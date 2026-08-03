@@ -1,1 +1,9 @@
 .worktrees/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+config.toml
+config.local.toml
+data/
+.superpowers/

@@ -1,0 +1,34 @@
+[project]
+name = "maibot-lunagentic-research-swarm"
+version = "0.1.0"
+description = "麦麦深度调查组：可扩展的多智能体深度研究蜂群"
+requires-python = ">=3.10"
+dependencies = [
+    "maibot-plugin-sdk>=2.7.1,<3.0.0",
+    "pydantic>=2.10.0,<3.0.0",
+    "httpx>=0.28.0,<0.29.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis>=6.100.0,<7.0.0",
+    "pytest>=8.0.0,<9.0.0",
+    "pytest-asyncio>=1.4.0,<2.0.0",
+    "ruff>=0.4.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lunagentic_research_swarm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120

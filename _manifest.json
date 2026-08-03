@@ -1,0 +1,61 @@
+{
+  "manifest_version": 2,
+  "id": "com.0-hz.lunagentic-research-swarm",
+  "version": "0.1.0",
+  "name": "麦麦深度调查组",
+  "description": "可扩展的多智能体深度研究蜂群。",
+  "author": {
+    "name": "kes",
+    "url": "https://github.com/yufei-pan"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/yufei-pan/maibot-lunagentic-research-swarm"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.7.1",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "pydantic",
+      "version_spec": ">=2.10.0"
+    },
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0.28.0"
+    }
+  ],
+  "capabilities": [
+    "api.call",
+    "api.list",
+    "chat.get_all_streams",
+    "chat.get_group_streams",
+    "chat.get_private_streams",
+    "config.get",
+    "knowledge.search",
+    "llm.embed",
+    "llm.generate",
+    "llm.generate_with_tools",
+    "maisaka.context.append",
+    "maisaka.proactive.trigger",
+    "message.build_readable",
+    "message.get_by_id",
+    "message.get_by_time",
+    "message.get_by_time_in_chat",
+    "message.get_recent",
+    "person.get_id",
+    "person.get_id_by_name",
+    "person.get_value",
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN"
+  }
+}
