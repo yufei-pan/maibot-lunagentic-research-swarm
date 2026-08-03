@@ -104,15 +104,6 @@ def normalize_actual_usage(
     return TokenUsage(prompt, completion, hit, miss, source="actual")
 
 
-def _validate_usage(usage: TokenUsage) -> None:
-    prompt = _usage_integer(usage.prompt_tokens, "prompt_tokens")
-    _usage_integer(usage.completion_tokens, "completion_tokens")
-    hit = _usage_integer(usage.cache_hit_tokens, "cache_hit_tokens")
-    miss = _usage_integer(usage.cache_miss_tokens, "cache_miss_tokens")
-    if hit + miss > prompt:
-        raise LRSError("invalid_usage", "无效 LLM usage：cache hit 与 miss 之和超过 prompt tokens")
-
-
 def price_units_to_credits(price_units: float) -> float:
     """Host 配置价格数值 1.0 固定换算为 100 credits。"""
 
@@ -122,14 +113,20 @@ def price_units_to_credits(price_units: float) -> float:
 def charge(profile: PriceProfile, usage: TokenUsage) -> float:
     """按完整价格 profile 计算一次调用的 credits。"""
 
-    _validate_usage(usage)
+    normalized = normalize_actual_usage(
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        cache_hit_tokens=usage.cache_hit_tokens,
+        cache_miss_tokens=usage.cache_miss_tokens,
+    )
     if profile.cache:
         input_units = (
-            usage.cache_miss_tokens * profile.price_in + usage.cache_hit_tokens * profile.cache_price_in
+            normalized.cache_miss_tokens * profile.price_in
+            + normalized.cache_hit_tokens * profile.cache_price_in
         ) / 1_000_000
     else:
-        input_units = usage.prompt_tokens * profile.price_in / 1_000_000
-    output_units = usage.completion_tokens * profile.price_out / 1_000_000
+        input_units = normalized.prompt_tokens * profile.price_in / 1_000_000
+    output_units = normalized.completion_tokens * profile.price_out / 1_000_000
     return price_units_to_credits(input_units + output_units)
 
 

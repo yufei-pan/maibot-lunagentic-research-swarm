@@ -137,6 +137,23 @@ def test_cache_accounting_fills_unreported_gap_as_miss_and_rejects_overflow() ->
     assert caught.value.code == "invalid_usage"
 
 
+def test_direct_charge_bills_unclassified_prompt_tokens_as_cache_miss() -> None:
+    credits = charge(
+        PriceProfile(price_in=2.0, cache=True, cache_price_in=0.5, price_out=3.0),
+        TokenUsage(prompt_tokens=100, completion_tokens=10, cache_hit_tokens=40, cache_miss_tokens=20),
+    )
+    assert credits == pytest.approx(0.017)
+
+
+def test_direct_charge_rejects_cache_classification_overflow() -> None:
+    with pytest.raises(LRSError) as caught:
+        charge(
+            PriceProfile(price_in=2.0, cache=True, cache_price_in=0.5, price_out=3.0),
+            TokenUsage(prompt_tokens=100, completion_tokens=10, cache_hit_tokens=70, cache_miss_tokens=40),
+        )
+    assert caught.value.code == "invalid_usage"
+
+
 @pytest.mark.parametrize(
     "usage",
     [

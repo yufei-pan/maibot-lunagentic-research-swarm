@@ -190,7 +190,7 @@ class LLMGateway:
                 message,
                 duration,
                 usage=usage,
-                model_name=str(raw.get("model") or raw.get("model_name") or ""),
+                model_name=str(raw.get("model_name") or raw.get("model") or ""),
                 response=str(raw.get("response", "") or ""),
             )
         try:
@@ -207,7 +207,7 @@ class LLMGateway:
         return GenerationResult(
             response=str(raw.get("response", "") or ""),
             tool_calls=tool_calls,
-            model_name=str(raw.get("model") or raw.get("model_name") or ""),
+            model_name=str(raw.get("model_name") or raw.get("model") or ""),
             usage=usage,
             success=True,
             error=None,

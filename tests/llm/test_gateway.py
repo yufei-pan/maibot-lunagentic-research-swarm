@@ -10,6 +10,7 @@ from lunagentic_research_swarm.llm.gateway import (
     HostModelSnapshotReader,
     LLMGateway,
 )
+from lunagentic_research_swarm.llm.pricing import PriceCatalog, PriceProfile
 from lunagentic_research_swarm.llm.tokens import (
     estimate_child_tokens,
     estimate_prompt_tokens,
@@ -94,6 +95,65 @@ async def test_task_selector_routes_plain_and_native_tool_calls_through_public_c
 
 
 @pytest.mark.asyncio
+async def test_task_response_prefers_physical_model_name_for_actual_reconciliation() -> None:
+    raw = dict(FULL_HOST_RESULT, model="utils", model_name="physical-task", tool_calls=None)
+    result = await LLMGateway(FakeContext(FakeLLM(raw)), physical_pinning=FakePinning()).generate(
+        GenerationRequest(selector="task:utils", messages="hello")
+    )
+    assert result.model_name == "physical-task"
+    assert result.usage is not None
+
+    catalog = PriceCatalog.from_sources(
+        {},
+        {
+            "utils": PriceProfile(9.0, False, 0.0, 9.0),
+            "physical-task": PriceProfile(1.0, False, 0.0, 2.0),
+        },
+        {"utils": ["utils"]},
+    )
+    charged = catalog.charge_actual(
+        actual_model_name=result.model_name,
+        prompt_tokens=result.usage.prompt_tokens,
+        completion_tokens=result.usage.completion_tokens,
+        cache_hit_tokens=result.usage.cache_hit_tokens,
+        cache_miss_tokens=result.usage.cache_miss_tokens,
+    )
+    assert charged.price.model_name == "physical-task"
+    assert charged.credits == pytest.approx(0.014)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_response_prefers_physical_model_name_for_actual_reconciliation() -> None:
+    raw = dict(FULL_HOST_RESULT, model="planner", model_name="physical-tool")
+    public = FakeLLM(raw)
+    tools = [{"type": "function", "function": {"name": "submit", "parameters": {"type": "object"}}}]
+    result = await LLMGateway(FakeContext(public), physical_pinning=FakePinning()).generate(
+        GenerationRequest(selector="task:planner", messages="hello", tools=tools)
+    )
+    assert public.calls[0][0] == "generate_with_tools"
+    assert result.model_name == "physical-tool"
+    assert result.usage is not None
+
+    catalog = PriceCatalog.from_sources(
+        {},
+        {
+            "planner": PriceProfile(9.0, False, 0.0, 9.0),
+            "physical-tool": PriceProfile(1.0, False, 0.0, 2.0),
+        },
+        {"planner": ["planner"]},
+    )
+    charged = catalog.charge_actual(
+        actual_model_name=result.model_name,
+        prompt_tokens=result.usage.prompt_tokens,
+        completion_tokens=result.usage.completion_tokens,
+        cache_hit_tokens=result.usage.cache_hit_tokens,
+        cache_miss_tokens=result.usage.cache_miss_tokens,
+    )
+    assert charged.price.model_name == "physical-tool"
+    assert charged.credits == pytest.approx(0.014)
+
+
+@pytest.mark.asyncio
 async def test_model_selector_never_falls_back_to_public_task_selector() -> None:
     public = FakeLLM()
     pinned = FakePinning(
@@ -149,6 +209,7 @@ async def test_failed_generation_preserves_reported_usage_but_absent_usage_stays
         "success": False,
         "response": "",
         "error": "provider failed after usage",
+        "model": "utils",
         "model_name": "actual-model",
         "prompt_tokens": 10,
         "completion_tokens": 2,
