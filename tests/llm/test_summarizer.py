@@ -247,12 +247,51 @@ async def test_metadata_cannot_make_whitespace_history_semantically_nonempty(met
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method_name", ["finalize_branch", "compact_branch"])
-async def test_nonblank_message_content_is_semantically_meaningful(method_name: str) -> None:
-    """若语义判定过度收紧并拒绝 branch/compact 的非空正文，本测试应失败。"""
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"role": "assistant", "provider": "x"},
+        {"role": "assistant", "unknown_metadata": {"nested": "value"}},
+        {"role": "tool", "tool_calls": [{"name": "metadata_only"}]},
+    ],
+)
+async def test_mapping_without_content_is_empty_regardless_of_unknown_metadata(
+    method_name: str, metadata: dict[str, object]
+) -> None:
+    """若任意未知 metadata 值能让无 content 的消息伪装成语义内容，本测试应失败。"""
+
+    gateway = CapturingGateway()
+    task = FormalizedTask.create("正式任务")
+    history = (metadata,)
+    requests: dict[str, object] = {
+        "finalize_branch": BranchFinalizationRequest(formalized_task=task, branch_history=history),
+        "compact_branch": CompactionRequest(formalized_task=task, branch_history=history),
+    }
+
+    result = await getattr(_service(gateway), method_name)(requests[method_name])
+
+    assert not result.success
+    assert result.error is not None and result.error.code == "summary_input_empty"
+    assert gateway.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["finalize_branch", "compact_branch"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "有效证据",
+        [" ", {"content": ["", "有效 multipart 证据"]}],
+    ],
+)
+async def test_nonblank_string_and_multipart_content_are_semantically_meaningful(
+    method_name: str, content: object
+) -> None:
+    """若语义判定过度收紧并拒绝 branch/compact 的字符串或 multipart 正文，本测试应失败。"""
 
     gateway = CapturingGateway(_generation("有效摘要"))
     task = FormalizedTask.create("正式任务")
-    history = ({"role": "assistant", "content": "有效证据", "name": "agent", "timestamp": "now"},)
+    history = ({"role": "assistant", "content": content, "provider": "x", "timestamp": "now"},)
     requests: dict[str, object] = {
         "finalize_branch": BranchFinalizationRequest(
             formalized_task=task,
