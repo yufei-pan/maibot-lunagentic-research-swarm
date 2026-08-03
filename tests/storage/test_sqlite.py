@@ -105,6 +105,28 @@ def test_store_command_copies_and_freezes_values() -> None:
         command.kind = "other"  # type: ignore[misc]
 
 
+def test_store_command_snapshots_mutable_buffer_values() -> None:
+    """若 command 共享 bytearray/memoryview，排队后的 buffer 修改会改变落盘值。"""
+
+    payload = bytearray(b"payload")
+    viewed_payload = bytearray(b"viewed")
+    command = StoreCommand(
+        "buffer_probe",
+        {
+            "bytearray": payload,
+            "writable_view": memoryview(viewed_payload),
+            "readonly_view": memoryview(b"readonly"),
+        },
+    )
+    payload[0] = ord("X")
+    viewed_payload[0] = ord("Y")
+
+    assert command.values["bytearray"] == b"payload"
+    assert command.values["writable_view"] == b"viewed"
+    assert command.values["readonly_view"] == b"readonly"
+    assert all(isinstance(value, bytes) for value in command.values.values())
+
+
 @pytest.mark.asyncio
 async def test_cancelled_call_holds_lock_until_worker_finishes(tmp_path) -> None:
     """若取消 await 会提前释放锁，单连接可能被两个 worker 同时访问。"""
@@ -134,6 +156,34 @@ async def test_cancelled_call_holds_lock_until_worker_finishes(tmp_path) -> None
     with pytest.raises(asyncio.CancelledError):
         await first
     assert await second is not None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_call_surfaces_worker_storage_error(tmp_path) -> None:
+    """若取消掩盖 worker 的 SQLite 错误，调用方会误把持久化失败当作普通取消。"""
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class FailingStore(SQLiteStateStore):
+        def _insert_task(self, connection, values) -> None:  # type: ignore[no-untyped-def, override]
+            entered.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("测试未及时释放失败命令")
+            raise sqlite3.IntegrityError("字面存储失败")
+
+    store = FailingStore(tmp_path / "state.sqlite3")
+    await store.open()
+    transaction = asyncio.create_task(store.transact([_task("lrs_cancel_error")]))
+    while not entered.is_set():
+        await asyncio.sleep(0.001)
+    transaction.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(sqlite3.IntegrityError, match="字面存储失败"):
+        await transaction
     await store.close()
 
 

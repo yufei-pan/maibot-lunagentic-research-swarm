@@ -17,6 +17,10 @@ from lunagentic_research_swarm.storage.migrations import MIGRATIONS
 
 
 def _freeze_json(value: Any) -> Any:
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
     if isinstance(value, list | tuple):
@@ -124,21 +128,10 @@ class SQLiteStateStore:
                     # worker 无法被取消；必须继续持锁直到它退出，避免同一连接并发使用。
                     if cancellation is None:
                         cancellation = exc
-                except BaseException:
-                    if cancellation is not None:
-                        try:
-                            operation.result()
-                        except BaseException:
-                            pass
-                        raise cancellation
-                    raise
+            result = operation.result()
             if cancellation is not None:
-                try:
-                    operation.result()
-                except BaseException:
-                    pass
                 raise cancellation
-            return operation.result()
+            return result
 
     async def open(self) -> None:
         await self._call(self._open_sync)
