@@ -1,10 +1,17 @@
 # 麦麦深度调查组（Lunagentic Research Swarm）设计规格
 
-**日期：** 2026-08-03  
-**状态：** 已完成 brainstorming，待文档复核  
-**仓库：** `maibot-lunagentic-research-swarm/`  
-**插件 ID：** `com.0-hz.lunagentic-research-swarm`  
-**Python 包：** `lunagentic_research_swarm`  
+**日期：** 2026-08-03
+
+**状态：** 已完成 brainstorming 和自检，待用户文档复核
+
+**仓库：** `maibot-lunagentic-research-swarm/`
+
+**插件 ID：** `com.0-hz.lunagentic-research-swarm`
+
+**Python 包：** `lunagentic_research_swarm`
+
+**简称：** LRS
+
 **架构：** 中央事件归约器 + 有界异步图调度器 + 可扩展智能体/Procedure 注册表
 
 ## 1. 摘要
@@ -385,6 +392,8 @@ initial credits
 3. **`finalize_task`：** 从正式任务描述和多个分支总结生成任务级综合结论。
 4. **`compact_branch`：** 把分支的可变历史压缩成可继续工作的上下文，不改写正式任务描述。
 
+四种模式都把正式任务描述视为不可变参考，提示词明确禁止生成“改写后的任务描述”去替换它；插件也从结构上把任务描述与可总结历史分开存放。
+
 建议选择低温度、低幻觉、低成本、长上下文、输出稳定的模型。默认 selector 为 `task:mid_memory`。
 
 ### 12.1 `max_tokens`
@@ -689,7 +698,7 @@ Web 搜索由 LRS 内部实现，API keys 和 SearXNG instance 由用户配置�
 | `list_research_tasks` | 状态/时间过滤 | 列出活动或历史 Task |
 | `submit_research_feedback` | `task_id`, `round?`, feedback fields | 保存质量判断、纠正、实际决定和结果 |
 
-mutating tool 一律返回 task ID、round、结果状态、有效预算和结构化错误 code。`add_research_context` 不改写正式任务描述，而是创建有序 broadcast event；在途调用不被中断。
+Task ID 使用 `lrs_<uuid4>`，round 使用从 1 开始的递增整数。mutating tool 一律返回 task ID、round、结果状态、有效预算和结构化错误 code。`add_research_context` 不改写正式任务描述，而是创建有序 broadcast event；在途调用不被中断。
 
 ### 17.2 报告交付
 
@@ -698,7 +707,7 @@ mutating tool 一律返回 task ID、round、结果状态、有效预算和结�
 1. `ctx.maisaka.context.append`；
 2. `ctx.maisaka.proactive.trigger`。
 
-每个 outbox item 有稳定 idempotency key。若 append 成功而 trigger 失败，重试只能补 trigger，不能重复追加正文。交付状态进入 task status/health。
+每个 outbox item 有稳定 report ID 和内部 idempotency key。若插件已确认 append 成功而 trigger 失败，重试只能补 trigger，不能重复追加正文。当前 Maisaka API 不提供跨崩溃的 exactly-once 保证；若进程恰好在 append 成功、落盘确认前崩溃，恢复后可能重复 append，因此报告正文包含稳定 report ID，消费者可识别/去重。交付状态进入 task status/health。
 
 ### 17.3 用户命令
 
@@ -1115,6 +1124,46 @@ maibot-lunagentic-research-swarm/
 - 文件仓库作为独立可选插件设计，不阻塞 LRS 核心首发。
 - 上游真正取消 LLM 请求和 `@LLMProvider` 物理路由不属于首发；未来 SDK/Host 提供稳定能力时再替换隔离适配器。
 
-## 28. Open questions
+## 28. 未决问题
 
 无。brainstorming 阶段提出的命名、协议、credits、时间、总结器、compact、扩展、存储、反馈、模型 pinning、可选依赖和测试策略均已确定。
+
+## 附录 A：需求追踪
+
+| 原始需求 | 对应章节 |
+|---|---|
+| 1. 多智能体深度调查 | 6、10、14 |
+| 2. objective/time/effort 输入 | 7.2、17.1 |
+| 3. 角色驱动决策与基础角色 | 8.2、14.1、14.4 |
+| 4. 总结器 ingest、最近聊天和 Maisaka context | 7.2、8.1 |
+| 5. 根智能体启动、swarm identity 和 cache 前缀 | 8.2、14.1 |
+| 6. 子代继承上下文并分配 credits | 8.2、10、11 |
+| 7. envelope 解析、Procedure 和分支图 | 9、10 |
+| 8. task/物理模型选择 | 16 |
+| 9–10. 专职角色与统一输出协议 | 9、14 |
+| 11. MaiBot 上下文、Web、fetch 和案例工具 | 15 |
+| 12. 默认/自定义智能体、自调用循环 | 9.1、14 |
+| 13–17. 深思、辩论、外部研究、记忆、知识角色 | 14.4 |
+| 18. 分支总结、广播、总结后丢弃上下文 | 10.1、12、13.4、18.3 |
+| 19. time+grace、中间/最终综合 | 13 |
+| 20. Maisaka context、主动触发、唯一任务 ID | 17 |
+| 21. 停止研究 | 7.4 |
+| 22. 暂停、1200 秒超时 | 7.3 |
+| 23. 继续、重置时间和预算调整 | 7.5、11.6、17.1 |
+| 24. 时间是提示、credits 是控制量 | 11、13.1 |
+| 25. effort level 与默认 100 credits | 11.1 |
+| 26. token/cache/价格估算 | 11.2、11.3 |
+| 27. input/output 扣费和负余额终止顺序 | 10、11.2 |
+| 28. 余额结算到休眠 Task pool | 11.4–11.6 |
+| 29. 全部分支结束与从总结重启 | 7.5、13.3、18.3 |
+| 30. 周期报告和多次唤醒 Maisaka | 13、17.2 |
+| 31. 追加信息广播 | 17.1 |
+| 32. 异步启动、默认 120 秒 | 7.2、13.1 |
+| 33. 插件命名 | 1、24 |
+| 34. SQLite/LanceDB 和 persistent data | 18、19 |
+| 35. 历史案例智能体 | 14.4、19.3 |
+| 36. 推荐额外智能体 | 14.4 的证据核验员、定量分析员 |
+| 37. 推荐额外 Procedure | 15.4、15.5 |
+| 38. 可扩展智能体/Procedure | 14、15 |
+
+后续澄清也已纳入：内部物理 pinning（16）、混合扩展和外部配置所有权（14–15）、逐智能体协议与无正文 native toolcall（9）、扩展移除时的在途规则（14.3）、货币无关 credits 与低预算警告（11）、零余额委派和仅 continue 重分配（11）、总结器四角色与 credits 豁免（12）、258k/逐智能体 compact（12.2）、两项 raw storage 默认关闭和 crash 取舍（18）、任务统计命令（17.3）、反馈学习及 600 秒主动提醒（20）、fetch-url 改为推荐依赖（15.5）、总结器继承 Host `max_tokens`（12.1）、仅协议错误做一次递归纠正（9、23），以及最终命名和无品牌前缀的 Planner 工具名（1、17.1）。
