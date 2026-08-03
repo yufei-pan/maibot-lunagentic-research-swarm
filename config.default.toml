@@ -1,6 +1,5 @@
-config_version = "1.0.0"
-
 [plugin]
+config_version = "1.0.0"
 enabled = true
 root_agent = "builtin.quick_thinker"
 

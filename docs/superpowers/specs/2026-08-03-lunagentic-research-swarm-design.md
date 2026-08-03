@@ -958,9 +958,8 @@ feedback 是不可变、按时间追加的事件。新反馈可 supersede 旧反
 示意默认配置：
 
 ```toml
-config_version = 1
-
 [plugin]
+config_version = "1.0.0"
 enabled = true
 root_agent = "builtin.quick_thinker"
 

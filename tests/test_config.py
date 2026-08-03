@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from maibot_sdk.config import PluginConfigVersionError, extract_plugin_config_version
 from lunagentic_research_swarm.config import CURRENT_CONFIG_VERSION, LRSConfig, normalize_config
 
 
@@ -22,6 +25,14 @@ def test_config_defaults_match_approved_spec() -> None:
     assert "reasoning" not in LRSConfig.model_json_schema()["properties"]
 
 
+def test_default_config_exposes_sdk_canonical_plugin_version() -> None:
+    defaults = LRSConfig().model_dump(mode="python")
+
+    assert defaults["plugin"]["config_version"] == CURRENT_CONFIG_VERSION
+    assert "config_version" not in defaults
+    assert extract_plugin_config_version(defaults) == CURRENT_CONFIG_VERSION
+
+
 def test_explicit_price_override_is_a_complete_profile() -> None:
     config = LRSConfig.model_validate({"pricing": {"models": {"gpt-fast": {"price_in": 1.0}}}})
     profile = config.pricing.models["gpt-fast"]
@@ -33,13 +44,26 @@ def test_explicit_price_override_is_a_complete_profile() -> None:
 
 def test_migration_preserves_user_values_and_bumps_version() -> None:
     raw = {
-        "config_version": "0.0.1",
+        "plugin": {"config_version": "0.0.1"},
         "timing": {"default_time_budget_seconds": 300},
         "storage": {"store_agent_transcripts": True},
     }
     merged, changed, notes = normalize_config(raw, LRSConfig().model_dump(mode="python"))
     assert changed
-    assert merged["config_version"] == CURRENT_CONFIG_VERSION
+    assert merged["plugin"]["config_version"] == CURRENT_CONFIG_VERSION
     assert merged["timing"]["default_time_budget_seconds"] == 300
     assert merged["storage"]["store_agent_transcripts"] is True
     assert notes
+
+
+@pytest.mark.parametrize("version", [None, [], ""])
+def test_migration_rejects_invalid_explicit_plugin_version(version: object) -> None:
+    raw = {"plugin": {"config_version": version}}
+
+    with pytest.raises(PluginConfigVersionError):
+        normalize_config(raw, LRSConfig().model_dump(mode="python"))
+
+
+def test_migration_rejects_non_mapping_config_data() -> None:
+    with pytest.raises(TypeError, match="Mapping"):
+        normalize_config([], LRSConfig().model_dump(mode="python"))

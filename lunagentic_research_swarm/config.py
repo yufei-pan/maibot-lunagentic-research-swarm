@@ -40,6 +40,7 @@ def _ui_factory(*, factory: Any, label: str, hint: str, placeholder: str = "", *
 
 class PluginSection(PluginConfigBase):
     __ui_label__ = "插件"
+    config_version: str = _ui_field(CURRENT_CONFIG_VERSION, label="配置版本", hint="由插件用于配置迁移。")
     enabled: bool = _ui_field(True, label="启用插件", hint="是否启用麦麦深度调查组。")
     root_agent: str = _ui_field("builtin.quick_thinker", label="根智能体", hint="默认启动的根智能体。")
 
@@ -186,7 +187,6 @@ class ProcedureOverride(PluginConfigBase):
 class LRSConfig(PluginConfigBase):
     """LRS 插件完整配置根模型。"""
 
-    config_version: str = _ui_field(CURRENT_CONFIG_VERSION, label="配置版本", hint="由插件用于配置迁移。")
     plugin: PluginSection = _ui_factory(factory=PluginSection, label="插件", hint="插件基础设置。")
     llm: LLMSection = _ui_factory(factory=LLMSection, label="语言模型", hint="语言模型选择设置。")
     summarizer: SummarizerSection = _ui_factory(factory=SummarizerSection, label="摘要", hint="摘要生成设置。")
@@ -217,45 +217,26 @@ class LRSConfig(PluginConfigBase):
         return self.procedures if not procedure_name else self.procedures.get(procedure_name)
 
 
-def _with_sdk_version(config_data: Mapping[str, Any], version: str) -> dict[str, Any]:
-    """为 SDK 版本辅助函数适配首版顶层版本格式。"""
-
-    adapted = dict(config_data)
-    plugin = dict(adapted.get("plugin", {})) if isinstance(adapted.get("plugin"), Mapping) else {}
-    plugin["config_version"] = version
-    adapted["plugin"] = plugin
-    return adapted
-
-
-def _without_sdk_version(config_data: Mapping[str, Any]) -> dict[str, Any]:
-    """移除仅用于 SDK 版本辅助函数的内部字段。"""
-
-    normalized = dict(config_data)
-    plugin = dict(normalized.get("plugin", {})) if isinstance(normalized.get("plugin"), Mapping) else {}
-    plugin.pop("config_version", None)
-    normalized["plugin"] = plugin
-    return normalized
-
-
 def normalize_config(
     config_data: Mapping[str, Any] | None, defaults: Mapping[str, Any]
 ) -> tuple[dict[str, Any], bool, list[str]]:
     """补齐首版配置字段，保留用户值并让显式非法值直接失败。"""
 
-    raw = dict(config_data) if isinstance(config_data, Mapping) else {}
-    raw_version = str(raw.get("config_version", "")).strip()
-    if not raw_version:
-        raw_version = CURRENT_CONFIG_VERSION
-    sdk_raw = _with_sdk_version(raw, raw_version)
-    extract_plugin_config_version(sdk_raw)
-
     default_data = dict(defaults)
-    default_data["config_version"] = CURRENT_CONFIG_VERSION
-    sdk_defaults = _with_sdk_version(default_data, CURRENT_CONFIG_VERSION)
-    rebuilt = rebuild_plugin_config_data(sdk_defaults, sdk_raw)
-    merged, merged_changed = merge_plugin_config_data(sdk_defaults, rebuilt)
-    merged = _without_sdk_version(merged)
-    merged["config_version"] = CURRENT_CONFIG_VERSION
+    extract_plugin_config_version(default_data)
+    if config_data is None:
+        normalized = validate_plugin_config(LRSConfig, default_data).model_dump(mode="python")
+        return normalized, True, ["已生成默认配置"]
+    if not isinstance(config_data, Mapping):
+        raise TypeError("config_data 必须为 Mapping 或 None")
+
+    raw = dict(config_data)
+    raw_version = extract_plugin_config_version(raw)
+    rebuilt = rebuild_plugin_config_data(default_data, raw)
+    merged, merged_changed = merge_plugin_config_data(default_data, rebuilt)
+    plugin = dict(merged["plugin"])
+    plugin["config_version"] = CURRENT_CONFIG_VERSION
+    merged["plugin"] = plugin
     validated = validate_plugin_config(LRSConfig, merged)
     normalized = validated.model_dump(mode="python")
     changed = merged_changed or raw != normalized

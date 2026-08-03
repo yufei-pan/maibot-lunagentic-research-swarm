@@ -224,7 +224,7 @@ def create_plugin() -> LunagenticResearchSwarmPlugin:
     return LunagenticResearchSwarmPlugin()
 ```
 
-`.gitignore` 至少忽略 `.venv/`、`__pycache__/`、`.pytest_cache/`、`*.pyc`、`config.toml`、`config.local.toml`、`data/`、`.superpowers/`。`config.default.toml` 暂只放 `config_version = "1.0.0"` 与 `[plugin] enabled/root_agent`，完整 schema 在 Task 2 一次补齐。
+`.gitignore` 至少忽略 `.venv/`、`__pycache__/`、`.pytest_cache/`、`*.pyc`、`config.toml`、`config.local.toml`、`data/`、`.superpowers/`。`config.default.toml` 暂只放 `[plugin]` 内的 `config_version = "1.0.0"` 与 `enabled/root_agent`，完整 schema 在 Task 2 一次补齐。
 
 - [ ] **Step 4: 运行装载测试并确认通过**
 
@@ -291,13 +291,13 @@ def test_explicit_price_override_is_a_complete_profile() -> None:
 
 def test_migration_preserves_user_values_and_bumps_version() -> None:
     raw = {
-        "config_version": "0.0.1",
+        "plugin": {"config_version": "0.0.1"},
         "timing": {"default_time_budget_seconds": 300},
         "storage": {"store_agent_transcripts": True},
     }
     merged, changed, notes = normalize_config(raw, LRSConfig().model_dump(mode="python"))
     assert changed
-    assert merged["config_version"] == CURRENT_CONFIG_VERSION
+    assert merged["plugin"]["config_version"] == CURRENT_CONFIG_VERSION
     assert merged["timing"]["default_time_budget_seconds"] == 300
     assert merged["storage"]["store_agent_transcripts"] is True
     assert notes
