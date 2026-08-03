@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, TypeAlias
 
 
@@ -27,6 +29,28 @@ EVENT_REGISTRY: dict[str, type[Event]] = {}
 def _register(cls: type[Event]) -> type[Event]:
     EVENT_REGISTRY[cls.__name__] = cls
     return cls
+
+
+def _freeze_value(value: Any) -> Any:
+    """递归冻结事件中的 JSON 数据，避免发布后被调用方改写。"""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_value(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_value(item) for item in value)
+    return value
+
+
+def _json_value(value: Any) -> Any:
+    """将冻结的 JSON 数据还原为标准 JSON 值。"""
+
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 @_register
@@ -72,7 +96,11 @@ class AgentCallCompleted(Event):
     branch_id: str = ""
     call_id: str = ""
     result_id: str = ""
-    usage: dict[str, Any] | None = None
+    usage: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.usage is not None:
+            object.__setattr__(self, "usage", _freeze_value(self.usage))
 
 
 @_register
@@ -213,9 +241,11 @@ RuntimeEvent: TypeAlias = (
 def event_to_json(event: RuntimeEvent) -> str:
     """编码事件类型与字段；datetime 一律使用 ISO 8601。"""
 
-    payload = asdict(event)
-    payload["event_type"] = type(event).__name__
-    payload["occurred_at"] = event.occurred_at.isoformat()
+    event_type = type(event).__name__
+    if EVENT_REGISTRY.get(event_type) is not type(event):
+        raise ValueError(f"未注册事件类型：{event_type}")
+    payload = {name: _json_value(getattr(event, name)) for name in event.__dataclass_fields__}
+    payload["event_type"] = event_type
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
