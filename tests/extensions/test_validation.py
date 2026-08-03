@@ -226,3 +226,29 @@ def test_canonical_fingerprint_uses_sorted_utf8_json_and_catalog_id_order() -> N
 
     assert canonical_fingerprint([writer, reader], id_field="agent_id") == expected
     assert canonical_fingerprint([reader, writer], id_field="agent_id") == expected
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {1: "x"},
+        ("x",),
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"value": b"x"},
+        {"value": object()},
+    ],
+)
+def test_canonical_fingerprint_rejects_non_json_values(invalid: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="JSON"):
+        canonical_fingerprint(invalid)
+
+
+def test_canonical_fingerprint_does_not_collapse_key_or_sequence_types() -> None:
+    with pytest.raises((TypeError, ValueError), match="JSON"):
+        canonical_fingerprint({1: "x"})
+    with pytest.raises((TypeError, ValueError), match="JSON"):
+        canonical_fingerprint(("x",))
+
+    assert canonical_fingerprint({"1": "x"})
+    assert canonical_fingerprint(["x"])

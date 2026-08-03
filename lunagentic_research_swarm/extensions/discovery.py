@@ -57,6 +57,7 @@ class ExtensionDiscovery:
         self._procedures = procedure_registry
         self._refresh_interval_seconds = float(refresh_interval_seconds)
         self._refresh_lock = asyncio.Lock()
+        self._inflight_refresh: asyncio.Task[None] | None = None
         self._refresh_requested = asyncio.Event()
         self._background_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -75,10 +76,23 @@ class ExtensionDiscovery:
         return self._closed
 
     async def refresh(self) -> None:
-        """扫描并替换本轮可见 provider；单个 provider 失败不阻断其他批次。"""
+        """共享同一个在途扫描；单个 provider 失败不阻断其他批次。"""
 
         if self._closed:
             return
+        task = self._inflight_refresh
+        if task is None or task.done():
+            task = asyncio.create_task(self._refresh_once(), name="lrs-extension-refresh-once")
+            self._inflight_refresh = task
+        try:
+            await asyncio.shield(task)
+        finally:
+            if self._inflight_refresh is task and task.done():
+                self._inflight_refresh = None
+
+    async def _refresh_once(self) -> None:
+        """执行一次实际 Host 扫描。"""
+
         async with self._refresh_lock:
             if self._closed:
                 return

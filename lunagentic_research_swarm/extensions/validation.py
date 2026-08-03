@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
 from pydantic import BaseModel
@@ -86,6 +86,17 @@ def validate_extension_id(value: str, *, field_name: str) -> str:
     return value
 
 
+def authorized_provider_namespace(provider_id: str) -> str:
+    """由 Host plugin ID 纯函数决定唯一可声明的扩展命名空间。"""
+
+    if not isinstance(provider_id, str) or not provider_id or provider_id != provider_id.strip():
+        raise ValueError("provider plugin ID 不能为空或包含首尾空白")
+    namespace = "builtin" if provider_id == "builtin" else provider_id.rsplit(".", 1)[-1].replace("-", "_")
+    if re.fullmatch(r"[a-z0-9][a-z0-9_]{0,127}", namespace) is None:
+        raise ValueError(f"provider plugin ID {provider_id} 无法映射为合法命名空间")
+    return namespace
+
+
 def validate_model_selector(value: str) -> str:
     """只接受带非空后缀的 task:/model: selector，不做静默 fallback。"""
 
@@ -99,12 +110,18 @@ def validate_model_selector(value: str) -> str:
 
 def _fingerprint_value(value: Any) -> Any:
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
+        return _fingerprint_value(value.model_dump(mode="json"))
     if isinstance(value, Mapping):
-        return {str(key): _fingerprint_value(item) for key, item in value.items()}
-    if isinstance(value, tuple | list):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("canonical fingerprint 的 JSON object key 必须为字符串")
+        return {key: _fingerprint_value(item) for key, item in value.items()}
+    if isinstance(value, list):
         return [_fingerprint_value(item) for item in value]
-    return value
+    if value is None or isinstance(value, str | bool | int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise TypeError("canonical fingerprint 输入必须是有限且可序列化的 JSON 值")
 
 
 def canonical_fingerprint(values: Any, *, id_field: str | None = None) -> str:
@@ -112,8 +129,8 @@ def canonical_fingerprint(values: Any, *, id_field: str | None = None) -> str:
 
     normalized = _fingerprint_value(values)
     if id_field is not None:
-        if not isinstance(normalized, Sequence) or isinstance(normalized, str | bytes | bytearray):
-            raise TypeError("带 id_field 的指纹输入必须为序列")
+        if not isinstance(normalized, list):
+            raise TypeError("带 id_field 的指纹输入必须为 JSON array")
         normalized = sorted(normalized, key=lambda item: str(item[id_field]))
     encoded = json.dumps(
         normalized,

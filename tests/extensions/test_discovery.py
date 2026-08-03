@@ -246,6 +246,34 @@ async def test_request_refresh_coalesces_and_close_cleans_background_task() -> N
         await asyncio.sleep(0)
     assert api.list_count == 1
 
+
+@pytest.mark.asyncio
+async def test_overlapping_direct_refresh_calls_share_one_scan_and_result() -> None:
+    info = api_info("provider.agents", "agents")
+    api = FakeAPI(
+        [info],
+        {"provider.agents.describe_agents": RuntimeError("字面共享 provider 失败")},
+    )
+    api.list_started = asyncio.Event()
+    api.release_list = asyncio.Event()
+    agents = AgentRegistry(root_agent="agents.root")
+    discovery = ExtensionDiscovery(FakeContext(api), agents, ProcedureRegistry(), refresh_interval_seconds=60)
+
+    first = asyncio.create_task(discovery.refresh())
+    await api.list_started.wait()
+    second = asyncio.create_task(discovery.refresh())
+    await asyncio.sleep(0)
+    assert api.list_count == 1
+
+    api.release_list.set()
+    results = await asyncio.gather(first, second)
+
+    assert results == [None, None]
+    assert api.list_count == 1
+    assert api.calls == [("provider.agents.describe_agents", "1", {})]
+    assert agents.health["provider.agents"].status == "invalid"
+    assert "字面共享 provider 失败" in agents.health["provider.agents"].errors[0]
+
     await discovery.close()
     assert discovery.closed
     assert discovery.background_task is None

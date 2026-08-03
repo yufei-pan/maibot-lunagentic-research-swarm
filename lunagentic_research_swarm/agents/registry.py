@@ -9,7 +9,11 @@ from typing import Any
 
 from lunagentic_research_swarm.config import AgentOverride
 from lunagentic_research_swarm.extensions.contracts import AgentDefinition, CatalogDelta, ProviderHealth
-from lunagentic_research_swarm.extensions.validation import canonical_fingerprint, validate_model_selector
+from lunagentic_research_swarm.extensions.validation import (
+    authorized_provider_namespace,
+    canonical_fingerprint,
+    validate_model_selector,
+)
 
 
 class RootAgentUnavailableError(ValueError):
@@ -83,8 +87,6 @@ class AgentRegistry:
         self._root_agent = root_agent
         self._providers: dict[str, _ProviderBatch] = {}
         self._owners: dict[str, str] = {}
-        self._namespace_owners: dict[str, str] = {}
-        self._provider_namespaces: dict[str, str] = {}
         self._health: dict[str, ProviderHealth] = {}
 
     @property
@@ -104,7 +106,7 @@ class AgentRegistry:
         self, provider_id: str, definitions: Sequence[AgentDefinition | Mapping[str, Any]]
     ) -> CatalogDelta:
         try:
-            checked, namespace = self._validate_batch(provider_id, definitions)
+            checked = self._validate_batch(provider_id, definitions)
         except (TypeError, ValueError) as exc:
             self.reject_provider(provider_id, [str(exc)])
             raise
@@ -114,11 +116,8 @@ class AgentRegistry:
         new_by_id = {item.agent_id: item for item in checked}
         for agent_id in old_by_id:
             self._owners.pop(agent_id, None)
-        fingerprint = canonical_fingerprint(checked, id_field="agent_id")
+        fingerprint = canonical_fingerprint(list(checked), id_field="agent_id")
         self._providers[provider_id] = _ProviderBatch(checked, fingerprint)
-        if namespace is not None:
-            self._namespace_owners[namespace] = provider_id
-            self._provider_namespaces[provider_id] = namespace
         for agent_id in new_by_id:
             self._owners[agent_id] = provider_id
         self._health[provider_id] = ProviderHealth(provider_id, "healthy", fingerprint=fingerprint)
@@ -136,9 +135,8 @@ class AgentRegistry:
 
     def _validate_batch(
         self, provider_id: str, definitions: Sequence[AgentDefinition | Mapping[str, Any]]
-    ) -> tuple[tuple[AgentDefinition, ...], str | None]:
-        if not isinstance(provider_id, str) or not provider_id.strip() or provider_id != provider_id.strip():
-            raise ValueError("provider plugin ID 不能为空或包含首尾空白")
+    ) -> tuple[AgentDefinition, ...]:
+        authorized_namespace = authorized_provider_namespace(provider_id)
         raw_definitions: list[Mapping[str, Any]] = []
         for item in definitions:
             if isinstance(item, AgentDefinition):
@@ -151,26 +149,20 @@ class AgentRegistry:
         ids = [item.agent_id for item in checked]
         if len(set(ids)) != len(ids):
             raise ValueError("agent provider 批次包含重复 ID")
-        namespaces = {agent_id.partition(".")[0] for agent_id in ids}
-        if len(namespaces) > 1:
-            raise ValueError("同一 agent provider 批次只能声明一个命名空间")
-        namespace = next(iter(namespaces), None)
-        established = self._provider_namespaces.get(provider_id)
-        if namespace is not None and established is not None and namespace != established:
-            raise ValueError(f"provider {provider_id} 已绑定命名空间 {established}，不得改为 {namespace}")
-        namespace_owner = self._namespace_owners.get(namespace) if namespace is not None else None
-        if namespace_owner is not None and namespace_owner != provider_id:
-            raise ValueError(f"命名空间 {namespace} 已属于 provider {namespace_owner}，不得冒充")
         for agent_id in ids:
+            if agent_id.partition(".")[0] != authorized_namespace:
+                raise ValueError(
+                    f"agent_id {agent_id} 不属于 provider {provider_id} 获授权的命名空间 {authorized_namespace}"
+                )
             owner = self._owners.get(agent_id)
             if owner is not None and owner != provider_id:
                 raise ValueError(f"agent_id {agent_id} 已属于 provider {owner}，不得冒充")
-        return checked, namespace
+        return checked
 
     def reject_provider(self, provider_id: str, errors: Sequence[str]) -> None:
         self._drop_provider(provider_id)
         normalized = tuple(str(error) for error in errors) or ("provider 批次无效",)
-        fingerprint = canonical_fingerprint({"provider_plugin_id": provider_id, "errors": normalized})
+        fingerprint = canonical_fingerprint({"provider_plugin_id": provider_id, "errors": list(normalized)})
         self._health[provider_id] = ProviderHealth(provider_id, "invalid", normalized, fingerprint)
 
     def remove_provider(self, provider_id: str) -> CatalogDelta:

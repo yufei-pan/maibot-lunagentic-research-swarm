@@ -64,19 +64,50 @@ def test_provider_cannot_claim_definition_owned_by_another_provider() -> None:
     assert registry.is_live("one.root")
 
 
-def test_provider_cannot_publish_outside_its_own_namespace() -> None:
+def test_malicious_provider_is_rejected_even_when_processed_first() -> None:
     agents = AgentRegistry(root_agent="one.root")
     procedures = ProcedureRegistry()
-    agents.replace_provider("provider.tools", [agent("tools.reader")])
-    procedures.replace_provider("provider.tools", [procedure("tools.fetch")])
 
-    with pytest.raises(ValueError, match="provider.tools"):
+    with pytest.raises(ValueError, match="evil"):
         agents.replace_provider("provider.evil", [agent("tools.writer")])
-    with pytest.raises(ValueError, match="provider.tools"):
+    with pytest.raises(ValueError, match="evil"):
         procedures.replace_provider("provider.evil", [procedure("tools.search")])
 
     assert agents.health["provider.evil"].status == "invalid"
     assert procedures.health["provider.evil"].status == "invalid"
+
+
+@pytest.mark.parametrize("evil_first", [True, False])
+def test_namespace_authority_is_independent_of_provider_order(evil_first: bool) -> None:
+    agents = AgentRegistry(root_agent="tools.root")
+    operations = [
+        ("provider.evil", [agent("tools.writer")], False),
+        ("provider.tools", [agent("tools.root")], True),
+    ]
+    if not evil_first:
+        operations.reverse()
+
+    for provider_id, definitions, accepted in operations:
+        if accepted:
+            agents.replace_provider(provider_id, definitions)
+        else:
+            with pytest.raises(ValueError, match="命名空间"):
+                agents.replace_provider(provider_id, definitions)
+
+    assert agents.is_live("tools.root")
+    assert not agents.is_live("tools.writer")
+
+
+def test_namespace_authority_is_identical_across_agent_and_procedure_registries() -> None:
+    agents = AgentRegistry(root_agent="example.root")
+    procedures = ProcedureRegistry()
+    procedures.replace_provider("provider.tools", [procedure("tools.fetch")])
+    agents.replace_provider("provider.example", [agent("example.root")])
+
+    with pytest.raises(ValueError, match="命名空间"):
+        agents.replace_provider("provider.evil", [agent("tools.reader")])
+    with pytest.raises(ValueError, match="命名空间"):
+        procedures.replace_provider("provider.evil", [procedure("example.search")])
 
 
 def test_registry_normalizes_mapping_payloads_through_strict_contracts() -> None:
@@ -84,9 +115,11 @@ def test_registry_normalizes_mapping_payloads_through_strict_contracts() -> None
     procedures = ProcedureRegistry()
 
     agents.replace_provider("builtin", [agent("builtin.root").model_dump(mode="json")])
+    procedures.replace_provider("builtin", [procedure("builtin.search").model_dump(mode="json")])
     procedures.replace_provider("com.0-hz.fetch-url", [procedure("fetch_url.fetch").model_dump(mode="json")])
 
     assert agents.snapshot({}).get("builtin.root") is not None
+    assert procedures.snapshot({}).get("builtin.search") is not None
     assert procedures.snapshot({}).get("fetch_url.fetch") is not None
 
     bad = agent("builtin.bad").model_dump(mode="json")
