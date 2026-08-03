@@ -62,10 +62,13 @@
 - `ctx.llm.generate` 可接收字符串或消息序列，并按任务名选择模型。
 - 当前 Host 的 LLM capability 返回 prompt、completion、total、cache-hit 和 cache-miss token usage；插件优先使用这些实际值结算。
 - `ctx.llm.get_available_models` 可列出任务名，但公开调用不直接选择物理模型。
+- `ctx.llm.generate` 和 `generate_with_tools` 的成功结果包含实际 `model_name`；当前值对应 `ModelInfo.name`，可用于调用后的准确价格核销。
 - `ctx.maisaka.context.append` 可把报告追加到 Planner 上下文。
 - `ctx.maisaka.proactive.trigger` 可主动唤醒 Maisaka。
 - `ctx.paths.data_dir` 是插件持久化目录。
 - `ctx.api.list`、`ctx.api.call` 和动态 API 支持跨插件扩展发现与调用。
+- `ctx.config.get` 公开读取 Host 的 `bot_config` 全局字段，`get_all/get_plugin` 读取插件配置；它们不能直接读取 `model_config.toml`。
+- SDK 可通过 `config_reload_subscriptions = {ON_MODEL_CONFIG_RELOAD}` 订阅完整模型配置的热更新广播，但插件首次加载时不会自动收到初始模型配置快照。
 - 当前 Host 没有为本场景暴露可靠的上游请求中断能力。
 - 当前 `ctx.llm.generate` 结果没有向插件暴露统一 `finish_reason`，因此不能只依靠 provider 原因判断输出是否截断。
 - 显式 `max_tokens` 会覆盖模型/任务配置并传给 provider；过大值可能被模型拒绝。
@@ -276,12 +279,13 @@ submit_swarm_turn(report, procedures, delegations)
 3. 解析、有限修复并验证 envelope；必要时执行一次协议纠正 turn。
 4. 执行本 turn 请求的普通 Procedure；同一 turn 内可在并发上限内并行。
 5. 若存在待处理的 `continue_deep_research`，进入重新分配屏障并完成 pool 分配。
-6. 处理核心控制 Procedure：`terminate`、`compact`、`checkpoint`。
-7. 若 `terminate` 已请求，忽略所有委派并最终总结当前分支。
-8. 否则若余额为负，忽略所有委派并按 credits 原因最终总结当前分支。
-9. 否则根据父分支余额缩放并创建子分支；零余额委派仍正常创建。
-10. 未请求任何委派时自然结束，调用分支总结器。
-11. 父 turn 的未分配余额或终结余额结算到 Task pool，父节点不再活动。
+6. 执行 `compact`，并识别 `terminate` / `checkpoint` 控制请求。
+7. 若 `terminate` 已请求，忽略 checkpoint 和所有委派，最终总结当前分支。
+8. 否则若余额为负，忽略 checkpoint 和所有委派，并按 credits 原因最终总结当前分支。
+9. 否则若请求 `checkpoint`，立即生成 checkpoint summary，把委派暂存到下一个报告时间点。
+10. 否则根据父分支余额缩放并创建子分支；零余额委派仍正常创建。
+11. 未请求任何委派时自然结束，调用分支总结器。
+12. 父 turn 的未分配余额或终结余额结算到 Task pool，父节点不再活动。
 
 Procedure 先执行、credits 终止后检查这一顺序是强制规则。这样即使模型估算错误导致本 turn 结束后变成负余额，它已经请求的搜索、计算或资料读取仍会完成并进入最终总结，但不会继续生成新的普通智能体调用。
 
@@ -291,9 +295,9 @@ Procedure 先执行、credits 终止后检查这一顺序是强制规则。这�
 
 - **`terminate`：** 主动结束当前分支。与其他 Procedure 同时请求时，其他普通 Procedure 可先完成；所有委派忽略。
 - **`compact`：** 使用核心总结器压缩当前分支的可变历史。可与普通 Procedure 和委派同时请求；压缩在普通 Procedure 结果进入上下文后、子分支 clone 前完成，因此所有新子分支继承压缩后的父上下文。
-- **`checkpoint`：** clone 当前分支上下文并调用“分支总结”角色，生成不终止原分支的阶段性总结。总结广播给其他活动分支；原分支仍可继续委派。
+- **`checkpoint`：** 调用“分支总结”角色，生成不终止原分支的阶段性总结。总结广播给其他活动分支；当前 envelope 的委派先暂存，branch 等到下一报告时间点再继续。若已经处于 grace，则 summary 完成后即可继续。
 
-原设计中“同时调用总结器并继续分支”的能力由 `checkpoint` 明确定义；总结器本身仍不是可委派智能体。
+调度器为报告自动生成的 checkpoint 与智能体主动 Procedure 不同：自动 checkpoint clone 稳定上下文后，原 branch 立即继续，不进入等待状态。总结器本身仍不是可委派智能体。
 
 ## 11. Credits 与成本账本
 
@@ -323,7 +327,30 @@ call_cost   = miss_cost + hit_cost + output_cost
 - 返回后用实际 input 核销预扣，并扣实际 output。
 - 若调用失败且没有 usage，保留估算 input 扣款并标记 `estimated_unreconciled`；没有证据时不虚构 output token。
 - 若某调用路径没有 usage 能力，则使用明确标记的 estimator，而不是把估算值伪装成实际值。
-- 模型价格优先读取 Host `models_config.toml`；读取不到时要求用户在插件配置中提供完整价格。未定价模型默认拒绝启动需要 credits 结算的任务。显式零价格可表示免费模型。
+
+价格 profile 按物理模型的 `ModelInfo.name` 解析，优先级如下：
+
+1. LRS 插件配置中的该模型完整 override；
+2. Host `model_config.toml` 中该模型的 `price_in`、`cache`、`cache_price_in`、`price_out`；
+3. 找不到模型、价格字段缺失或无法读取 Host 配置时，沿用 Host 默认行为，完整 profile 按 0 计算，即视为免费。
+
+只要用户为某物理模型建立 LRS price override，该 profile 就完全忽略 Host 中同一模型的实际价格。override 条目中省略的数字字段按 0、`cache` 按 false，因此它始终是一个完整 profile。WebUI 和文档必须突出显示这一点；不能把 Host 与插件字段逐项混合。
+
+初次加载时，LRS 通过与 physical pinning 相同的隔离 Host-internal adapter 读取 Host 已验证的内存 `model_config`，不直接依赖相对路径解析原始 TOML。读取失败不阻止插件加载，价格按 0，并在 health/ledger 的 `price_source` 标记为 `host_unavailable_free`。插件声明 `ON_MODEL_CONFIG_RELOAD` 订阅；之后由公开 `on_config_update(scope="model", config_data=...)` 更新内存价格和 task model-list 快照。
+
+模型配置广播可能同时包含 provider credentials。LRS 只抽取模型 `name/price_in/cache/cache_price_in/price_out` 和 task `model_list` 等必要字段，构建最小内存快照后立即丢弃原始 config_data；绝不记录、日志输出或写入数据库中的 `api_providers`、API key、base URL 或其他认证字段。
+
+`cache=false` 时，全部 prompt tokens 按 `price_in`；`cache=true` 时，cache-hit 按 `cache_price_in`、cache-miss 按 `price_in`，与 Host 当前统计逻辑一致。
+
+对于 `task:` selector：
+
+- 启动前的 input 预扣和低预算估算使用 task `model_list` 的第一个模型；不尝试预测 random/round-robin/fallback 的实际选择。
+- 调用成功后读取返回的实际 `model_name`，使用该物理模型最终核销本次完整 input/cache/output cost。
+- 若结果没有实际模型名，则继续使用启动时的第一个模型，并把结算标记为 estimated。
+
+对于 `model:` selector，启动估算和最终核销都使用该物理模型；内部 adapter 仍把实际返回名写入统一结果。
+
+每个 usage/ledger entry 保存 `estimated_model_name`、`actual_model_name`、`price_source`、price profile fingerprint、估算扣款、实际核销差额和是否 estimated，确保价格覆盖和 task 模型切换可审计。
 
 ### 11.3 低预算警告
 
@@ -333,7 +360,7 @@ call_cost   = miss_cost + hit_cost + output_cost
 warning_threshold = 50 × input_price + 5 × output_price
 ```
 
-若有效初始预算低于阈值，发出“credits 可能不足以正常运行”的明确警告，但不拒绝启动。任务 selector 对应多个可用物理模型时，使用其中最保守的最高阈值。
+若有效初始预算低于阈值，发出“credits 可能不足以正常运行”的明确警告，但不拒绝启动。`task:` selector 对应多个物理模型时只使用 `model_list` 第一个模型的价格估算。价格为 0 时阈值也为 0，不产生低预算警告，但 health 会显示该模型的 `price_source`。
 
 ### 11.4 父子分配
 
@@ -422,20 +449,58 @@ initial credits
 
 时间预算是 Maisaka 希望多久收到一次结果的提示，不是停止研究的硬期限。默认 120 秒，可配置。每次中间报告发出后重新计时；`continue_deep_research` 也重新计时。
 
-到达预算时建立报告屏障：
+每个报告周期有递增的 `report_epoch` 和一组需要被本次报告覆盖的活动 branch frontier。已最终结束的 branch 不需要重复 checkpoint，但其 terminal summary 会继续进入所有后续中间报告和最终报告。
 
-1. 暂停启动新的普通智能体调用；已经在途的调用继续。
-2. 允许在途 turn 返回、执行其普通 Procedure，并允许其主动 checkpoint/terminate。
-3. 进入默认 60 秒 grace period。
-4. grace 结束时，对仍没有新鲜总结的活动 branch clone 当前可用上下文并调用 checkpoint 总结；原 branch 不终止。
-5. 生成中间任务报告，追加到 Maisaka context 并主动触发 Planner。
-6. 重置报告计时器，释放排队的新普通智能体调用。
+#### 智能体主动 checkpoint
 
-若 checkpoint 失败，中间报告明确标记该 branch 暂不可用；原 branch 继续。若所有 branch 在报告汇总过程中结束，则把本次报告升级为最终报告，避免先中间后立即最终的重复唤醒。
+普通智能体可在任意 turn 请求 `checkpoint`：
 
-报告屏障只有一个新鲜 branch/checkpoint 总结时，可直接使用该总结作为正文；有多个时，调用 `finalize_task` 的“中间”变体，把不可变正式任务描述和各总结作为按时间排序的独立 assistant 消息，并明确告知仍活动的 branch 数量。若没有任何可用总结，则只发送插件生成的进度/错误状态，不让 LLM 凭空生成调查结论。该汇总同样不扣研究 credits。
+1. 该 turn 的普通 Procedure 先完成；
+2. 核心总结器立即对当前 branch 生成 checkpoint summary；
+3. 同一 envelope 中请求的 child delegations 暂存，不启动新的 child LLM；
+4. branch 进入 `WAITING_REPORT_WITH_CHECKPOINT`，直到下一个报告时间点；
+5. checkpoint summary 立即持久化并广播给其他活动 branch。
 
-### 13.2 中间报告内容
+到达下一个 grace period 时，该 branch 已经完成本 epoch 的报告覆盖，会立即释放暂存委派并继续运行，不必再次 checkpoint。若 checkpoint 正好在 grace 中请求，则 summary 完成后即可继续。
+
+如果报告截止时间尚未到，但当前所有活动 branch 都已经得到本 epoch 的 checkpoint summary（或明确的 checkpoint failure），或者已经 finalized 并得到 terminal summary，则不继续空等剩余时间：
+
+- 只要仍有活动 branch，立即开始中间报告，并恢复所有等待报告的 branch；
+- 若所有 branch 都 finalized，立即开始最终报告。
+
+#### 到达报告时间与 60 秒 grace
+
+到达时间预算时冻结本 epoch 的 frontier 并进入默认 60 秒 grace period。普通研究不建立全局暂停屏障：
+
+1. 已有预生成 checkpoint 的 branch 立即恢复并继续其暂存委派；它的预生成 summary 已覆盖本 epoch。
+2. 其他在途 agent call 正常继续。
+3. grace 中任一 agent 返回后，先完成协议验证和该 turn 请求的普通 Procedure，然后立即 clone 该 branch 的稳定上下文并优先启动 checkpoint summary，不要求模型自主请求 `checkpoint`。
+4. clone 后原 branch 正常处理 compact/terminate/credits 和下一步委派；checkpoint summary 与原 branch 后续工作可以并行。
+5. agent 若在 grace 中 finalized，则 terminal summary 直接满足该 frontier branch 的覆盖要求，不再生成 checkpoint。
+6. clone 后新产生的 child 工作属于下一报告 epoch，不扩大当前已经冻结的 frontier。
+
+只要冻结 frontier 的所有 branch summary 已经成功生成或明确失败，就立即提前结束 grace，不等待满 60 秒，并开始任务级中间综合。若 60 秒到期仍有 agent 没返回，则从该 branch 最后一个已提交的稳定上下文 clone 并启动 checkpoint；迟到的在途结果继续原 branch，属于下一 epoch。任务级综合等待这些 checkpoint 成功或明确失败后开始。
+
+checkpoint 失败时，中间报告明确标记该 branch 暂不可用；原 branch 不终止。若没有任何可用 summary，则只发送插件生成的进度/错误状态，不让 LLM 凭空生成调查结论。
+
+### 13.2 报告输入集合与类型判定
+
+每次任务级综合使用一个冻结的 coverage summary set，而不是只使用本次 grace 新产生的结果：
+
+- 包含所有已经 finalized 的 branch terminal summary，包括在更早报告周期就 finalized 的 branch；
+- 对每个仍活动的 frontier branch，包含为本 epoch 预生成或自动 clone 的最新 checkpoint summary；
+- 同一 branch 更旧、已被新 checkpoint 或 terminal summary 取代的 checkpoint 仍保存在数据库中，但不重复输入本次综合；
+- 所有选中 summary 都带 branch ID、summary type、report epoch、生成时间和是否 terminal，并按时间顺序作为独立 assistant 消息传入。
+
+报告类型只由本次综合真正使用的输入快照决定：
+
+- 只要使用了任意 clone/checkpoint summary，或仍存在活动 branch，本次一定是 **中间报告**；
+- 只有所有 branch 都已 finalized，且综合输入全部是 terminal summaries 时，才能生成 **最终报告**；
+- report type 在任务级总结调用开始前冻结。若中间报告生成期间剩余 branch 又全部结束，该报告仍是中间报告，随后另行使用全 terminal summary set 生成最终报告，不能把已使用 checkpoint 的报告“升级”为最终报告。
+
+coverage set 只有一个 summary 时可直接使用其正文；有多个时调用 `finalize_task` 对应的中间或最终变体，并始终附上不可变正式任务描述。该汇总不扣研究 credits。
+
+### 13.3 中间报告内容
 
 中间报告必须由插件明确标记为“中间报告”，并包含：
 
@@ -448,17 +513,17 @@ initial credits
 - token、cache hit/miss、credits 和失败概况；
 - 当前仍在运行的子智能体数量和主要未决工作。
 
-### 13.3 最终结论
+### 13.4 最终结论
 
-- 所有活动叶子都已最终总结时，任务进入 `FINALIZING`。
+- 所有活动叶子都已最终总结时，任务立即进入 `FINALIZING`，不等待当前时间预算结束。
 - 只有一个终结分支总结时，直接把它作为结论正文，不额外调用任务总结器。
-- 有多个终结分支总结时，把正式任务描述和各总结作为按时间排序的独立 assistant 消息交给 `finalize_task`。
+- 有多个终结分支总结时，把正式任务描述和所有 terminal summaries（包括更早报告周期已终结的 branch）作为按时间排序的独立 assistant 消息交给 `finalize_task`；历史 checkpoint 不进入最终报告输入。
 - 最终结论明确标记为“最终报告”，追加到 Maisaka context 并主动触发 Planner。
 - 任务级总结失败时，把已有分支总结原样、有序地报告，并把状态设为 `COMPLETED_WITH_ERRORS`，不伪造综合结论。
 
 所有统计区块由插件确定性生成，不能让 LLM 猜测。至少包括：普通智能体调用数、Procedure 次数、分支数、最大深度、compact/checkpoint 次数、协议修复、失败数、token/cache usage、研究 credits、总结器 cost-equivalent、现实 Procedure 费用、耗时、继续次数和最终 pool。
 
-### 13.4 总结广播
+### 13.5 总结广播
 
 分支终结总结和 checkpoint 总结按生成时间广播给所有仍活动 branch，只在它们的下一次调用中追加，不中断在途调用。分支最终总结成功写入 SQLite 后，原 branch 上下文立即丢弃；已经从旧上下文 fork 出去的兄弟分支保留自己的引用。
 
@@ -719,6 +784,8 @@ Task ID 使用 `lrs_<uuid4>`，round 使用从 1 开始的递增整数。mutatin
 - `/swarm agents`
 - `/swarm procedures`
 - `/swarm health`
+- `/swarm vectors status`
+- `/swarm vectors rebuild [--force]`
 - `/swarm feedback <task_id> ...`
 
 输出默认简体中文。状态和统计包括活动/排队数、模型/agent 分布、token、cache hit rate、credits、Procedure、compact/checkpoint、失败、延迟、推荐依赖和 pinning 健康度。
@@ -818,12 +885,25 @@ store_raw_procedure_payloads = false
 
 ### 19.2 Embedding 版本
 
-每个向量保存 embedding selector、模型 fingerprint、维度、schema generation 和源记录 ID。模型变化时：
+每个向量和 index generation 都保存 embedding selector、实际模型名（若 Host 返回）、模型 fingerprint、向量维度、schema generation 和源记录 ID。每次 embedding 返回后都以 `len(vector)` 验证维度，批量结果也必须彼此一致。
+
+以下任一情况触发明确的 `embedding_generation_mismatch` 错误和自动重建：
+
+- selector 或实际 embedding 模型 fingerprint 变化；
+- 返回向量维度与 active generation 记录不一致；
+- LanceDB table schema 中的 vector dimension 与 generation metadata 不一致。
+
+重建流程：
 
 1. 创建新的 generation/table；
 2. 从 SQLite 总结层重新 embedding；
-3. 完整验证后原子切换 active generation；
-4. 旧 generation 延迟清理。
+3. 对每一批结果验证维度；任何不一致立即停止该 generation；
+4. 完整验证后原子切换 active generation；
+5. 旧 generation 延迟清理。
+
+维度 mismatch 的向量绝不能插入旧 table，也不能通过截断或 padding 强行适配。自动重建期间 `past_cases` 明确返回 `vector_index_rebuilding`；SQLite 总结仍可正常写入。自动重建失败时保留错误和可重试 job，不删除旧数据。
+
+用户可通过 `/swarm vectors status` 查看 selector/fingerprint/dimension/generation/job，或通过 `/swarm vectors rebuild [--force]` 手动从 SQLite 全量重建 LanceDB。`--force` 即使 fingerprint 未变化也创建新 generation，但不会删除 SQLite 权威数据。
 
 embedding/LanceDB 失败不影响 SQLite 中的任务结果。vector job 标为 pending/failed，`past_cases` Procedure 明确返回索引不可用或部分结果，不能伪装为空结果。
 
@@ -905,7 +985,6 @@ feedback_wait_seconds = 600
 default_effort_credits = 100.0
 warning_miss_input_tokens = 500000
 warning_output_tokens = 50000
-require_resolved_pricing = true
 
 [scheduler]
 max_task_llm_concurrency = 8
@@ -934,12 +1013,19 @@ refresh_interval_seconds = 60
 [web_search]
 enabled_engines = ["duckduckgo"]
 # searxng_url / tavily_key / you_key 等放在受保护配置中
+
+# 可选；没有条目时读取 Host，Host 也没有/读取失败时按 0（免费）
+[pricing.models."example-model"]
+price_in = 0.0
+cache = false
+cache_price_in = 0.0
+price_out = 0.0
 ```
 
 另有动态配置区：
 
 - `[agents.<agent_id>]`：启用、selector、protocol、compact threshold 等 override；
-- `[pricing.<model_id>]`：input/cached_input/output price；
+- `[pricing.models."<ModelInfo.name>"]`：完整覆盖该物理模型的 `price_in/cache/cache_price_in/price_out`；只要存在该条目，就忽略 Host 同模型的全部价格字段。配置界面必须显示醒目 Note；
 - `[procedures.<procedure_id>]`：启用、timeout、权限；
 - `[reporting]`：正文/统计大小和 Maisaka 交付策略；
 - `[feedback]`：提醒和 lesson 行为；
@@ -1060,6 +1146,7 @@ maibot-lunagentic-research-swarm/
 - JSON 有限修复、schema validation 和单次递归纠正；
 - native tool 只有 `submit_swarm_turn`、没有正文的返回；
 - selector 解析、价格解析、token estimator 和 usage reconciliation；
+- LRS price override 完整覆盖 Host、Host 缺失/不可读按 0、task 首模型预估和实际 `model_name` 核销；
 - 正式任务描述在 delegation/compact/checkpoint/restart 后逐字节相同；
 - 自动 compact 阈值和 model context 上限；
 - report/statistics 的确定性计算。
@@ -1070,12 +1157,13 @@ maibot-lunagentic-research-swarm/
 
 - 全局/Task 并发、排队公平和宽 fan-out；
 - pause 在当前调用后停止、continue barrier、stop 丢弃迟到结果；
-- time budget、grace、clone checkpoint、intermediate/final upgrade；
+- 主动 checkpoint 暂停 child、全 frontier 提前报告、grace 返回即 clone、60 秒超时 clone 和新 child 归入下一 epoch；
+- coverage set 包含旧 terminal summary 和当前 checkpoint，且使用过 checkpoint 的报告绝不标记为 final；
 - extension 在途移除、自调用失效边、有效兄弟继续；
 - feedback 600 秒提醒、continue 取消和每 round 一次；
 - Maisaka outbox 的 append/trigger 部分失败；
 - SQLite crash/interrupted 恢复和 unreconciled reservation；
-- LanceDB rebuild、embedding generation 切换和索引不可用；
+- LanceDB rebuild、embedding generation/维度切换、自动 mismatch rebuild、手动 force rebuild 和索引不可用；
 - 两个 raw storage 开关的四种组合。
 
 ### 25.3 必测 credits 场景
@@ -1093,6 +1181,7 @@ maibot-lunagentic-research-swarm/
 
 - 默认配置下 SQLite、LanceDB 和 debug 目录不存在原始 agent/procedure 内容。
 - 物理 pinning adapter 对当前 Host 内部签名做 contract test；不兼容时 health 明确失败。
+- `ctx.config` 不提供初始 model config、内部初始快照失败按免费，以及 `ON_MODEL_CONFIG_RELOAD` 公开广播刷新价格/task list。
 - `fetch_url`、文件仓库和第三方 provider 分别在存在/缺失/卸载时测试。
 - public task selector 和 physical selector 产生统一 usage/result 结构。
 - 不支持 assistant 正文+toolcall 的模型可以完整运行 native mode。
@@ -1166,4 +1255,4 @@ maibot-lunagentic-research-swarm/
 | 37. 推荐额外 Procedure | 15.4、15.5 |
 | 38. 可扩展智能体/Procedure | 14、15 |
 
-后续澄清也已纳入：内部物理 pinning（16）、混合扩展和外部配置所有权（14–15）、逐智能体协议与无正文 native toolcall（9）、扩展移除时的在途规则（14.3）、货币无关 credits 与低预算警告（11）、零余额委派和仅 continue 重分配（11）、总结器四角色与 credits 豁免（12）、258k/逐智能体 compact（12.2）、两项 raw storage 默认关闭和 crash 取舍（18）、任务统计命令（17.3）、反馈学习及 600 秒主动提醒（20）、fetch-url 改为推荐依赖（15.5）、总结器继承 Host `max_tokens`（12.1）、仅协议错误做一次递归纠正（9、23），以及最终命名和无品牌前缀的 Planner 工具名（1、17.1）。
+后续澄清也已纳入：内部物理 pinning（16）、混合扩展和外部配置所有权（14–15）、逐智能体协议与无正文 native toolcall（9）、扩展移除时的在途规则（14.3）、货币无关 credits 与低预算警告（11）、插件价格完整覆盖/Host 缺失按免费/实际模型核销（11.2）、零余额委派和仅 continue 重分配（11）、总结器四角色与 credits 豁免（12）、258k/逐智能体 compact（12.2）、主动 checkpoint 等待/全 frontier 提前报告/grace 返回即 clone/严格中间最终判定（13）、两项 raw storage 默认关闭和 crash 取舍（18）、embedding 维度 mismatch 自动和手动重建（19.2）、任务统计命令（17.3）、反馈学习及 600 秒主动提醒（20）、fetch-url 改为推荐依赖（15.5）、总结器继承 Host `max_tokens`（12.1）、仅协议错误做一次递归纠正（9、23），以及最终命名和无品牌前缀的 Planner 工具名（1、17.1）。
