@@ -3,3 +3,88 @@ config_version = "1.0.0"
 [plugin]
 enabled = true
 root_agent = "builtin.quick_thinker"
+
+[llm]
+force_selector = ""
+
+[summarizer]
+selector = "task:mid_memory"
+temperature = 0.2
+max_tokens = 0
+
+[embedding]
+selector = "task:embedding"
+batch_size = 32
+max_concurrent = 4
+auto_rebuild = true
+retired_generation_retention_seconds = 86400
+
+[timing]
+default_time_budget_seconds = 120
+grace_period_seconds = 60
+pause_timeout_seconds = 1200
+feedback_wait_seconds = 600
+
+[budget]
+default_effort_credits = 100.0
+warning_miss_input_tokens = 500000
+warning_output_tokens = 50000
+
+[scheduler]
+max_task_llm_concurrency = 8
+max_global_llm_concurrency = 16
+max_task_procedure_concurrency = 16
+max_delegations_per_turn = 8
+max_branch_depth = 32
+max_agent_calls_per_task = 256
+
+[context]
+auto_compact_tokens = 258000
+reserved_output_tokens = 8192
+safety_margin_tokens = 8192
+
+[protocol]
+default_mode = "json_envelope"
+max_correction_turns = 1
+
+[storage]
+store_agent_transcripts = false
+store_raw_procedure_payloads = false
+
+[extensions]
+refresh_interval_seconds = 60
+
+[pricing]
+
+[pricing.models]
+
+[reporting]
+max_report_chars = 60000
+max_stats_chars = 12000
+deliver_intermediate = true
+deliver_final = true
+outbox_poll_seconds = 2.0
+
+[feedback]
+reminders_enabled = true
+index_lessons = true
+max_lesson_chars = 8000
+
+[commands]
+enabled = true
+max_output_chars = 12000
+maintenance_allowed_person_ids = []
+allow_vector_rebuild = true
+
+[web_search]
+enabled_engines = ["duckduckgo"]
+timeout_seconds = 30.0
+max_results = 10
+searxng_url = ""
+tavily_api_key = ""
+you_base_url = ""
+you_api_key = ""
+
+[agents]
+
+[procedures]
