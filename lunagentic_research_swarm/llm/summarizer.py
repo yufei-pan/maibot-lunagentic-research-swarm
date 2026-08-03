@@ -63,6 +63,7 @@ class SummaryResult:
 
 
 _PROMPT_ROOT = Path(__file__).resolve().parents[1] / "prompts" / "zh-CN"
+_MESSAGE_METADATA_KEYS = frozenset({"role", "name", "timestamp", "id"})
 
 
 def _json_text(value: Any) -> str:
@@ -76,10 +77,8 @@ def _has_content(value: Any) -> bool:
         return bool(value.strip())
     if isinstance(value, Mapping):
         if "content" in value:
-            if _has_content(value["content"]):
-                return True
-            return any(_has_content(item) for key, item in value.items() if key not in {"role", "content"})
-        return any(_has_content(item) for item in value.values())
+            return _has_content(value["content"])
+        return any(_has_content(item) for key, item in value.items() if key not in _MESSAGE_METADATA_KEYS)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return any(_has_content(item) for item in value)
     return True

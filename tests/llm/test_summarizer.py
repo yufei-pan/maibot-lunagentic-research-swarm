@@ -220,20 +220,54 @@ async def test_empty_branch_history_fails_explicitly_without_call_or_retry() -> 
 
 
 @pytest.mark.asyncio
-async def test_role_only_whitespace_branch_history_is_empty() -> None:
-    """若消息结构字段让空白分支伪装成有内容，本测试应失败。"""
+@pytest.mark.parametrize("method_name", ["finalize_branch", "compact_branch"])
+async def test_metadata_cannot_make_whitespace_history_semantically_nonempty(method_name: str) -> None:
+    """若 name/timestamp 等元数据让空白 branch/compact 历史伪装成内容，本测试应失败。"""
 
     gateway = CapturingGateway()
-    result = await _service(gateway).finalize_branch(
-        BranchFinalizationRequest(
-            formalized_task=FormalizedTask.create("正式任务"),
-            branch_history=({"role": "assistant", "content": " \n"},),
-        )
-    )
+    task = FormalizedTask.create("正式任务")
+    history = ({"role": "assistant", "content": " \n", "name": "agent", "timestamp": "now"},)
+    requests: dict[str, object] = {
+        "finalize_branch": BranchFinalizationRequest(
+            formalized_task=task,
+            branch_history=history,
+        ),
+        "compact_branch": CompactionRequest(
+            formalized_task=task,
+            branch_history=history,
+        ),
+    }
+
+    result = await getattr(_service(gateway), method_name)(requests[method_name])
 
     assert not result.success
     assert result.error is not None and result.error.code == "summary_input_empty"
     assert gateway.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["finalize_branch", "compact_branch"])
+async def test_nonblank_message_content_is_semantically_meaningful(method_name: str) -> None:
+    """若语义判定过度收紧并拒绝 branch/compact 的非空正文，本测试应失败。"""
+
+    gateway = CapturingGateway(_generation("有效摘要"))
+    task = FormalizedTask.create("正式任务")
+    history = ({"role": "assistant", "content": "有效证据", "name": "agent", "timestamp": "now"},)
+    requests: dict[str, object] = {
+        "finalize_branch": BranchFinalizationRequest(
+            formalized_task=task,
+            branch_history=history,
+        ),
+        "compact_branch": CompactionRequest(
+            formalized_task=task,
+            branch_history=history,
+        ),
+    }
+
+    result = await getattr(_service(gateway), method_name)(requests[method_name])
+
+    assert result.success and result.text == "有效摘要"
+    assert len(gateway.requests) == 1
 
 
 @pytest.mark.asyncio
