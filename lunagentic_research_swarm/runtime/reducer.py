@@ -21,7 +21,8 @@ from typing import Any, ClassVar, TypeAlias
 
 from lunagentic_research_swarm.errors import INVALID_STATE, STORAGE_COMMIT_FAILED, LRSError
 from lunagentic_research_swarm.models import FormalizedTask, TaskSnapshot, TaskStatus
-from lunagentic_research_swarm.runtime.credits import redistribute_pool
+from lunagentic_research_swarm.llm.protocol import ProtocolError, build_correction_message
+from lunagentic_research_swarm.runtime.credits import reconcile_usage, redistribute_pool, reserve_input
 from lunagentic_research_swarm.runtime.events import (
     AgentCallCompleted,
     AgentCallFailed,
@@ -735,13 +736,50 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     if isinstance(event, AgentCallRequested):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING}:
             return _invalid(state, event, "AgentCallRequested 只能用于 RUNNING/REPORTING")
+        try:
+            credits_after_reservation = event.balance_before - event.estimated_charge
+            reservation = reserve_input(
+                event.estimated_charge,
+                task_id=event.task_id,
+                round_id=event.round_id,
+                branch_id=event.branch_id,
+                call_id=event.call_id,
+                usage_id=event.usage_id or None,
+                ledger_id=event.ledger_id or None,
+                role="agent",
+                selector=event.selector,
+                estimated_model_name=event.estimated_model_name or None,
+                price_source=event.price_source,
+                price_fingerprint=event.price_fingerprint,
+                prompt_tokens=event.prompt_tokens,
+                cache_hit_tokens=event.cache_hit_tokens,
+                cache_miss_tokens=event.cache_miss_tokens,
+                balance_after=credits_after_reservation,
+                metadata={"event_type": "AgentCallReserved", "agent_id": event.agent_id},
+                created_at=event.occurred_at,
+            )
+        except (TypeError, ValueError) as exc:
+            return _invalid(state, event, f"AgentCallRequested reservation 无效：{exc}")
+        reserved_event_command = _lifecycle_event_command(event, status, status)
         return Transition(
             state,
+            commands=(*reservation.commands, reserved_event_command),
             effects=(
                 _effect(
                     PerformAgentCall,
                     event,
-                    payload={"branch_id": event.branch_id, "call_id": event.call_id, "agent_id": event.agent_id},
+                    payload={
+                        "branch_id": event.branch_id,
+                        "call_id": event.call_id,
+                        "agent_id": event.agent_id,
+                        "selector": event.selector,
+                        "protocol": event.protocol,
+                        "messages": event.messages,
+                        "estimated_charge": event.estimated_charge,
+                        "credits_after_reservation": credits_after_reservation,
+                        "correction_count": event.correction_count,
+                        "pinning_supported": event.pinning_supported,
+                    },
                 ),
             ),
         )
@@ -754,13 +792,123 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     if isinstance(event, AgentCallCompleted):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING}:
             return _invalid(state, event, "AgentCallCompleted 只能用于活跃 round")
+        actual_charge = event.actual_charge
+        if actual_charge is None:
+            actual_charge = event.estimated_charge
+        balance_after = event.balance_before_reconciliation + event.estimated_charge - actual_charge
+        try:
+            reconciliation = reconcile_usage(
+                estimated_charge=event.estimated_charge,
+                actual_charge=actual_charge,
+                actual_model_name=event.actual_model_name or None,
+                usage=event.usage,
+                success=True,
+                task_id=event.task_id,
+                round_id=event.round_id,
+                branch_id=event.branch_id,
+                call_id=event.call_id,
+                role="agent",
+                balance_after=balance_after,
+                created_at=event.occurred_at,
+            )
+        except (TypeError, ValueError) as exc:
+            return _invalid(state, event, f"AgentCallCompleted reconciliation 无效：{exc}")
+        commands: list[StoreCommand] = list(reconciliation.commands)
+        if event.protocol_error is not None:
+            if balance_after < 0:
+                return Transition(
+                    state,
+                    commands=tuple(commands),
+                    effects=(
+                        _effect(
+                            PerformBranchSummary,
+                            event,
+                            priority="barrier",
+                            payload={"branch_id": event.branch_id, "reason": "negative_credit"},
+                        ),
+                    ),
+                )
+            can_correct = (
+                event.correction_count == 0
+                and event.pinning_supported
+                and bool(event.actual_model_name)
+            )
+            if not can_correct:
+                return Transition(
+                    state,
+                    commands=tuple(commands),
+                    effects=(
+                        _effect(
+                            PerformBranchSummary,
+                            event,
+                            priority="barrier",
+                            payload={"branch_id": event.branch_id, "reason": "protocol_invalid"},
+                        ),
+                    ),
+                )
+            raw_errors = event.protocol_error.get("errors", ())
+            errors = tuple(item for item in raw_errors if isinstance(item, Mapping))
+            protocol_error = ProtocolError(str(event.protocol_error.get("message", "协议无效")), errors)
+            correction_message = build_correction_message(protocol_error)
+            correction_call_id = event.correction_call_id or f"{event.call_id}:correction"
+            correction_estimate = event.correction_estimated_charge
+            correction_balance = balance_after - correction_estimate
+            correction_reservation = reserve_input(
+                correction_estimate,
+                task_id=event.task_id,
+                round_id=event.round_id,
+                branch_id=event.branch_id,
+                call_id=correction_call_id,
+                usage_id=event.correction_usage_id or None,
+                ledger_id=event.correction_ledger_id or None,
+                role="agent",
+                selector=f"model:{event.actual_model_name}",
+                estimated_model_name=event.actual_model_name,
+                prompt_tokens=0,
+                balance_after=correction_balance,
+                metadata={"event_type": "AgentCallReserved", "correction_count": 1},
+                created_at=event.occurred_at,
+            )
+            commands.extend(correction_reservation.commands)
+            messages = (*event.messages, correction_message)
+            return Transition(
+                state,
+                commands=tuple(commands),
+                effects=(
+                    _effect(
+                        PerformAgentCall,
+                        event,
+                        payload={
+                            "branch_id": event.branch_id,
+                            "call_id": correction_call_id,
+                            "selector": f"model:{event.actual_model_name}",
+                            "protocol": "json_envelope",
+                            "messages": messages,
+                            "estimated_charge": correction_estimate,
+                            "credits_after_reservation": correction_balance,
+                            "correction_count": 1,
+                            "pinning_supported": True,
+                        },
+                    ),
+                ),
+            )
+        result = dict(event.protocol_result or {})
         return Transition(
             state,
+            commands=tuple(commands),
             effects=(
                 _effect(
                     PerformProcedureBatch,
                     event,
-                    payload={"branch_id": event.branch_id, "call_id": event.call_id, "result_id": event.result_id},
+                    payload={
+                        "branch_id": event.branch_id,
+                        "call_id": event.call_id,
+                        "result_id": event.result_id,
+                        "report": result.get("report", ""),
+                        "requests": tuple(result.get("procedures", ())),
+                        "delegations": tuple(result.get("delegations", ())),
+                        "credits_after": balance_after,
+                    },
                 ),
             ),
         )
@@ -783,7 +931,114 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     if isinstance(event, ProcedureBatchCompleted):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING}:
             return _invalid(state, event, "ProcedureBatchCompleted 只能用于活跃 round")
-        return Transition(state)
+        commands: list[StoreCommand] = []
+        for item in event.results:
+            result = getattr(item, "result", None)
+            success = bool(getattr(result, "success", False))
+            error = getattr(result, "error", None)
+            metadata = getattr(result, "metadata", {})
+            error_code = None
+            if isinstance(error, Mapping):
+                error_code = str(error.get("code") or "procedure_failed")
+            external_cost = metadata.get("external_cost") if isinstance(metadata, Mapping) else None
+            commands.append(
+                _command(
+                    "insert_procedure_call",
+                    {
+                        "request_id": str(getattr(item, "request_id", "")),
+                        "task_id": event.task_id,
+                        "round_id": event.round_id,
+                        "branch_id": event.branch_id,
+                        "turn_id": event.call_id,
+                        "agent_id": str(metadata.get("agent_id", "lrs.executor"))
+                        if isinstance(metadata, Mapping)
+                        else "lrs.executor",
+                        "procedure_id": str(getattr(item, "procedure_id", "")),
+                        "provider_plugin_id": str(getattr(item, "provider_plugin_id", "")),
+                        "status": "succeeded" if success else "failed",
+                        "duration_ms": int(getattr(item, "duration_ms", 0)),
+                        "error_code": error_code,
+                        "provenance_json": _metadata_json(
+                            {
+                                "api_name": str(getattr(item, "api_name", "")),
+                                "api_version": str(getattr(item, "api_version", "1")),
+                                "attempts": int(getattr(item, "attempts", 1)),
+                            }
+                        ),
+                        "external_cost_json": _metadata_json(external_cost)
+                        if isinstance(external_cost, Mapping)
+                        else None,
+                        "created_at": event.occurred_at.timestamp(),
+                    },
+                )
+            )
+
+        next_state = state
+        credits_after = event.credits_after
+        if bool(getattr(state, "continue_barrier", False)):
+            leaves = _state_leaves(state)
+            leaves[event.branch_id] = credits_after
+            redistribution = redistribute_pool(_state_credit_pool(state), 0.0, leaves)
+            credits_after = redistribution.balances.get(event.branch_id, credits_after)
+            next_state = _replace_state(
+                state,
+                active_leaves={key: value for key, value in redistribution.balances.items() if value >= 0},
+                credit_pool=redistribution.pool_after,
+                continue_barrier=False,
+            )
+
+        controls = event.controls
+        terminate = bool(getattr(controls, "terminate", False))
+        compact = bool(getattr(controls, "compact", False))
+        checkpoint = bool(getattr(controls, "checkpoint", False))
+        held = tuple(event.delegations)
+        if terminate:
+            reason = "terminate"
+        elif compact:
+            reason = "compact"
+        elif credits_after < 0:
+            reason = "negative_credit"
+        elif checkpoint:
+            reason = "checkpoint"
+        elif not held:
+            reason = "no_further_work"
+        else:
+            # Child materialization is performed by the transaction-aware controller
+            # from this immutable payload; it must submit AgentCallRequested before a
+            # scheduler can receive PerformAgentCall.
+            return Transition(
+                next_state,
+                commands=tuple(commands),
+                effects=(
+                    _effect(
+                        NotifyToolWaiter,
+                        event,
+                        priority="barrier",
+                        payload={
+                            "action": "materialize_children",
+                            "branch_id": event.branch_id,
+                            "delegations": held,
+                            "credits_after": credits_after,
+                        },
+                    ),
+                ),
+            )
+        return Transition(
+            next_state,
+            commands=tuple(commands),
+            effects=(
+                _effect(
+                    PerformBranchSummary,
+                    event,
+                    priority="barrier",
+                    payload={
+                        "branch_id": event.branch_id,
+                        "reason": reason,
+                        "held_delegations": held if reason in {"compact", "checkpoint"} else (),
+                    },
+                ),
+            ),
+        )
 
     if isinstance(event, (SummaryCompleted, SummaryFailed, BranchCheckpointed, BranchFinalized)):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.FINALIZING}:

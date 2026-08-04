@@ -87,6 +87,24 @@ class AgentCallRequested(Event):
     branch_id: str = ""
     call_id: str = ""
     agent_id: str = ""
+    selector: str = ""
+    protocol: str = "json_envelope"
+    messages: tuple[Mapping[str, Any], ...] = ()
+    prompt_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    estimated_charge: float = 0.0
+    balance_before: float = 0.0
+    usage_id: str = ""
+    ledger_id: str = ""
+    price_source: str = "host_config"
+    price_fingerprint: str = ""
+    estimated_model_name: str = ""
+    correction_count: int = 0
+    pinning_supported: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "messages", tuple(_freeze_value(self.messages)))
 
 
 @_register
@@ -105,10 +123,28 @@ class AgentCallCompleted(Event):
     call_id: str = ""
     result_id: str = ""
     usage: Mapping[str, Any] | None = None
+    actual_model_name: str = ""
+    actual_charge: float | None = None
+    estimated_charge: float = 0.0
+    balance_before_reconciliation: float = 0.0
+    protocol_result: Mapping[str, Any] | None = None
+    protocol_error: Mapping[str, Any] | None = None
+    correction_count: int = 0
+    correction_call_id: str = ""
+    correction_usage_id: str = ""
+    correction_ledger_id: str = ""
+    correction_estimated_charge: float = 0.0
+    pinning_supported: bool = True
+    messages: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if self.usage is not None:
             object.__setattr__(self, "usage", _freeze_value(self.usage))
+        if self.protocol_result is not None:
+            object.__setattr__(self, "protocol_result", _freeze_value(self.protocol_result))
+        if self.protocol_error is not None:
+            object.__setattr__(self, "protocol_error", _freeze_value(self.protocol_error))
+        object.__setattr__(self, "messages", tuple(_freeze_value(self.messages)))
 
 
 @_register
@@ -130,6 +166,9 @@ class ProcedureBatchCompleted(Event):
     # 导入环，executor 完成时已使用 ProcedureResult.model_validate() 校验。
     results: tuple[Any, ...] = ()
     controls: Any | None = None
+    report: str = ""
+    delegations: tuple[Mapping[str, Any], ...] = ()
+    credits_after: float = 0.0
 
     def __post_init__(self) -> None:
         normalized: list[Any] = []
@@ -158,6 +197,7 @@ class ProcedureBatchCompleted(Event):
                     pass
             normalized.append(item)
         object.__setattr__(self, "results", tuple(_freeze_value(normalized)))
+        object.__setattr__(self, "delegations", tuple(_freeze_value(self.delegations)))
         if isinstance(self.controls, Mapping):
             try:
                 from lunagentic_research_swarm.procedures.core import CoreProcedureDecision
