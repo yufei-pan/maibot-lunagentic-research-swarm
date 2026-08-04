@@ -48,6 +48,20 @@ generation，迟到结果被忽略。continue 在 pause barrier 重新分配 poo
 - continue 的 active leaf balances、credit pool、time budget/deadline reset 以及无 leaf
   的负 pool+adjustment 均由 reducer 和同一 transaction 持久化。
 
+## Review fix round 3
+
+- pause barrier 改为从 FairScheduler 的公开 task telemetry 同时检查 `active` 与
+  `queued`，覆盖 AgentCallCompleted 持久化后、ProcedureBatch 尚在队列中的交接窗口；
+  真实 FairScheduler 回归测试确认 procedure 开始且未结束时状态仍为 `PAUSING`。
+- reducer 将 agent 核销、失败核销和 procedure 完成后的 branch balance 写回
+  `RuntimeState.active_leaves`；manager 在每个当前 runtime event 后以该权威状态刷新
+  仅用于 status/pending-context 的 `_branches` cache。continue 因此持久化核销后的
+  80 credits，而不会使用过期的 100。
+- controller 遇到 `transition.error` 时只提交 reducer 自带的补偿 commands/effects，
+  保持 reducer 的 next state 并返回 `False`；不再合并 manager 的 state_changes、extra
+  commands 或 effect override。负余额 restart 不会产生 phantom leaf 或重置
+  `raw_context_released`。
+
 ## 验证
 
 - `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest tests/runtime/test_controller_start.py tests/runtime/test_controller_controls.py -v` → `14 passed`。

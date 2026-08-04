@@ -7,11 +7,17 @@ import pytest
 
 from lunagentic_research_swarm.models import TaskStatus
 from lunagentic_research_swarm.runtime.controller import TaskController
-from lunagentic_research_swarm.runtime.events import AgentCallCompleted, StopRequested
-from lunagentic_research_swarm.runtime.reducer import PerformProcedureBatch, RuntimeState
+from lunagentic_research_swarm.runtime.events import (
+    AgentCallCompleted,
+    PauseRequested,
+    ProcedureBatchCompleted,
+    StopRequested,
+)
+from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformProcedureBatch, RuntimeState
 from lunagentic_research_swarm.runtime.scheduler import FairScheduler
+from lunagentic_research_swarm.storage.sqlite import StoreCommand
 
-from .test_controller_start import FakeScheduler, harness
+from .test_controller_start import FakeScheduler, FakeStore, harness
 
 
 class ControllableScheduler(FakeScheduler):
@@ -245,6 +251,65 @@ async def test_continue_without_leaves_persists_negative_pool_and_refuses_restar
     assert len([command for command in store.commands if command.kind == "insert_branch"]) == branch_inserts
     continuation = [command for command in store.commands if command.kind == "update_round_continuation"]
     assert continuation[-1].values["credit_pool"] == -1.0
+    status = await manager.status(task_id)
+    assert status["active_leaves"] == []
+    assert status["raw_context_released"] is True
+
+
+@pytest.mark.asyncio
+async def test_continue_uses_reconciled_runtime_branch_credit_balance(harness) -> None:
+    manager, store, _, _, task_id = await _running_manager(harness)
+    before = await manager.status(task_id)
+    branch_id = before["active_leaves"][0]["branch_id"]
+
+    await manager.handle_runtime_event(
+        AgentCallCompleted(
+            event_id="reconcile-credit",
+            task_id=task_id,
+            round_id=before["round_id"],
+            generation=before["generation"],
+            branch_id=branch_id,
+            call_id="call",
+            result_id="result",
+            actual_charge=20.0,
+            balance_before_reconciliation=100.0,
+            protocol_result={"report": "完成", "procedures": (), "delegations": ()},
+        )
+    )
+    await manager.pause(task_id)
+
+    result = await manager.continue_task(task_id)
+
+    assert result["active_leaves"] == [{"branch_id": branch_id, "credits": 80.0}]
+    balances = [command for command in store.commands if command.kind == "update_branch_balance"]
+    assert balances[-1].values["branch_id"] == branch_id
+    assert balances[-1].values["credit_balance"] == 80.0
+
+
+@pytest.mark.asyncio
+async def test_controller_reducer_error_rejects_manager_state_changes_and_effect_override() -> None:
+    store = FakeStore()
+    scheduler = FakeScheduler()
+    controller = TaskController(
+        RuntimeState("task", TaskStatus.PAUSED, generation=0, active_round_id="round", raw_context_released=True),
+        store=store,
+        scheduler=scheduler,
+    )
+
+    accepted = await controller.apply(
+        PauseRequested("invalid-pause", "task", "round", 0),
+        extra_commands=(StoreCommand("insert_branch", {"branch_id": "phantom"}),),
+        effects=(PerformAgentCall("task", "round", 0, payload={}),),
+        state_changes={"active_leaves": {"phantom": 10.0}, "raw_context_released": False},
+    )
+
+    assert accepted is False
+    assert controller.state.status is TaskStatus.PAUSED
+    assert controller.state.active_leaves == {}
+    assert controller.state.raw_context_released is True
+    assert store.commands == []
+    assert len(scheduler.enqueued) == 1
+    assert not isinstance(scheduler.enqueued[0], PerformAgentCall)
 
 
 @pytest.mark.asyncio
@@ -266,6 +331,66 @@ async def test_pause_uses_fair_scheduler_public_stats_when_task_wait_api_is_abse
     paused = await manager.pause(result["task_id"])
     assert paused["status"] == "PAUSING"
     release.set()
+    await manager.wait_idle(result["task_id"])
+    assert (await manager.status(result["task_id"]))["status"] == "PAUSED"
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_waits_for_queued_procedure_during_agent_to_procedure_handoff(harness) -> None:
+    manager, _, _, _, _, _ = harness
+    agent_started = asyncio.Event()
+    release_agent = asyncio.Event()
+    procedure_started = asyncio.Event()
+    release_procedure = asyncio.Event()
+
+    async def worker(effect, token):
+        if isinstance(effect, PerformAgentCall):
+            agent_started.set()
+            await release_agent.wait()
+            return AgentCallCompleted(
+                event_id="agent-completed",
+                task_id=effect.task_id,
+                round_id=effect.round_id,
+                generation=effect.generation,
+                branch_id=effect.payload["branch_id"],
+                call_id="call",
+                result_id="result",
+                actual_charge=0.0,
+                balance_before_reconciliation=100.0,
+                protocol_result={"report": "完成", "procedures": (), "delegations": ()},
+            )
+        if isinstance(effect, PerformProcedureBatch):
+            procedure_started.set()
+            await release_procedure.wait()
+            return ProcedureBatchCompleted(
+                event_id="procedures-completed",
+                task_id=effect.task_id,
+                round_id=effect.round_id,
+                generation=effect.generation,
+                branch_id=effect.payload["branch_id"],
+                call_id=effect.payload["call_id"],
+                credits_after=float(effect.payload["credits_after"]),
+            )
+        return None
+
+    async def on_result(effect, result, token) -> None:
+        if isinstance(result, AgentCallCompleted):
+            await manager.handle_runtime_event(result)
+
+    scheduler = FairScheduler(worker=worker, on_result=on_result)
+    manager.scheduler = scheduler
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await agent_started.wait()
+
+    paused = await manager.pause(result["task_id"])
+    assert paused["status"] == "PAUSING"
+    release_agent.set()
+    await procedure_started.wait()
+    await asyncio.sleep(0)
+    assert (await manager.status(result["task_id"]))["status"] == "PAUSING"
+
+    release_procedure.set()
     await manager.wait_idle(result["task_id"])
     assert (await manager.status(result["task_id"]))["status"] == "PAUSED"
     await scheduler.close()

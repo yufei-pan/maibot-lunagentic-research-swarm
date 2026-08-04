@@ -978,10 +978,14 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         except (TypeError, ValueError) as exc:
             return _invalid(state, event, f"AgentCallCompleted reconciliation 无效：{exc}")
         commands: list[StoreCommand] = list(reconciliation.commands)
+        leaves = _state_leaves(state)
+        if event.branch_id in leaves:
+            leaves[event.branch_id] = balance_after
+        reconciled_state = _replace_state(state, active_leaves=leaves)
         if event.protocol_error is not None:
             if balance_after < 0:
                 return Transition(
-                    state,
+                    reconciled_state,
                     commands=tuple(commands),
                     effects=(
                         _effect(
@@ -999,7 +1003,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             )
             if not can_correct:
                 return Transition(
-                    state,
+                    reconciled_state,
                     commands=tuple(commands),
                     effects=(
                         _effect(
@@ -1017,6 +1021,9 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             correction_call_id = event.correction_call_id or f"{event.call_id}:correction"
             correction_estimate = event.correction_estimated_charge
             correction_balance = balance_after - correction_estimate
+            correction_leaves = _state_leaves(reconciled_state)
+            if event.branch_id in correction_leaves:
+                correction_leaves[event.branch_id] = correction_balance
             correction_reservation = reserve_input(
                 correction_estimate,
                 task_id=event.task_id,
@@ -1036,7 +1043,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             commands.extend(correction_reservation.commands)
             messages = (*event.messages, correction_message)
             return Transition(
-                state,
+                _replace_state(reconciled_state, active_leaves=correction_leaves),
                 commands=tuple(commands),
                 effects=(
                     _effect(
@@ -1064,7 +1071,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             )
         result = dict(event.protocol_result or {})
         return Transition(
-            state,
+            reconciled_state,
             commands=tuple(commands),
             effects=(
                 _effect(
@@ -1118,8 +1125,11 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             )
         except (TypeError, ValueError) as exc:
             return _invalid(state, event, f"AgentCallFailed reconciliation 无效：{exc}")
+        leaves = _state_leaves(state)
+        if event.branch_id in leaves:
+            leaves[event.branch_id] = balance_after
         return Transition(
-            state,
+            _replace_state(state, active_leaves=leaves),
             commands=reconciliation.commands,
             effects=(
                 _effect(
@@ -1180,6 +1190,10 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         authoritative_calls_started = max(state_calls_started, event.agent_calls_started)
         next_state = _replace_state(state, agent_calls_started=authoritative_calls_started)
         credits_after = event.credits_after
+        leaves = _state_leaves(next_state)
+        if event.branch_id in leaves:
+            leaves[event.branch_id] = credits_after
+        next_state = _replace_state(next_state, active_leaves=leaves)
         if bool(getattr(state, "continue_barrier", False)):
             leaves = _state_leaves(state)
             leaves[event.branch_id] = credits_after

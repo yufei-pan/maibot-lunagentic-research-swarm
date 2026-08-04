@@ -110,8 +110,17 @@ class TaskController:
         except Exception as exc:
             await self._fail_after_storage_error(event, exc)
             return False
+        if transition.error is not None:
+            # A reducer error may carry its own durable compensation (for
+            # example a rejected terminal continue persists its credit pool),
+            # but it must never accept manager-supplied state, commands, or
+            # effects intended for a successful transition.
+            self.state = transition.next_state
+            for effect in transition.effects:
+                await self.scheduler.enqueue(effect)
+            return False
         self.state = _replace_state(transition.next_state, **dict(state_changes or {}))
-        selected_effects = transition.effects if effects is None or transition.error is not None else effects
+        selected_effects = transition.effects if effects is None else effects
         for effect in selected_effects:
             await self.scheduler.enqueue(effect)
         return True

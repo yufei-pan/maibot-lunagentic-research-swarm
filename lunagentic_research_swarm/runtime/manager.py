@@ -190,9 +190,9 @@ class ResearchManager:
             if hasattr(result, "__await__"):
                 await result
         else:
-            # FairScheduler intentionally exposes telemetry rather than a
-            # task-specific wait API.  Poll only its public active count; a
-            # paused task's queued work must not hold the pause barrier open.
+            # FairScheduler exposes telemetry rather than a task-specific wait
+            # API.  A task is settled only after both active and queued local
+            # work have drained, including an agent→procedure handoff.
             while self._task_inflight_count(task_id):
                 await asyncio.sleep(0)
         await self._mark_paused(task_id)
@@ -328,6 +328,7 @@ class ResearchManager:
         # path.  In particular, AgentCallCompleted reconciles cost and queues the
         # next procedure/materialization phase after its transaction commits.
         await self._submit(controller, event)
+        self._sync_branch_credits(event.task_id, controller)
 
     async def _submit(self, controller: TaskController, event: Any) -> None:
         """Submit a runtime event through the sole transaction-before-effect driver."""
@@ -344,8 +345,22 @@ class ResearchManager:
         stats = getattr(self.scheduler, "stats", None)
         if callable(stats):
             task = dict(stats().get("tasks", {}).get(task_id, {}))
-            return max(0, int(task.get("active", 0)))
+            # A worker may enqueue the next procedure before it releases its
+            # own active slot.  The pause barrier is therefore idle only after
+            # both sides of that handoff have drained.
+            return max(0, int(task.get("active", 0))) + max(0, int(task.get("queued", 0)))
         return 0
+
+    def _sync_branch_credits(self, task_id: str, controller: TaskController) -> None:
+        """Mirror reducer-owned balances into the status-only branch cache."""
+
+        branches = self._branches.get(task_id)
+        if branches is None:
+            return
+        for branch_id, credits in controller.state.active_leaves.items():
+            branch = branches.get(branch_id)
+            if branch is not None:
+                branch["credits"] = float(credits)
 
     async def wait_idle(self, task_id: str) -> None:
         while True:
