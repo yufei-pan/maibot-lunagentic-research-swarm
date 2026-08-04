@@ -22,7 +22,12 @@ from typing import Any, ClassVar, TypeAlias
 from lunagentic_research_swarm.errors import INVALID_STATE, STORAGE_COMMIT_FAILED, LRSError
 from lunagentic_research_swarm.models import FormalizedTask, TaskSnapshot, TaskStatus
 from lunagentic_research_swarm.llm.protocol import ProtocolError, build_correction_message
-from lunagentic_research_swarm.runtime.credits import reconcile_usage, redistribute_pool, reserve_input
+from lunagentic_research_swarm.runtime.credits import (
+    allocate_children,
+    reconcile_usage,
+    redistribute_pool,
+    reserve_input,
+)
 from lunagentic_research_swarm.runtime.events import (
     AgentCallCompleted,
     AgentCallFailed,
@@ -333,6 +338,15 @@ def _lifecycle_event_command(
 ) -> StoreCommand:
     """构造 lifecycle event 行；round_id 可指向同 transaction 新建的 round。"""
 
+    metadata = {
+        name: getattr(event, name)
+        for name in event.__dataclass_fields__
+        if name not in {"event_id", "task_id", "round_id", "generation", "occurred_at"}
+    }
+    # Agent call effect 仍需完整 messages，但 reservation lifecycle 是长期审计记录，
+    # 只保留 routing/accounting 字段，绝不复制 raw prompt/transcript。
+    if isinstance(event, AgentCallRequested):
+        metadata.pop("messages", None)
     event_values = {
         "event_id": event.event_id,
         "task_id": event.task_id,
@@ -340,9 +354,7 @@ def _lifecycle_event_command(
         "event_type": type(event).__name__,
         "from_status": old.value,
         "to_status": new.value,
-        "metadata_json": _metadata_json(
-            {name: getattr(event, name) for name in event.__dataclass_fields__ if name not in {"event_id", "task_id", "round_id", "generation", "occurred_at"}}
-        ),
+        "metadata_json": _metadata_json(metadata),
         "created_at": event.occurred_at.timestamp(),
     }
     return _command("insert_lifecycle_event", event_values)
@@ -384,6 +396,109 @@ def _effect(
         event_id=event.event_id,
         payload=payload or {},
     )
+
+
+def _positive_limit(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须为正整数")
+    return value
+
+
+def _delegation_effects(event: ProcedureBatchCompleted, credits_after: float) -> tuple[Effect, ...]:
+    """在 Procedure durable boundary 把每条 delegation 解析为显式 immutable effect。"""
+
+    max_delegations = _positive_limit(event.max_delegations_per_turn, "max_delegations_per_turn")
+    max_depth = _positive_limit(event.max_branch_depth, "max_branch_depth")
+    max_calls = _positive_limit(event.max_agent_calls_per_task, "max_agent_calls_per_task")
+    if isinstance(event.parent_depth, bool) or not isinstance(event.parent_depth, int) or event.parent_depth < 0:
+        raise ValueError("parent_depth 必须为非负整数")
+    if (
+        isinstance(event.agent_calls_started, bool)
+        or not isinstance(event.agent_calls_started, int)
+        or event.agent_calls_started < 0
+    ):
+        raise ValueError("agent_calls_started 必须为非负整数")
+
+    normalized: list[tuple[int, str, str, float, str | None]] = []
+    allocatable: list[tuple[str, float]] = []
+    available_calls = max(0, max_calls - event.agent_calls_started)
+    for index, raw in enumerate(event.delegations):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"delegations[{index}] 必须为对象")
+        agent_id = raw.get("agent_id")
+        assignment = raw.get("task")
+        requested_credits = raw.get("credits", 0.0)
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError(f"delegations[{index}].agent_id 必须为非空字符串")
+        if not isinstance(assignment, str) or not assignment:
+            raise ValueError(f"delegations[{index}].task 必须为非空字符串")
+        if isinstance(requested_credits, bool) or not isinstance(requested_credits, int | float):
+            raise ValueError(f"delegations[{index}].credits 必须为非负有限数")
+        reason: str | None = None
+        if index >= max_delegations:
+            reason = "delegation_limit_exceeded"
+        elif event.parent_depth >= max_depth:
+            reason = "branch_depth_exceeded"
+        elif index >= available_calls:
+            reason = "agent_call_limit_exceeded"
+        normalized.append((index, agent_id, assignment, float(requested_credits), reason))
+        if reason is None:
+            allocatable.append((str(index), float(requested_credits)))
+
+    allocations = allocate_children(credits_after, allocatable).allocations
+    live_agents = None if event.live_agent_ids is None else frozenset(event.live_agent_ids)
+    effects: list[Effect] = []
+    for index, agent_id, assignment, _requested_credits, structural_reason in normalized:
+        child_branch_id = f"{event.branch_id}:{index + 1}"
+        credits = float(allocations.get(str(index), 0.0))
+        reason = structural_reason
+        if reason is None and live_agents is not None and agent_id not in live_agents:
+            reason = "agent_unavailable"
+        if reason is not None:
+            edge_messages = (
+                *event.parent_messages,
+                {
+                    "role": "user",
+                    "content": f"assignment: {assignment}\nedge finalized: {reason}",
+                },
+            )
+            effects.append(
+                _effect(
+                    PerformBranchSummary,
+                    event,
+                    priority="barrier",
+                    payload={
+                        "edge_finalization": True,
+                        "branch_id": child_branch_id,
+                        "parent_branch_id": event.branch_id,
+                        "agent_id": agent_id,
+                        "assignment": assignment,
+                        "reason": reason,
+                        "credits": credits if structural_reason is None else 0.0,
+                        "depth": event.parent_depth + 1,
+                        "messages": edge_messages,
+                    },
+                )
+            )
+            continue
+        effects.append(
+            _effect(
+                NotifyToolWaiter,
+                event,
+                priority="barrier",
+                payload={
+                    "action": "materialize_child",
+                    "branch_id": child_branch_id,
+                    "parent_branch_id": event.branch_id,
+                    "agent_id": agent_id,
+                    "assignment": assignment,
+                    "credits": credits,
+                    "depth": event.parent_depth + 1,
+                    "messages": (*event.parent_messages, {"role": "user", "content": f"assignment: {assignment}"}),
+                },
+            )
+        )
+    return tuple(effects)
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -779,6 +894,12 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                         "credits_after_reservation": credits_after_reservation,
                         "correction_count": event.correction_count,
                         "pinning_supported": event.pinning_supported,
+                        "branch_depth": event.branch_depth,
+                        "live_agent_ids": event.live_agent_ids,
+                        "max_delegations_per_turn": event.max_delegations_per_turn,
+                        "max_branch_depth": event.max_branch_depth,
+                        "max_agent_calls_per_task": event.max_agent_calls_per_task,
+                        "agent_calls_started": event.agent_calls_started,
                     },
                 ),
             ),
@@ -888,6 +1009,12 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                             "credits_after_reservation": correction_balance,
                             "correction_count": 1,
                             "pinning_supported": True,
+                            "branch_depth": event.branch_depth,
+                            "live_agent_ids": event.live_agent_ids,
+                            "max_delegations_per_turn": event.max_delegations_per_turn,
+                            "max_branch_depth": event.max_branch_depth,
+                            "max_agent_calls_per_task": event.max_agent_calls_per_task,
+                            "agent_calls_started": event.agent_calls_started,
                         },
                     ),
                 ),
@@ -908,6 +1035,13 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                         "requests": tuple(result.get("procedures", ())),
                         "delegations": tuple(result.get("delegations", ())),
                         "credits_after": balance_after,
+                        "messages": event.messages,
+                        "branch_depth": event.branch_depth,
+                        "live_agent_ids": event.live_agent_ids,
+                        "max_delegations_per_turn": event.max_delegations_per_turn,
+                        "max_branch_depth": event.max_branch_depth,
+                        "max_agent_calls_per_task": event.max_agent_calls_per_task,
+                        "agent_calls_started": event.agent_calls_started,
                     },
                 ),
             ),
@@ -916,8 +1050,34 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     if isinstance(event, AgentCallFailed):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING}:
             return _invalid(state, event, "AgentCallFailed 只能用于活跃 round")
+        actual_charge = event.actual_charge
+        if event.usage is not None and actual_charge is None:
+            actual_charge = event.estimated_charge
+        balance_after = event.balance_before_reconciliation
+        if event.usage is not None:
+            balance_after += event.estimated_charge - float(actual_charge or 0.0)
+        try:
+            reconciliation = reconcile_usage(
+                estimated_charge=event.estimated_charge,
+                actual_charge=actual_charge,
+                actual_model_name=event.actual_model_name or None,
+                usage=event.usage,
+                success=False,
+                task_id=event.task_id,
+                round_id=event.round_id,
+                branch_id=event.branch_id,
+                call_id=event.call_id,
+                role="agent",
+                selector=event.selector,
+                balance_after=balance_after,
+                created_at=event.occurred_at,
+                metadata={"error_code": event.error_code or "agent_failed"},
+            )
+        except (TypeError, ValueError) as exc:
+            return _invalid(state, event, f"AgentCallFailed reconciliation 无效：{exc}")
         return Transition(
             state,
+            commands=reconciliation.commands,
             effects=(
                 _effect(
                     PerformBranchSummary,
@@ -1003,25 +1163,14 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         elif not held:
             reason = "no_further_work"
         else:
-            # Child materialization is performed by the transaction-aware controller
-            # from this immutable payload; it must submit AgentCallRequested before a
-            # scheduler can receive PerformAgentCall.
+            try:
+                materialization_effects = _delegation_effects(event, credits_after)
+            except (TypeError, ValueError) as exc:
+                return _invalid(next_state, event, f"ProcedureBatchCompleted delegation 无效：{exc}")
             return Transition(
                 next_state,
                 commands=tuple(commands),
-                effects=(
-                    _effect(
-                        NotifyToolWaiter,
-                        event,
-                        priority="barrier",
-                        payload={
-                            "action": "materialize_children",
-                            "branch_id": event.branch_id,
-                            "delegations": held,
-                            "credits_after": credits_after,
-                        },
-                    ),
-                ),
+                effects=materialization_effects,
             )
         return Transition(
             next_state,

@@ -1,17 +1,30 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from lunagentic_research_swarm.llm.gateway import GenerationResult
+from lunagentic_research_swarm.llm.gateway import GenerationError, GenerationResult
 from lunagentic_research_swarm.llm.pricing import TokenUsage
 from lunagentic_research_swarm.llm.protocol import DelegationRequest, ProcedureRequest, SwarmTurnEnvelope
 from lunagentic_research_swarm.models import BranchRuntime, FormalizedTask, TaskStatus
 from lunagentic_research_swarm.procedures.core import CoreProcedureDecision
-from lunagentic_research_swarm.runtime.events import AgentCallCompleted, AgentCallRequested, ProcedureBatchCompleted
-from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformBranchSummary, RuntimeState, reduce_event
+from lunagentic_research_swarm.runtime.events import (
+    AgentCallCompleted,
+    AgentCallFailed,
+    AgentCallRequested,
+    ProcedureBatchCompleted,
+)
+from lunagentic_research_swarm.runtime.reducer import (
+    NotifyToolWaiter,
+    PerformAgentCall,
+    PerformBranchSummary,
+    PerformProcedureBatch,
+    RuntimeState,
+    reduce_event,
+)
 from lunagentic_research_swarm.runtime.turns import TurnLimits, TurnWorker, resolve_completed_turn
 
 
@@ -212,6 +225,156 @@ def test_reducer_reserves_before_scheduling_agent_call() -> None:
     assert transition.effects[0].payload["credits_after_reservation"] == pytest.approx(2.75)
 
 
+def test_agent_reservation_lifecycle_metadata_omits_raw_messages() -> None:
+    state = RuntimeState("task-1", TaskStatus.RUNNING, generation=0, active_round_id="round-1")
+    event = AgentCallRequested(
+        "evt-request-private",
+        "task-1",
+        "round-1",
+        0,
+        occurred_at=NOW,
+        branch_id="branch-1",
+        call_id="call-1",
+        agent_id="agent.a",
+        selector="task:reasoning",
+        messages=({"role": "user", "content": "SECRET_RAW_PROMPT"},),
+        prompt_tokens=100,
+        estimated_charge=1.25,
+        balance_before=4.0,
+    )
+
+    transition = reduce_event(state, event)
+
+    lifecycle = next(command for command in transition.commands if command.kind == "insert_lifecycle_event")
+    metadata = json.loads(lifecycle.values["metadata_json"])
+    assert "messages" not in metadata
+    assert "SECRET_RAW_PROMPT" not in lifecycle.values["metadata_json"]
+    assert metadata["selector"] == "task:reasoning"
+    assert metadata["estimated_charge"] == pytest.approx(1.25)
+
+
+@pytest.mark.asyncio
+async def test_protocol_correction_appends_to_original_request_messages() -> None:
+    original_messages = (
+        {"role": "system", "content": "stable prefix"},
+        {"role": "user", "content": "formalized task"},
+        {"role": "user", "content": "runtime header"},
+    )
+    llm = FakeLLM(
+        GenerationResult(
+            response='{"report": 7}',
+            tool_calls=None,
+            model_name="physical-v1",
+            usage=TokenUsage(10, 2, 0, 10, source="actual"),
+            success=True,
+            error=None,
+            duration=0.25,
+        )
+    )
+    effect = PerformAgentCall(
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        event_id="evt-call",
+        payload={
+            "branch_id": "branch-1",
+            "call_id": "call-1",
+            "selector": "task:reasoning",
+            "protocol": "json_envelope",
+            "messages": original_messages,
+            "estimated_charge": 2.0,
+            "credits_after_reservation": 8.0,
+            "correction_call_id": "call-1:correction",
+            "correction_usage_id": "usage-correction",
+            "correction_ledger_id": "ledger-correction",
+            "correction_estimated_charge": 0.1,
+        },
+    )
+
+    completed = await TurnWorker(llm, RecordingProcedures(), pricing=FakePricing()).perform_agent_call(effect)
+    assert isinstance(completed, AgentCallCompleted)
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.RUNNING, generation=0, active_round_id="round-1"),
+        completed,
+    )
+
+    correction = next(item for item in transition.effects if isinstance(item, PerformAgentCall))
+    assert correction.payload["messages"][:-1] == original_messages
+    assert correction.payload["messages"][-1]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_failed_agent_call_with_usage_reconciles_reserved_estimate() -> None:
+    llm = FakeLLM(
+        GenerationResult(
+            response="",
+            tool_calls=None,
+            model_name="physical-v1",
+            usage=TokenUsage(10, 2, 0, 10, source="actual"),
+            success=False,
+            error=GenerationError("provider_error", "provider failed after usage"),
+            duration=0.25,
+        )
+    )
+    effect = PerformAgentCall(
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        event_id="evt-call",
+        payload={
+            "branch_id": "branch-1",
+            "call_id": "call-1",
+            "selector": "task:reasoning",
+            "messages": ({"role": "user", "content": "task"},),
+            "estimated_charge": 2.0,
+            "credits_after_reservation": 8.0,
+        },
+    )
+
+    failed = await TurnWorker(llm, RecordingProcedures(), pricing=FakePricing()).perform_agent_call(effect)
+    assert isinstance(failed, AgentCallFailed)
+    assert failed.usage == {"prompt_tokens": 10, "completion_tokens": 2, "cache_hit_tokens": 0, "cache_miss_tokens": 10}
+    assert failed.actual_model_name == "physical-v1"
+    assert failed.actual_charge == pytest.approx(1.5)
+
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.RUNNING, generation=0, active_round_id="round-1"),
+        failed,
+    )
+    usage = next(command for command in transition.commands if command.kind == "insert_llm_usage")
+    ledger = next(command for command in transition.commands if command.kind == "insert_credit_ledger")
+    assert usage.values["reconciliation_status"] == "actual"
+    assert usage.values["actual_charge"] == pytest.approx(1.5)
+    assert ledger.values["amount"] == pytest.approx(0.5)
+    assert any(isinstance(item, PerformBranchSummary) for item in transition.effects)
+
+
+def test_failed_agent_call_without_usage_stays_estimated_unreconciled() -> None:
+    failed = AgentCallFailed(
+        "evt-failed",
+        "task-1",
+        "round-1",
+        0,
+        occurred_at=NOW,
+        branch_id="branch-1",
+        call_id="call-1",
+        error_code="provider_error",
+        error_message="failed before usage",
+        estimated_charge=2.0,
+        balance_before_reconciliation=8.0,
+    )
+
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.RUNNING, generation=0, active_round_id="round-1"),
+        failed,
+    )
+
+    usage = next(command for command in transition.commands if command.kind == "insert_llm_usage")
+    assert usage.values["reconciliation_status"] == "estimated_unreconciled"
+    assert usage.values["actual_charge"] is None
+    assert not any(command.kind == "insert_credit_ledger" for command in transition.commands)
+
+
 def test_protocol_correction_is_pinned_to_first_actual_model_and_only_once() -> None:
     state = RuntimeState("task-1", TaskStatus.RUNNING, generation=0, active_round_id="round-1")
     event = AgentCallCompleted(
@@ -297,3 +460,135 @@ def test_procedure_completion_applies_control_then_negative_then_checkpoint_orde
     assert negative.effects[0].payload["reason"] == "negative_credit"
     assert checkpoint.effects[0].payload["reason"] == "checkpoint"
     assert checkpoint.effects[0].payload["held_delegations"] == base["delegations"]
+
+
+def test_procedure_completion_materializes_valid_sibling_and_finalizes_rejected_edges() -> None:
+    event = ProcedureBatchCompleted(
+        event_id="evt-procedures-materialize",
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        branch_id="branch-1",
+        call_id="call-1",
+        result_id="result-1",
+        credits_after=3.0,
+        delegations=(
+            {"agent_id": "agent.removed", "task": "removed assignment", "credits": 1.0},
+            {"agent_id": "agent.valid", "task": "valid assignment", "credits": 1.0},
+            {"agent_id": "agent.extra", "task": "extra assignment", "credits": 1.0},
+        ),
+        parent_messages=({"role": "user", "content": "formalized task"},),
+        parent_depth=0,
+        live_agent_ids=("agent.valid", "agent.extra"),
+        max_delegations_per_turn=2,
+        max_branch_depth=32,
+        max_agent_calls_per_task=256,
+        agent_calls_started=0,
+    )
+
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.RUNNING, generation=0, active_round_id="round-1"),
+        event,
+    )
+
+    children = [
+        item for item in transition.effects
+        if isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
+    ]
+    edges = [item for item in transition.effects if isinstance(item, PerformBranchSummary)]
+    assert [item.payload["agent_id"] for item in children] == ["agent.valid"]
+    assert children[0].payload["messages"][-1]["content"] == "assignment: valid assignment"
+    assert [(item.payload["agent_id"], item.payload["reason"]) for item in edges] == [
+        ("agent.removed", "agent_unavailable"),
+        ("agent.extra", "delegation_limit_exceeded"),
+    ]
+    assert edges[0].payload["assignment"] == "removed assignment"
+    assert edges[0].payload["messages"][-1]["content"].endswith("agent_unavailable")
+    with pytest.raises(TypeError):
+        edges[0].payload["messages"][0]["content"] = "mutated"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("parent_depth", "agent_calls_started", "reason"),
+    [
+        (32, 0, "branch_depth_exceeded"),
+        (0, 256, "agent_call_limit_exceeded"),
+    ],
+)
+def test_procedure_completion_reaches_each_structural_edge_limit(
+    parent_depth: int,
+    agent_calls_started: int,
+    reason: str,
+) -> None:
+    event = ProcedureBatchCompleted(
+        event_id=f"evt-{reason}",
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        branch_id="branch-1",
+        call_id="call-1",
+        credits_after=1.0,
+        delegations=({"agent_id": "agent.valid", "task": "child", "credits": 1.0},),
+        parent_depth=parent_depth,
+        live_agent_ids=("agent.valid",),
+        max_delegations_per_turn=8,
+        max_branch_depth=32,
+        max_agent_calls_per_task=256,
+        agent_calls_started=agent_calls_started,
+    )
+
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.RUNNING, generation=0, active_round_id="round-1"),
+        event,
+    )
+
+    edge = next(item for item in transition.effects if isinstance(item, PerformBranchSummary))
+    assert edge.payload["reason"] == reason
+    assert not any(
+        isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
+        for item in transition.effects
+    )
+
+
+class CompletedProcedures:
+    async def invoke_many(self, effect: PerformProcedureBatch) -> ProcedureBatchCompleted:
+        return ProcedureBatchCompleted(
+            event_id="evt-procedures",
+            task_id=effect.task_id,
+            round_id=str(effect.round_id),
+            generation=effect.generation,
+            branch_id=str(effect.payload["branch_id"]),
+            call_id=str(effect.payload["call_id"]),
+        )
+
+
+@pytest.mark.asyncio
+async def test_procedure_worker_preserves_materialization_snapshot_for_reducer_boundary() -> None:
+    effect = PerformProcedureBatch(
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        payload={
+            "branch_id": "branch-1",
+            "call_id": "call-1",
+            "delegations": ({"agent_id": "agent.valid", "task": "child", "credits": 1.0},),
+            "credits_after": 1.0,
+            "messages": ({"role": "user", "content": "formalized task"},),
+            "branch_depth": 7,
+            "live_agent_ids": ("agent.valid",),
+            "max_delegations_per_turn": 4,
+            "max_branch_depth": 9,
+            "max_agent_calls_per_task": 11,
+            "agent_calls_started": 3,
+        },
+    )
+
+    event = await TurnWorker(FakeLLM, CompletedProcedures()).perform_procedure_batch(effect)
+
+    assert event.parent_messages == effect.payload["messages"]
+    assert event.parent_depth == 7
+    assert event.live_agent_ids == ("agent.valid",)
+    assert event.max_delegations_per_turn == 4
+    assert event.max_branch_depth == 9
+    assert event.max_agent_calls_per_task == 11
+    assert event.agent_calls_started == 3

@@ -47,3 +47,35 @@ PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
 ## Commit
 
 本报告随 `feat: implement agent turn pipeline` 提交。
+
+## Review fix round 1
+
+复审发现的四项阻塞已在 Task 5 范围内修复：
+
+- `AgentCallRequested` 的 reservation lifecycle metadata 现在剥离完整 `messages`，不再持久化
+  raw prompt/transcript；selector、模型、token、价格、余额与结构限制等 routing/accounting 字段保留。
+- `TurnWorker` 把原始 request messages 写入 `AgentCallCompleted`；同物理模型 correction 因而在原上下文
+  末尾追加 schema error，而不是从空消息开始。
+- `AgentCallFailed` 携带 normalized usage、实际模型、实际/预估费用与预留后余额。失败有 usage 时 reducer
+  写 whole-call reconciliation 与 signed ledger adjustment；无 usage 时写
+  `estimated_unreconciled` telemetry，保留 reservation 且不产生补偿 ledger。
+- delegation/depth/task-call 上限与 missing-agent 判断已经接入 `ProcedureBatchCompleted` durable
+  materialization boundary。合法 sibling 逐个发出 immutable `materialize_child` effect；被拒绝的 edge
+  逐个发出带原 assignment、credits、clone messages 与明确原因的 immutable branch-finalization effect。
+
+### Fix-round TDD 与验证
+
+```text
+RED: PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest tests/runtime/test_turns.py -q
+→ 8 failed, 10 passed
+
+GREEN focused: PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
+  tests/runtime/test_turns.py tests/runtime/test_context_invariance.py -q
+→ 22 passed
+
+Impacted: PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
+  tests/runtime tests/procedures tests/test_events.py -q
+→ 96 passed
+```
+
+本轮仍未修改 controller、reporting 或 Task 6+ 文件。

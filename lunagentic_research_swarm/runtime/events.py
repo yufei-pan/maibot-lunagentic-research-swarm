@@ -102,9 +102,17 @@ class AgentCallRequested(Event):
     estimated_model_name: str = ""
     correction_count: int = 0
     pinning_supported: bool = True
+    branch_depth: int = 0
+    live_agent_ids: tuple[str, ...] | None = None
+    max_delegations_per_turn: int = 8
+    max_branch_depth: int = 32
+    max_agent_calls_per_task: int = 256
+    agent_calls_started: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "messages", tuple(_freeze_value(self.messages)))
+        if self.live_agent_ids is not None:
+            object.__setattr__(self, "live_agent_ids", tuple(str(item) for item in self.live_agent_ids))
 
 
 @_register
@@ -136,6 +144,12 @@ class AgentCallCompleted(Event):
     correction_estimated_charge: float = 0.0
     pinning_supported: bool = True
     messages: tuple[Mapping[str, Any], ...] = ()
+    branch_depth: int = 0
+    live_agent_ids: tuple[str, ...] | None = None
+    max_delegations_per_turn: int = 8
+    max_branch_depth: int = 32
+    max_agent_calls_per_task: int = 256
+    agent_calls_started: int = 0
 
     def __post_init__(self) -> None:
         if self.usage is not None:
@@ -145,6 +159,8 @@ class AgentCallCompleted(Event):
         if self.protocol_error is not None:
             object.__setattr__(self, "protocol_error", _freeze_value(self.protocol_error))
         object.__setattr__(self, "messages", tuple(_freeze_value(self.messages)))
+        if self.live_agent_ids is not None:
+            object.__setattr__(self, "live_agent_ids", tuple(str(item) for item in self.live_agent_ids))
 
 
 @_register
@@ -154,6 +170,16 @@ class AgentCallFailed(Event):
     call_id: str = ""
     error_code: str = ""
     error_message: str = ""
+    usage: Mapping[str, Any] | None = None
+    actual_model_name: str = ""
+    actual_charge: float | None = None
+    estimated_charge: float = 0.0
+    balance_before_reconciliation: float = 0.0
+    selector: str = ""
+
+    def __post_init__(self) -> None:
+        if self.usage is not None:
+            object.__setattr__(self, "usage", _freeze_value(self.usage))
 
 
 @_register
@@ -169,6 +195,13 @@ class ProcedureBatchCompleted(Event):
     report: str = ""
     delegations: tuple[Mapping[str, Any], ...] = ()
     credits_after: float = 0.0
+    parent_messages: tuple[Mapping[str, Any], ...] = ()
+    parent_depth: int = 0
+    live_agent_ids: tuple[str, ...] | None = None
+    max_delegations_per_turn: int = 8
+    max_branch_depth: int = 32
+    max_agent_calls_per_task: int = 256
+    agent_calls_started: int = 0
 
     def __post_init__(self) -> None:
         normalized: list[Any] = []
@@ -198,6 +231,9 @@ class ProcedureBatchCompleted(Event):
             normalized.append(item)
         object.__setattr__(self, "results", tuple(_freeze_value(normalized)))
         object.__setattr__(self, "delegations", tuple(_freeze_value(self.delegations)))
+        object.__setattr__(self, "parent_messages", tuple(_freeze_value(self.parent_messages)))
+        if self.live_agent_ids is not None:
+            object.__setattr__(self, "live_agent_ids", tuple(str(item) for item in self.live_agent_ids))
         if isinstance(self.controls, Mapping):
             try:
                 from lunagentic_research_swarm.procedures.core import CoreProcedureDecision

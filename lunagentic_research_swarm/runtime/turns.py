@@ -233,14 +233,6 @@ class TurnWorker:
             "branch_id": str(payload.get("branch_id", "")),
             "call_id": str(payload.get("call_id", "")),
         }
-        if not result.success:
-            error = result.error
-            return AgentCallFailed(
-                **common,
-                error_code=error.code if error is not None else "llm_generation_failed",
-                error_message=error.message if error is not None else "LLM 调用失败",
-            )
-
         usage = None
         if result.usage is not None:
             usage = {
@@ -259,6 +251,20 @@ class TurnWorker:
                 cache_miss_tokens=result.usage.cache_miss_tokens,
             )
             actual_charge = float(charged.credits)
+        if not result.success:
+            error = result.error
+            return AgentCallFailed(
+                **common,
+                error_code=error.code if error is not None else "llm_generation_failed",
+                error_message=error.message if error is not None else "LLM 调用失败",
+                usage=usage,
+                actual_model_name=result.model_name,
+                actual_charge=actual_charge,
+                estimated_charge=float(payload.get("estimated_charge", 0.0)),
+                balance_before_reconciliation=float(payload.get("credits_after_reservation", 0.0)),
+                selector=str(payload.get("selector", "")),
+            )
+
         envelope: SwarmTurnEnvelope | None = None
         protocol_error: Mapping[str, Any] | None = None
         try:
@@ -280,6 +286,13 @@ class TurnWorker:
             estimated_charge=float(payload.get("estimated_charge", 0.0)),
             balance_before_reconciliation=float(payload.get("credits_after_reservation", 0.0)),
             pinning_supported=bool(payload.get("pinning_supported", True)),
+            messages=tuple(payload.get("messages", ())),
+            branch_depth=int(payload.get("branch_depth", 0)),
+            live_agent_ids=payload.get("live_agent_ids"),
+            max_delegations_per_turn=int(payload.get("max_delegations_per_turn", 8)),
+            max_branch_depth=int(payload.get("max_branch_depth", 32)),
+            max_agent_calls_per_task=int(payload.get("max_agent_calls_per_task", 256)),
+            agent_calls_started=int(payload.get("agent_calls_started", 0)),
         )
 
     async def perform_procedure_batch(self, effect: PerformProcedureBatch) -> ProcedureBatchCompleted:
@@ -292,6 +305,13 @@ class TurnWorker:
             report=str(payload.get("report", "")),
             delegations=tuple(payload.get("delegations", ())),
             credits_after=float(payload.get("credits_after", 0.0)),
+            parent_messages=tuple(payload.get("messages", ())),
+            parent_depth=int(payload.get("branch_depth", 0)),
+            live_agent_ids=payload.get("live_agent_ids"),
+            max_delegations_per_turn=int(payload.get("max_delegations_per_turn", 8)),
+            max_branch_depth=int(payload.get("max_branch_depth", 32)),
+            max_agent_calls_per_task=int(payload.get("max_agent_calls_per_task", 256)),
+            agent_calls_started=int(payload.get("agent_calls_started", 0)),
         )
 
 
