@@ -153,7 +153,7 @@ class BranchFinalized(Event):
 @_register
 @dataclass(frozen=True, slots=True)
 class ReportDeadlineReached(Event):
-    pass
+    epoch: int | None = None
 
 
 @_register
@@ -190,13 +190,41 @@ class AllInflightSettled(Event):
 @_register
 @dataclass(frozen=True, slots=True)
 class PauseRequested(Event):
+    # due_at 必须由 controller/clock 在构造事件时携带；reducer 不读取时间。
+    expires_at: float | None = None
+
+
+@_register
+@dataclass(frozen=True, slots=True)
+class PauseExpired(Event):
+    """暂停超时；只允许 PAUSED -> EXPIRED，不触发总结或反馈。"""
+
+    pass
+
+
+@_register
+@dataclass(frozen=True, slots=True)
+class PauseExpiryReached(Event):
+    """PauseExpired 的显式兼容名称，便于外部 clock adapter 直译事件。"""
+
     pass
 
 
 @_register
 @dataclass(frozen=True, slots=True)
 class ContinueRequested(Event):
-    pass
+    adjustment: float = 0.0
+    active_leaves: Mapping[str, float] | None = None
+    next_round_id: str | None = None
+    next_generation: int | None = None
+    round_number: int = 1
+    time_budget_seconds: int = 120
+    grace_period_seconds: int = 60
+    catalog_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.active_leaves is not None:
+            object.__setattr__(self, "active_leaves", _freeze_value(self.active_leaves))
 
 
 @_register
@@ -234,7 +262,7 @@ RuntimeEvent: TypeAlias = (
     TaskCreated | FormalizationSucceeded | FormalizationFailed | AgentCallRequested | AgentCallReserved | AgentCallCompleted
     | AgentCallFailed | ProcedureBatchCompleted | SummaryCompleted | SummaryFailed | BranchCheckpointed | BranchFinalized
     | ReportDeadlineReached | GraceExpired | ReportCompleted | FinalReportCompleted | FinalReportFailed | AllInflightSettled
-    | PauseRequested | ContinueRequested | StopRequested | ContextSupplied | FeedbackSubmitted | OutboxDelivered | PersistenceFailed
+    | PauseRequested | PauseExpired | PauseExpiryReached | ContinueRequested | StopRequested | ContextSupplied | FeedbackSubmitted | OutboxDelivered | PersistenceFailed
 )
 
 

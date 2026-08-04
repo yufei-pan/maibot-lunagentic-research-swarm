@@ -122,6 +122,7 @@ class SQLiteStateStore:
                     "update_task_formalization": self._update_task_formalization,
                     "set_task_current_round": self._set_task_current_round,
                     "update_round_status": self._update_round_status,
+                    "update_round_generation": self._update_round_generation,
                 }
             )
         )
@@ -620,6 +621,16 @@ class SQLiteStateStore:
                 values.get("ended_at"),
                 values["round_id"],
             ),
+        )
+        _require_single_target(cursor, target_kind="Round", target_id=values["round_id"])
+
+    @staticmethod
+    def _update_round_generation(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        """持久化 stop 产生的新 generation，令重启后迟到结果仍会被拒绝。"""
+
+        cursor = connection.execute(
+            "UPDATE investigation_rounds SET generation = ? WHERE round_id = ?",
+            (values["generation"], values["round_id"]),
         )
         _require_single_target(cursor, target_kind="Round", target_id=values["round_id"])
 
