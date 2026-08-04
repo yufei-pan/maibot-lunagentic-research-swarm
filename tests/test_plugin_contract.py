@@ -49,3 +49,13 @@ def test_manifest_declares_final_capabilities(plugin_module) -> None:
         "person.get_value",
         "send.text",
     }
+
+
+def test_refresh_api_component_is_public(plugin_module) -> None:
+    component = next(
+        item
+        for item in plugin_module.create_plugin().get_components()
+        if item["name"] == "refresh_extensions" and item["type"] == "API"
+    )
+    assert component["metadata"]["public"] is True
+    assert component["metadata"]["version"] == "1"

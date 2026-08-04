@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
-
 import pytest
 
 from lunagentic_research_swarm.llm.gateway import GenerationError, GenerationRequest, GenerationResult

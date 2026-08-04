@@ -103,6 +103,7 @@ class ExtensionDiscovery:
             except Exception as exc:
                 self._record_global_error(exc)
                 return
+            self._extension_fingerprints.pop("discovery", None)
             if self._closed:
                 return
 
