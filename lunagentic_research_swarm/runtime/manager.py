@@ -22,8 +22,10 @@ from lunagentic_research_swarm.runtime.events import (
     ContinueRequested,
     FormalizationFailed,
     FormalizationSucceeded,
+    GraceExpired,
     PauseExpired,
     PauseRequested,
+    ReportDeadlineReached,
     StopRequested,
 )
 from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformFormalization, RuntimeState
@@ -52,6 +54,7 @@ class ResearchManager:
         recent_message_limit: int = 20,
         pause_timeout_seconds: int = 1200,
         grace_period_seconds: int = 60,
+        report_coordinators: dict[str, Any] | None = None,
     ) -> None:
         self.ctx, self.store, self.summarizer, self.scheduler = ctx, store, summarizer, scheduler
         self._snapshot_provider = snapshot_provider
@@ -63,6 +66,10 @@ class ResearchManager:
         self._branches: dict[str, dict[str, dict[str, Any]]] = {}
         self._jobs: dict[str, set[asyncio.Task[Any]]] = {}
         self._pause_jobs: dict[str, asyncio.Task[Any]] = {}
+        # Effects and worker adapters register one coordinator per task.  The
+        # coordinator owns ephemeral report/branch state; TaskController stays
+        # the sole authority for durable RuntimeState transitions.
+        self.report_coordinators: dict[str, Any] = report_coordinators if report_coordinators is not None else {}
 
     async def start(
         self,
@@ -319,6 +326,12 @@ class ResearchManager:
         return True
 
     async def handle_runtime_event(self, event: Any) -> None:
+        if isinstance(event, ReportDeadlineReached):
+            await self.handle_report_deadline(event)
+            return
+        if isinstance(event, GraceExpired):
+            await self.handle_grace_expired(event)
+            return
         controller = self._controllers.get(event.task_id)
         if controller is None or event.generation != controller.state.generation or event.round_id != controller.state.active_round_id:
             return
@@ -329,6 +342,59 @@ class ResearchManager:
         # next procedure/materialization phase after its transaction commits.
         await self._submit(controller, event)
         self._sync_branch_credits(event.task_id, controller)
+
+    async def handle_report_deadline(self, event: ReportDeadlineReached) -> None:
+        """Durably enter REPORTING, then open the injected epoch coordinator.
+
+        This is the explicit scheduler/effect bridge for ``OpenReportEpoch``;
+        it deliberately invokes the coordinator only after TaskController has
+        committed the reducer transition.
+        """
+
+        controller = self._controllers.get(event.task_id)
+        if controller is None or event.generation != controller.state.generation or event.round_id != controller.state.active_round_id:
+            return
+        if controller.state.status is not TaskStatus.RUNNING:
+            return
+        await self._submit(controller, event)
+        coordinator = self.report_coordinators.get(event.task_id)
+        if coordinator is not None:
+            await coordinator.open_epoch(epoch=event.epoch if event.epoch is not None else controller.state.report_epoch)
+
+    async def handle_grace_expired(self, event: GraceExpired) -> None:
+        """Durably process grace expiry, then ask the coordinator for clones."""
+
+        controller = self._controllers.get(event.task_id)
+        if controller is None or event.generation != controller.state.generation or event.round_id != controller.state.active_round_id:
+            return
+        if controller.state.status is not TaskStatus.REPORTING:
+            return
+        await self._submit(controller, event)
+        coordinator = self.report_coordinators.get(event.task_id)
+        if coordinator is not None:
+            await coordinator.on_grace_expired(epoch=controller.state.report_epoch)
+
+    async def handle_branch_safe_point(
+        self,
+        task_id: str,
+        branch_id: str,
+        *,
+        checkpoint: bool = False,
+        terminal: bool = False,
+        delegations: tuple[dict[str, Any], ...] | tuple[Any, ...] = (),
+    ) -> Any:
+        """Bridge a post-commit summary/checkpoint/terminal effect to reports.
+
+        The caller must invoke this after its normal branch event transaction;
+        this method never changes ``TaskController.state`` directly.
+        """
+
+        coordinator = self.report_coordinators.get(task_id)
+        if coordinator is None:
+            return None
+        return await coordinator.on_branch_safe_point(
+            branch_id, checkpoint=checkpoint, terminal=terminal, delegations=delegations
+        )
 
     async def _submit(self, controller: TaskController, event: Any) -> None:
         """Submit a runtime event through the sole transaction-before-effect driver."""

@@ -23,6 +23,7 @@ class FakeSummarizer:
         self.gate = asyncio.Event()
         self.gate.set()
         self.task_requests = []
+        self.branch_requests = []
 
     def block(self) -> None:
         self.gate.clear()
@@ -31,6 +32,7 @@ class FakeSummarizer:
         self.gate.set()
 
     async def finalize_branch(self, request):
+        self.branch_requests.append(request)
         await self.gate.wait()
         return SummaryResult(True, f"branch:{request.branch_history[-1]['content']}", "fake", None, None)
 
@@ -112,3 +114,34 @@ async def test_intermediate_does_not_upgrade_if_branches_finish_during_synthesis
     final = await report_harness.coordinator.open_epoch()
     await report_harness.coordinator.wait_for_synthesis()
     assert final.kind is ReportKind.FINAL
+
+
+@pytest.mark.asyncio
+async def test_terminal_last_branch_opens_and_delivers_final_epoch_without_prior_deadline(
+    report_harness: ReportHarness,
+) -> None:
+    epoch = await report_harness.coordinator.on_branch_safe_point("A", terminal=True)
+    await report_harness.coordinator.wait_for_synthesis()
+
+    assert epoch is not None
+    assert epoch.kind is ReportKind.FINAL
+    assert report_harness.coordinator.reports[-1].kind is ReportKind.FINAL
+
+
+@pytest.mark.asyncio
+async def test_synthesis_uses_coverage_snapshot_taken_before_later_terminal_summary(
+    report_harness: ReportHarness,
+) -> None:
+    epoch = await report_harness.coordinator.open_epoch()
+
+    await report_harness.coordinator.on_branch_safe_point("A", checkpoint=True)
+    checkpoint_id = epoch.frontier["A"].checkpoint_summary_id
+    # The synthesis task has been scheduled but has not yet run.  A terminal
+    # summary arriving in this gap must belong to the next epoch, not rewrite
+    # this intermediate report's frozen input set.
+    await report_harness.coordinator.on_branch_safe_point("A", terminal=True)
+    await report_harness.coordinator.wait_for_synthesis()
+
+    report = report_harness.coordinator.reports[-1]
+    assert report.kind is ReportKind.INTERMEDIATE
+    assert [item.summary_id for item in report.coverage.items] == [checkpoint_id]

@@ -60,6 +60,10 @@ class ReportEpoch:
     grace_deadline_at: float | None = None
     synthesis_started: bool = False
     synthesis_finished: bool = False
+    # `CoverageSet` and its entries are frozen dataclasses.  Keeping the
+    # exact object captured at synthesis start prevents a later terminal
+    # summary from replacing this epoch's checkpoint coverage.
+    frozen_coverage: CoverageSet | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +185,13 @@ class ReportCoordinator:
                 entry.terminal_summary_id = summary_id
                 entry.failed = summary_id is None
                 await self._maybe_start_synthesis(self.current_epoch)
+                return self.current_epoch
+            # A terminal-only investigation has no deadline frontier to
+            # create its final report.  Open an empty frontier after the
+            # durable terminal summary so `_maybe_start_synthesis` can freeze
+            # FINAL coverage and deliver it immediately.
+            if self.current_epoch is None:
+                return await self.open_epoch()
             return self.current_epoch
 
         active_epoch = self.current_epoch
@@ -208,15 +219,19 @@ class ReportCoordinator:
                 return await self.open_epoch()
             return None
 
-        # A grace return first launches normal post-turn work.  The clone is
-        # summarized separately so the original can compact, spend credits and
-        # continue unhindered in the next epoch.
-        await self._launch(delegations, branch_id)
+        # A grace return must snapshot the fully committed pre-return history
+        # before launching children: child creation may mutate branch runtime
+        # bookkeeping, but that work belongs to the next epoch.
+        stable_history = _history_copy(branch.messages)
+        if in_frontier:
+            await self._launch(delegations, branch_id, report_epoch=active_epoch.epoch + 1)
+        else:
+            await self._launch(delegations, branch_id)
         if in_frontier:
             entry = active_epoch.frontier[branch_id]
             entry.checkpoint_requested = True
             summary_id = await self._summarize_branch(
-                branch_id, checkpoint=True, history=_history_copy(branch.messages)
+                branch_id, checkpoint=True, history=stable_history
             )
             entry.checkpoint_summary_id = summary_id
             entry.failed = summary_id is None
@@ -251,7 +266,16 @@ class ReportCoordinator:
         if report_epoch is None or report_epoch.synthesis_finished:
             return None
         active = self.active_branch_ids()
-        coverage = build_coverage(self._summaries, active_branch_ids=active)
+        coverage = report_epoch.frozen_coverage
+        if coverage is None:
+            # Direct callers remain safe; normal scheduling records this
+            # immutable snapshot in `_maybe_start_synthesis` before creating
+            # the coroutine.
+            coverage = build_coverage(self._summaries, active_branch_ids=active)
+            report_epoch.frozen_coverage = coverage
+            report_epoch.kind = freeze_report_kind(
+                active_branch_count=len(active), coverage_has_checkpoint=coverage.has_checkpoint
+            )
         # The epoch could begin with a checkpoint even if its branch finalizes
         # before the finalizer returns.  Freeze this decision before awaiting.
         frozen_kind = report_epoch.kind
@@ -334,6 +358,7 @@ class ReportCoordinator:
             active_branch_count=len(self.active_branch_ids()),
             coverage_has_checkpoint=coverage.has_checkpoint,
         )
+        epoch.frozen_coverage = coverage
         task = asyncio.create_task(self.synthesize(epoch))
         self._synthesis_tasks.add(task)
         task.add_done_callback(self._synthesis_tasks.discard)
@@ -385,13 +410,21 @@ class ReportCoordinator:
             branch = self.branches.get(branch_id)
             if branch is not None and branch.lifecycle is BranchLifecycle.WAITING_REPORT_WITH_CHECKPOINT:
                 branch.lifecycle = BranchLifecycle.READY
-            await self._launch(delegations, branch_id)
+            await self._launch(delegations, branch_id, report_epoch=self.current_epoch.epoch + 1)
 
-    async def _launch(self, delegations: Sequence[Mapping[str, Any]], parent_branch_id: str) -> None:
+    async def _launch(
+        self,
+        delegations: Sequence[Mapping[str, Any]],
+        parent_branch_id: str,
+        *,
+        report_epoch: int | None = None,
+    ) -> None:
         if self.launch_delegation is None:
             return
         for raw in delegations:
             child = dict(raw)
+            if report_epoch is not None:
+                child.setdefault("report_epoch", report_epoch)
             returned = self.launch_delegation(parent_branch_id, child)
             if hasattr(returned, "__await__"):
                 await returned
