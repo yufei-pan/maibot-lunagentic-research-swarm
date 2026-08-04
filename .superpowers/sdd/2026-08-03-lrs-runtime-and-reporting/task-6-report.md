@@ -20,9 +20,28 @@ generation，迟到结果被忽略。continue 在 pause barrier 重新分配 poo
 - GREEN：实现最小 controller/manager 并添加 `tests/runtime/__init__.py` 后，controller
   focused suite 通过。
 
+## Review fix round 1
+
+- RED：新增当前 generation 的 `AgentCallCompleted` 回归测试，确认此前 manager 会直接
+  丢弃它，既不写 reconciliation command，也不调度 `PerformProcedureBatch`；同时改为从
+  `runtime.controller` 导入 controller failure 测试，确认较弱的重复实现不会在 fallback
+  persistence 同样失败后停止接收事件。
+- GREEN：`ResearchManager.handle_runtime_event()` 现在把所有当前 round/generation 的 worker
+  event 提交给唯一 `TaskController` 并 drain，因此 completion 会先持久化核销、后调度
+  procedure/materialization effect；late generation 和 terminal task guard 保持不变。
+  pause、settle、expiry、stop 及 paused-leaf continue 也改走 reducer/controller。
+- `runtime/controller.py` 现在承载完整的 transaction-before-effect、fallback FAILED write、
+  health 和 stopped safeguards；`runtime.reducer.TaskController` 继续经兼容 re-export 指向
+  同一个类，避免两份实现漂移。
+
 ## 验证
 
 - `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest tests/runtime/test_controller_start.py tests/runtime/test_controller_controls.py -v` → `14 passed`。
 - `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest tests/runtime/test_reducer_persistence.py tests/runtime/test_reducer.py tests/runtime/test_scheduler.py -v` → `35 passed`。
 - `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest -v` → `349 passed`。
 - `.venv/bin/python -m compileall -q lunagentic_research_swarm tests/runtime` 与 `git diff --check` 通过。
+- Fix round verification: `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest
+  tests/runtime/test_controller_start.py tests/runtime/test_controller_controls.py
+  tests/runtime/test_reducer.py tests/runtime/test_reducer_persistence.py
+  tests/runtime/test_scheduler.py tests/runtime/test_turns.py
+  tests/runtime/test_context_invariance.py -v` → `75 passed`。

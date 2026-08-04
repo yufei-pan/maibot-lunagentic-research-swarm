@@ -10,9 +10,7 @@ asyncio；worker 只负责产生事件，权威状态永远由这里产生。
 
 from __future__ import annotations
 
-import asyncio
 import json
-from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
@@ -858,7 +856,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
 
     if isinstance(event, ContinueRequested):
         if status is TaskStatus.PAUSED:
-            return _transition_status(state, event, TaskStatus.RUNNING, continue_barrier=False)
+            return _continue_terminal(state, event)
         if status in _TERMINAL_STATUSES:
             return _continue_terminal(state, event)
         return _invalid(state, event, "ContinueRequested 只能用于 PAUSED 或 round 终态")
@@ -1237,123 +1235,6 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         )
 
     return _invalid(state, event, f"事件 {type(event).__name__} 在 {_status_value(status)} 状态不可用")
-
-
-class TaskController:
-    """把 reducer 接到一个串行 inbox；持久化成功后才暴露状态和 effect。
-
-    这是 Task 2 的最小驱动。Task 6 可以在此基础上加入 manager、scheduler
-    生命周期和 Tool-facing API，而不需要复制 transaction ordering。
-    """
-
-    def __init__(
-        self,
-        state: Any,
-        *,
-        store: Any,
-        scheduler: Any | None = None,
-        executor: Any | None = None,
-        health: Any = None,
-    ) -> None:
-        self.state = state
-        self.store = store
-        # ``executor`` is accepted as a compatibility name used by the first
-        # persistence harness; both objects expose the same enqueue contract.
-        self.scheduler = scheduler if scheduler is not None else executor
-        if self.scheduler is None:
-            raise TypeError("TaskController 需要 scheduler/executor")
-        self.health = health
-        self._inbox: deque[RuntimeEvent] = deque()
-        self.stopped = False
-
-    async def submit(self, event: RuntimeEvent) -> bool:
-        if self.stopped:
-            # A failed best-effort FAILED write is a terminal controller failure;
-            # accepting another event here could launch work against unknown state.
-            return False
-        self._inbox.append(event)
-        return True
-
-    async def drain_once(self) -> bool:
-        if self.stopped:
-            self._inbox.clear()
-            return False
-        if not self._inbox:
-            return False
-        event = self._inbox.popleft()
-        await self._apply(event)
-        return True
-
-    async def drain(self) -> None:
-        while self._inbox and not self.stopped:
-            await self.drain_once()
-
-    async def _apply(self, event: RuntimeEvent) -> None:
-        transition = reduce_event(self.state, event)
-        if transition.ignored:
-            # Late generations are deliberately no-ops: don't even open an empty
-            # transaction, and never publish an effect for the old round.
-            self.state = transition.next_state
-            return
-        try:
-            await self.store.transact(transition.commands)
-        except Exception as exc:
-            await self._fail_after_storage_error(event, exc)
-            return
-
-        # This assignment is intentionally after transact and before enqueue: an effect
-        # can never observe an in-memory state that SQLite rejected.
-        self.state = transition.next_state
-        for effect in transition.effects:
-            await self.scheduler.enqueue(effect)
-
-    async def _fail_after_storage_error(self, event: RuntimeEvent, exc: Exception) -> None:
-        failed_state = _replace_state(
-            self.state,
-            status=TaskStatus.FAILED,
-            failure_code=STORAGE_COMMIT_FAILED,
-        )
-        self.state = failed_state
-        round_id = _state_round_id(self.state) or event.round_id
-        fallback = (
-            _command(
-                "update_round_status",
-                {
-                    "round_id": round_id,
-                    "status": TaskStatus.FAILED.value,
-                    "report_deadline_at": None,
-                    "ended_at": event.occurred_at.timestamp(),
-                },
-            ),
-        )
-        try:
-            await self.store.transact(fallback)
-        except Exception as fallback_exc:
-            self.stopped = True
-            self._inbox.clear()
-            self._record_health(
-                {
-                    "status": "degraded",
-                    "code": STORAGE_COMMIT_FAILED,
-                    "message": str(fallback_exc),
-                    "original": str(exc),
-                }
-            )
-
-    def _record_health(self, payload: Mapping[str, Any]) -> None:
-        target = self.health
-        if target is None:
-            return
-        if callable(target):
-            target(payload)
-            return
-        if isinstance(target, dict):
-            target["runtime"] = dict(payload)
-            return
-        try:
-            setattr(target, "runtime", dict(payload))
-        except Exception:
-            pass
 
 
 __all__ = [

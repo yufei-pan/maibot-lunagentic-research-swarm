@@ -18,7 +18,13 @@ from typing import Any
 from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
 from lunagentic_research_swarm.models import BranchLifecycle, FormalizedTask, TaskStatus, new_branch_id, new_round_id, new_task_id
 from lunagentic_research_swarm.runtime.controller import TaskController
-from lunagentic_research_swarm.runtime.events import AgentCallCompleted
+from lunagentic_research_swarm.runtime.events import (
+    AllInflightSettled,
+    ContinueRequested,
+    PauseExpired,
+    PauseRequested,
+    StopRequested,
+)
 from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformFormalization, RuntimeState
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
 
@@ -149,12 +155,16 @@ class ResearchManager:
         controller = self._controller(task_id)
         if controller.state.status not in {TaskStatus.RUNNING, TaskStatus.REPORTING}:
             raise ValueError("task 不在可暂停状态")
-        now = _now()
-        await self.store.transact((
-            StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.PAUSING.value, "report_deadline_at": None, "ended_at": None}),
-            self._lifecycle(task_id, controller.state.active_round_id, "PauseRequested", controller.state.status, TaskStatus.PAUSING, now),
-        ))
-        controller.state = replace(controller.state, status=TaskStatus.PAUSING)
+        await self._submit(
+            controller,
+            PauseRequested(
+                _event_id(),
+                task_id,
+                controller.state.active_round_id or "",
+                controller.state.generation,
+                expires_at=_now() + self._pause_timeout_seconds,
+            ),
+        )
         self.scheduler.pause_task(task_id)
         if self.scheduler.task_inflight_count(task_id):
             self._track(task_id, self._settle_pause(task_id))
@@ -172,12 +182,12 @@ class ResearchManager:
         controller = self._controller(task_id)
         if controller.state.status is not TaskStatus.PAUSING:
             return
-        now = _now()
-        await self.store.transact((
-            StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.PAUSED.value, "report_deadline_at": None, "ended_at": None}),
-            self._lifecycle(task_id, controller.state.active_round_id, "AllInflightSettled", TaskStatus.PAUSING, TaskStatus.PAUSED, now),
-        ))
-        controller.state = replace(controller.state, status=TaskStatus.PAUSED)
+        await self._submit(
+            controller,
+            AllInflightSettled(
+                _event_id(), task_id, controller.state.active_round_id or "", controller.state.generation
+            ),
+        )
         self._pause_jobs[task_id] = asyncio.create_task(self._expiry_wait(task_id))
 
     async def _expiry_wait(self, task_id: str) -> None:
@@ -188,26 +198,22 @@ class ResearchManager:
         controller = self._controller(task_id)
         if controller.state.status is not TaskStatus.PAUSED:
             return
-        now = _now()
-        await self.store.transact((
-            StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.EXPIRED.value, "report_deadline_at": None, "ended_at": now}),
-            self._lifecycle(task_id, controller.state.active_round_id, "PauseExpired", TaskStatus.PAUSED, TaskStatus.EXPIRED, now),
-        ))
-        controller.state = replace(controller.state, status=TaskStatus.EXPIRED, raw_context_released=True, active_leaves={})
+        await self._submit(
+            controller,
+            PauseExpired(_event_id(), task_id, controller.state.active_round_id or "", controller.state.generation),
+        )
         self._branches[task_id].clear()
 
     async def stop(self, task_id: str, *, reason: str = "") -> dict[str, Any]:
         controller = self._controller(task_id)
-        state, now = controller.state, _now()
+        state = controller.state
         if state.status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.PAUSED}:
             raise ValueError("task 不在可停止状态")
+        await self._submit(
+            controller,
+            StopRequested(_event_id(), task_id, state.active_round_id or "", state.generation, reason=reason),
+        )
         self.scheduler.cancel_generation(task_id, state.generation)
-        await self.store.transact((
-            StoreCommand("update_round_generation", {"round_id": state.active_round_id, "generation": state.generation + 1}),
-            StoreCommand("update_round_status", {"round_id": state.active_round_id, "status": TaskStatus.STOPPED.value, "report_deadline_at": None, "ended_at": now}),
-            self._lifecycle(task_id, state.active_round_id, "StopRequested", state.status, TaskStatus.STOPPED, now, {"reason": reason}),
-        ))
-        controller.state = replace(state, status=TaskStatus.STOPPED, generation=state.generation + 1, raw_context_released=True, active_leaves={})
         self._branches[task_id].clear()
         return self._status(controller)
 
@@ -230,14 +236,28 @@ class ResearchManager:
             cancelled = self._pause_jobs.pop(task_id, None)
             if cancelled:
                 cancelled.cancel()
-            total = state.credit_pool + float(credit_adjustment)
-            shares = total / len(branches)
-            for branch_id, branch in list(branches.items()):
-                branch["credits"] += shares
-                if branch["credits"] < 0:
-                    del branches[branch_id]
-            leaves = {key: item["credits"] for key, item in branches.items()}
-            controller.state = replace(state, status=TaskStatus.RUNNING, active_leaves=leaves, credit_pool=0.0, continue_barrier=False)
+            pending_context = {
+                branch_id: list(branch["pending_context"])
+                for branch_id, branch in branches.items()
+            }
+            await self._submit(
+                controller,
+                ContinueRequested(
+                    _event_id(),
+                    task_id,
+                    state.active_round_id or "",
+                    state.generation,
+                    adjustment=float(credit_adjustment),
+                    active_leaves={key: item["credits"] for key, item in branches.items()},
+                    time_budget_seconds=effective_time,
+                    grace_period_seconds=self._grace_period_seconds,
+                ),
+            )
+            branches.clear()
+            branches.update(
+                {branch_id: {"credits": credits, "pending_context": pending_context.get(branch_id, [])}
+                 for branch_id, credits in controller.state.active_leaves.items()}
+            )
             self.scheduler.resume_task(task_id)
             return {**self._status(controller), "effective_time_budget_seconds": effective_time}
         if not branches and state.status in {TaskStatus.STOPPED, TaskStatus.EXPIRED, TaskStatus.COMPLETED, TaskStatus.FAILED}:
@@ -274,8 +294,17 @@ class ResearchManager:
             return
         if controller.state.status in {TaskStatus.STOPPED, TaskStatus.EXPIRED, TaskStatus.FAILED}:
             return
-        if isinstance(event, AgentCallCompleted):
-            return
+        # All current-generation worker outputs follow the same durable reducer
+        # path.  In particular, AgentCallCompleted reconciles cost and queues the
+        # next procedure/materialization phase after its transaction commits.
+        await self._submit(controller, event)
+
+    async def _submit(self, controller: TaskController, event: Any) -> None:
+        """Submit a runtime event through the sole transaction-before-effect driver."""
+
+        if not await controller.submit(event):
+            raise RuntimeError("task controller 已停止，拒绝处理事件")
+        await controller.drain()
 
     async def wait_idle(self, task_id: str) -> None:
         while True:

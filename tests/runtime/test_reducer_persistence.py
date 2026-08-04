@@ -6,7 +6,7 @@ import pytest
 
 from lunagentic_research_swarm.models import TaskSnapshot, TaskStatus
 from lunagentic_research_swarm.runtime.events import ContinueRequested, FormalizationSucceeded
-from lunagentic_research_swarm.runtime.reducer import TaskController
+from lunagentic_research_swarm.runtime.controller import TaskController
 
 
 class FakeStore:

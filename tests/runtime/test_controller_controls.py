@@ -7,6 +7,7 @@ import pytest
 
 from lunagentic_research_swarm.models import TaskStatus
 from lunagentic_research_swarm.runtime.events import AgentCallCompleted
+from lunagentic_research_swarm.runtime.reducer import PerformProcedureBatch
 
 from .test_controller_start import FakeScheduler, harness
 
@@ -97,6 +98,33 @@ async def test_stop_increments_generation_cancels_local_work_and_discards_late_r
 
     assert (await manager.status(task_id))["status"] == "STOPPED"
     assert len(store.commands) == command_count
+
+
+@pytest.mark.asyncio
+async def test_current_agent_completion_is_reduced_and_enqueues_procedure_work(harness) -> None:
+    manager, store, _, scheduler, task_id = await _running_manager(harness)
+    before = await manager.status(task_id)
+    branch_id = before["active_leaves"][0]["branch_id"]
+    command_count = len(store.commands)
+
+    await manager.handle_runtime_event(
+        AgentCallCompleted(
+            event_id="current-completion",
+            task_id=task_id,
+            round_id=before["round_id"],
+            generation=before["generation"],
+            branch_id=branch_id,
+            call_id="current-call",
+            result_id="current-result",
+            actual_charge=0.0,
+            balance_before_reconciliation=100.0,
+            protocol_result={"report": "完成", "procedures": (), "delegations": ()},
+        )
+    )
+
+    assert len(store.commands) == command_count + 1
+    assert isinstance(scheduler.enqueued[-1], PerformProcedureBatch)
+    assert scheduler.enqueued[-1].payload["branch_id"] == branch_id
 
 
 @pytest.mark.asyncio
