@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from lunagentic_research_swarm.errors import STORAGE_COMMIT_FAILED
@@ -32,15 +33,57 @@ class TaskController:
             raise TypeError("TaskController 需要 scheduler/executor")
         self.health = health
         self._inbox: deque[RuntimeEvent] = deque()
+        self._lock = asyncio.Lock()
         self.stopped = False
 
     async def submit(self, event: RuntimeEvent) -> bool:
-        if self.stopped:
-            return False
-        self._inbox.append(event)
-        return True
+        async with self._lock:
+            if self.stopped:
+                return False
+            self._inbox.append(event)
+            return True
 
     async def drain_once(self) -> bool:
+        async with self._lock:
+            return await self._drain_once_locked()
+
+    async def drain(self) -> None:
+        async with self._lock:
+            while self._inbox and not self.stopped:
+                await self._drain_once_locked()
+
+    async def submit_and_drain(self, event: RuntimeEvent) -> bool:
+        """Append and drain through the task's sole state/effect boundary."""
+
+        async with self._lock:
+            if self.stopped:
+                return False
+            self._inbox.append(event)
+            while self._inbox and not self.stopped:
+                await self._drain_once_locked()
+            return not self.stopped
+
+    async def apply(
+        self,
+        event: RuntimeEvent,
+        *,
+        extra_commands: Sequence[StoreCommand] = (),
+        effects: Sequence[Any] | None = None,
+        state_changes: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Atomically apply an event with manager-supplied durable details."""
+
+        async with self._lock:
+            if self.stopped:
+                return False
+            return await self._apply(
+                event,
+                extra_commands=extra_commands,
+                effects=effects,
+                state_changes=state_changes,
+            )
+
+    async def _drain_once_locked(self) -> bool:
         if self.stopped:
             self._inbox.clear()
             return False
@@ -49,23 +92,29 @@ class TaskController:
         await self._apply(self._inbox.popleft())
         return True
 
-    async def drain(self) -> None:
-        while self._inbox and not self.stopped:
-            await self.drain_once()
-
-    async def _apply(self, event: RuntimeEvent) -> None:
+    async def _apply(
+        self,
+        event: RuntimeEvent,
+        *,
+        extra_commands: Sequence[StoreCommand] = (),
+        effects: Sequence[Any] | None = None,
+        state_changes: Mapping[str, Any] | None = None,
+    ) -> bool:
         transition = reduce_event(self.state, event)
         if transition.ignored:
             self.state = transition.next_state
-            return
+            return False
         try:
-            await self.store.transact(transition.commands)
+            commands = transition.commands if transition.error is not None else (*transition.commands, *extra_commands)
+            await self.store.transact(commands)
         except Exception as exc:
             await self._fail_after_storage_error(event, exc)
-            return
-        self.state = transition.next_state
-        for effect in transition.effects:
+            return False
+        self.state = _replace_state(transition.next_state, **dict(state_changes or {}))
+        selected_effects = transition.effects if effects is None or transition.error is not None else effects
+        for effect in selected_effects:
             await self.scheduler.enqueue(effect)
+        return True
 
     async def _fail_after_storage_error(self, event: RuntimeEvent, exc: Exception) -> None:
         self.state = _replace_state(

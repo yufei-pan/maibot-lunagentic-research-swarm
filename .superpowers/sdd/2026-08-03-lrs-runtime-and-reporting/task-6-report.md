@@ -34,6 +34,20 @@ generation，迟到结果被忽略。continue 在 pause barrier 重新分配 poo
   health 和 stopped safeguards；`runtime.reducer.TaskController` 继续经兼容 re-export 指向
   同一个类，避免两份实现漂移。
 
+## Review fix round 2
+
+- RED：stop transaction 被故意阻塞时并发提交当前 generation 的 completion；旧实现会在
+  STOPPED 写入期间按旧 generation 规约并排入 procedure effect。controller 现以单一
+  asyncio lock 串行 inbox、reducer、durable transaction 与 effect 发布，completion 在
+  stop 后只会作为 late generation 被忽略。
+- formalization 成功/失败和 terminal round restart 都通过 controller 的原子 event path
+  提交；manager 不再绕过 controller 直接写权威状态或调度 effect。失败 restart 不会插入
+  负余额 root branch。
+- pause 兼容 FairScheduler 的公开 `stats().tasks[task_id].active`，可选使用专用
+  `wait_task_idle`，不再假设 scheduler 有未声明的 task_inflight_count API。
+- continue 的 active leaf balances、credit pool、time budget/deadline reset 以及无 leaf
+  的负 pool+adjustment 均由 reducer 和同一 transaction 持久化。
+
 ## 验证
 
 - `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest tests/runtime/test_controller_start.py tests/runtime/test_controller_controls.py -v` → `14 passed`。

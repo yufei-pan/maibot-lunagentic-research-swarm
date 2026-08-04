@@ -633,10 +633,33 @@ def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
         # 负叶子在 barrier 处保持终结；非负叶子允许继续运行。
         balances = dict(redistribution.balances)
         running = {key: value for key, value in balances.items() if value >= 0}
+        persistence = (
+            _command(
+                "update_round_continuation",
+                {
+                    "round_id": event.round_id,
+                    "credit_pool": redistribution.pool_after,
+                    "time_budget_seconds": event.time_budget_seconds,
+                    "report_deadline_at": None,
+                },
+            ),
+            *(
+                _command(
+                    "update_branch_balance",
+                    {
+                        "branch_id": branch_id,
+                        "credit_balance": balance,
+                        "lifecycle": "READY" if balance >= 0 else "FINALIZED",
+                    },
+                )
+                for branch_id, balance in balances.items()
+            ),
+        )
         return _transition_status(
             state,
             event,
             TaskStatus.RUNNING,
+            extra_commands=persistence,
             active_leaves=running,
             credit_pool=redistribution.pool_after,
             continue_barrier=False,
@@ -649,15 +672,19 @@ def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
             "任务没有可用于新 round 的 credits",
             {"balance": restart_balance},
         )
-        effect = _effect(
-            NotifyToolWaiter,
-            event,
-            priority="barrier",
-            payload={"error": error.to_result()["error"]},
-        )
         return Transition(
             _replace_state(state, failure_code="task_finished_insufficient_funds", credit_pool=redistribution.pool_after),
-            effects=(effect,),
+            commands=(
+                _command(
+                    "update_round_continuation",
+                    {
+                        "round_id": event.round_id,
+                        "credit_pool": redistribution.pool_after,
+                        "time_budget_seconds": event.time_budget_seconds,
+                        "report_deadline_at": None,
+                    },
+                ),
+            ),
             error=error,
             reason=error.code,
         )

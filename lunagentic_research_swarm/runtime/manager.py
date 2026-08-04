@@ -12,7 +12,6 @@ import hashlib
 import json
 import time
 import uuid
-from dataclasses import replace
 from typing import Any
 
 from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
@@ -21,6 +20,8 @@ from lunagentic_research_swarm.runtime.controller import TaskController
 from lunagentic_research_swarm.runtime.events import (
     AllInflightSettled,
     ContinueRequested,
+    FormalizationFailed,
+    FormalizationSucceeded,
     PauseExpired,
     PauseRequested,
     StopRequested,
@@ -128,23 +129,33 @@ class ResearchManager:
             formalized = FormalizedTask.create(result.text)
             branch_id, now = new_branch_id(), _now()
             commands = (
-                StoreCommand("update_task_formalization", {"task_id": task_id, "formalized_text": formalized.text, "formalized_sha256": formalized.sha256, "updated_at": now}),
                 StoreCommand("insert_vector_job", {"job_id": f"vec_{uuid.uuid4().hex}", "source_kind": "formalized_task", "source_id": task_id, "generation": 0, "status": "PENDING", "created_at": now}),
                 StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": controller.state.active_round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": 0, "created_at": now}),
-                StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.RUNNING.value, "report_deadline_at": None, "ended_at": None}),
-                self._lifecycle(task_id, controller.state.active_round_id, "FormalizationSucceeded", TaskStatus.FORMALIZING, TaskStatus.RUNNING, now),
             )
-            await self.store.transact(commands)
-            controller.state = replace(controller.state, status=TaskStatus.RUNNING, formalized_task=formalized, active_leaves={branch_id: credits})
+            accepted = await controller.apply(
+                FormalizationSucceeded(
+                    _event_id(), task_id, controller.state.active_round_id or "", controller.state.generation,
+                    formalized_text=formalized.text, formalized_sha256=formalized.sha256,
+                ),
+                extra_commands=commands,
+                effects=(
+                    PerformAgentCall(
+                        task_id, controller.state.active_round_id, controller.state.generation,
+                        payload={"root": True, "branch_id": branch_id, "formalized_text": formalized.text, "credit_balance": credits},
+                    ),
+                ),
+                state_changes={"active_leaves": {branch_id: credits}},
+            )
+            if not accepted:
+                return
             self._branches[task_id][branch_id] = {"credits": credits, "pending_context": []}
-            await self.scheduler.enqueue(PerformAgentCall(task_id, controller.state.active_round_id, controller.state.generation, payload={"root": True, "branch_id": branch_id, "formalized_text": formalized.text, "credit_balance": credits}))
         except Exception as exc:
-            now = _now()
-            await self.store.transact((
-                StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.FAILED.value, "report_deadline_at": None, "ended_at": now}),
-                self._lifecycle(task_id, controller.state.active_round_id, "FormalizationFailed", TaskStatus.FORMALIZING, TaskStatus.FAILED, now, {"error": str(exc)}),
-            ))
-            controller.state = replace(controller.state, status=TaskStatus.FAILED, failure_code="formalization_failed")
+            await controller.apply(
+                FormalizationFailed(
+                    _event_id(), task_id, controller.state.active_round_id or "", controller.state.generation,
+                    error_code="formalization_failed", error_message=str(exc),
+                )
+            )
         finally:
             # objective, readable messages and personality are never retained on the controller.
             raw_context = ""
@@ -166,7 +177,7 @@ class ResearchManager:
             ),
         )
         self.scheduler.pause_task(task_id)
-        if self.scheduler.task_inflight_count(task_id):
+        if self._task_inflight_count(task_id):
             self._track(task_id, self._settle_pause(task_id))
         else:
             await self._mark_paused(task_id)
@@ -174,8 +185,16 @@ class ResearchManager:
 
     async def _settle_pause(self, task_id: str) -> None:
         wait = getattr(self.scheduler, "wait_task_idle", None)
-        if wait is not None:
-            await wait(task_id)
+        if callable(wait):
+            result = wait(task_id)
+            if hasattr(result, "__await__"):
+                await result
+        else:
+            # FairScheduler intentionally exposes telemetry rather than a
+            # task-specific wait API.  Poll only its public active count; a
+            # paused task's queued work must not hold the pause barrier open.
+            while self._task_inflight_count(task_id):
+                await asyncio.sleep(0)
         await self._mark_paused(task_id)
 
     async def _mark_paused(self, task_id: str) -> None:
@@ -261,32 +280,43 @@ class ResearchManager:
             self.scheduler.resume_task(task_id)
             return {**self._status(controller), "effective_time_budget_seconds": effective_time}
         if not branches and state.status in {TaskStatus.STOPPED, TaskStatus.EXPIRED, TaskStatus.COMPLETED, TaskStatus.FAILED}:
-            balance = state.credit_pool + float(credit_adjustment)
-            if balance < 0:
-                return {"success": False, "error": {"code": "task_finished_insufficient_funds", "message": "任务没有可用于新 round 的 credits"}}
             if state.formalized_task is None:
                 return {"success": False, "error": {"code": "task_not_formalized", "message": "任务尚未形式化"}}
-            await self._restart_round(task_id, balance, effective_time)
+            restarted = await self._restart_round(task_id, float(credit_adjustment), effective_time)
+            if not restarted:
+                return {"success": False, "error": {"code": "task_finished_insufficient_funds", "message": "任务没有可用于新 round 的 credits"}}
             return {**self._status(controller), "effective_time_budget_seconds": effective_time}
         raise ValueError("task 不在可继续状态")
 
-    async def _restart_round(self, task_id: str, credits: float, time_budget_seconds: int) -> None:
+    async def _restart_round(self, task_id: str, adjustment: float, time_budget_seconds: int) -> bool:
         controller, state = self._controller(task_id), self._controller(task_id).state
         snapshot = await self._snapshot_provider()
         round_id, branch_id, now = new_round_id(), new_branch_id(), _now()
         number, generation = self._round_numbers[task_id] + 1, state.generation + 1
         layer = await self.store.load_summary_layer(task_id)
         summary_context = {"summaries": list(layer.summaries), "reports": list(layer.reports), "feedback": list(layer.feedback), "supplied_context": list(layer.supplied_context)} if layer else {}
-        await self.store.transact((
-            StoreCommand("insert_round", {"round_id": round_id, "task_id": task_id, "round_number": number, "generation": generation, "status": TaskStatus.RUNNING.value, "time_budget_seconds": time_budget_seconds, "grace_period_seconds": self._grace_period_seconds, "credit_pool": 0.0, "catalog_fingerprint": snapshot.agent_catalog.fingerprint, "started_at": now}),
-            StoreCommand("set_task_current_round", {"task_id": task_id, "current_round_number": number, "updated_at": now}),
-            StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": generation, "created_at": now}),
-            self._lifecycle(task_id, round_id, "ContinueRequested", state.status, TaskStatus.RUNNING, now),
-        ))
+        event = ContinueRequested(
+            _event_id(), task_id, state.active_round_id or "", state.generation,
+            adjustment=adjustment, active_leaves={}, next_round_id=round_id,
+            next_generation=generation, round_number=number, time_budget_seconds=time_budget_seconds,
+            grace_period_seconds=self._grace_period_seconds, catalog_fingerprint=snapshot.agent_catalog.fingerprint,
+        )
+        credits = state.credit_pool + adjustment
+        accepted = await controller.apply(
+            event,
+            extra_commands=(
+                StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": generation, "created_at": now}),
+            ),
+            effects=(
+                PerformAgentCall(task_id, round_id, generation, payload={"root": True, "branch_id": branch_id, "formalized_text": state.formalized_task.text, "summary_layer": summary_context}),
+            ),
+            state_changes={"active_leaves": {branch_id: credits}, "raw_context_released": False},
+        )
+        if not accepted or controller.state.status is not TaskStatus.RUNNING:
+            return False
         self._round_numbers[task_id] = number
-        controller.state = replace(state, status=TaskStatus.RUNNING, active_round_id=round_id, generation=generation, active_leaves={branch_id: credits}, credit_pool=0.0, raw_context_released=False)
         self._branches[task_id] = {branch_id: {"credits": credits, "pending_context": list(summary_context.get("supplied_context", []))}}
-        await self.scheduler.enqueue(PerformAgentCall(task_id, round_id, generation, payload={"root": True, "branch_id": branch_id, "formalized_text": state.formalized_task.text, "summary_layer": summary_context}))
+        return True
 
     async def handle_runtime_event(self, event: Any) -> None:
         controller = self._controllers.get(event.task_id)
@@ -302,9 +332,20 @@ class ResearchManager:
     async def _submit(self, controller: TaskController, event: Any) -> None:
         """Submit a runtime event through the sole transaction-before-effect driver."""
 
-        if not await controller.submit(event):
+        if not await controller.submit_and_drain(event):
             raise RuntimeError("task controller 已停止，拒绝处理事件")
-        await controller.drain()
+
+    def _task_inflight_count(self, task_id: str) -> int:
+        """Read optional scheduler-specific count or FairScheduler public stats."""
+
+        direct = getattr(self.scheduler, "task_inflight_count", None)
+        if callable(direct):
+            return max(0, int(direct(task_id)))
+        stats = getattr(self.scheduler, "stats", None)
+        if callable(stats):
+            task = dict(stats().get("tasks", {}).get(task_id, {}))
+            return max(0, int(task.get("active", 0)))
+        return 0
 
     async def wait_idle(self, task_id: str) -> None:
         while True:

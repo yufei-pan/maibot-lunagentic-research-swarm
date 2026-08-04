@@ -123,6 +123,8 @@ class SQLiteStateStore:
                     "set_task_current_round": self._set_task_current_round,
                     "update_round_status": self._update_round_status,
                     "update_round_generation": self._update_round_generation,
+                    "update_round_continuation": self._update_round_continuation,
+                    "update_branch_balance": self._update_branch_balance,
                 }
             )
         )
@@ -633,6 +635,33 @@ class SQLiteStateStore:
             (values["generation"], values["round_id"]),
         )
         _require_single_target(cursor, target_kind="Round", target_id=values["round_id"])
+
+    @staticmethod
+    def _update_round_continuation(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        """Persist the pause-barrier budget/pool change in the same transaction."""
+
+        cursor = connection.execute(
+            """
+            UPDATE investigation_rounds
+            SET credit_pool = ?, time_budget_seconds = ?, report_deadline_at = ?
+            WHERE round_id = ?
+            """,
+            (
+                values["credit_pool"],
+                values["time_budget_seconds"],
+                values.get("report_deadline_at"),
+                values["round_id"],
+            ),
+        )
+        _require_single_target(cursor, target_kind="Round", target_id=values["round_id"])
+
+    @staticmethod
+    def _update_branch_balance(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        cursor = connection.execute(
+            "UPDATE branches SET credit_balance = ?, lifecycle = ? WHERE branch_id = ?",
+            (values["credit_balance"], values["lifecycle"], values["branch_id"]),
+        )
+        _require_single_target(cursor, target_kind="Branch", target_id=values["branch_id"])
 
     @staticmethod
     def _row_to_round(row: sqlite3.Row) -> StoredRound:
