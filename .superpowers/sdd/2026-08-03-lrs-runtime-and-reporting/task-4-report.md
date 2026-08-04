@@ -66,3 +66,14 @@ timeout 30s env PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
 修复后 focused + Task1–3 回归：`68 passed in 0.35s`。
 
 修复提交：本报告随 `fix: harden Procedure privacy, provenance, retry and core event immutability` 提交。
+
+## 审查修复 Round 2
+
+### RED/GREEN
+
+新增回归先证明 `raw_result`、`raw_arguments`、`transcript`、`messages` 会从
+`ProcedureResult.data` 进入 event JSON；另证明 core control arguments 中同类字段以及
+`reasoning` 会泄露。递归 sanitizer 与 frozen control request 过滤后，普通业务字段和必要的
+`reason` 保留，focused + Task1–3 回归为 `70 passed in 0.33s`。
+
+修复提交：本报告随 `fix: remove raw procedure transcripts from events` 提交。

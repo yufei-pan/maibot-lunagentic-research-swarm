@@ -252,6 +252,39 @@ async def test_provider_payload_and_error_sensitive_fields_are_removed_before_ev
 
 
 @pytest.mark.asyncio
+async def test_raw_result_arguments_transcript_and_messages_are_not_persisted() -> None:
+    api = FakeAPI(
+        {
+            "builtin.transcript_safe": {
+                "success": True,
+                "data": {
+                    "answer": "普通业务字段",
+                    "raw_result": {"secret": "secret-raw-result"},
+                    "raw_arguments": {"secret": "secret-raw-arguments"},
+                    "transcript": [{"content": "secret-transcript"}],
+                    "messages": [{"content": "secret-messages"}],
+                },
+                "error": None,
+                "metadata": {},
+            }
+        }
+    )
+    executor = ProcedureExecutor(catalog(definition("builtin.transcript_safe")), api=api)
+
+    event = await executor.invoke_many(effect([ProcedureRequest(procedure_id="builtin.transcript_safe")]))
+    encoded = event_to_json(event)
+
+    assert "普通业务字段" in encoded
+    for secret in (
+        "secret-raw-result",
+        "secret-raw-arguments",
+        "secret-transcript",
+        "secret-messages",
+    ):
+        assert secret not in encoded
+
+
+@pytest.mark.asyncio
 async def test_catalog_provenance_overwrites_provider_spoofed_result_metadata() -> None:
     api = FakeAPI(
         {

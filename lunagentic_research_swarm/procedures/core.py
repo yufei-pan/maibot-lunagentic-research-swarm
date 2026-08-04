@@ -40,11 +40,33 @@ def _request_procedure_id(request: Any) -> str:
     return str(value) if value is not None else ""
 
 
+_SENSITIVE_CONTROL_KEYS = frozenset(
+    {
+        "reasoning",
+        "raw_payload",
+        "raw_provenance",
+        "raw_payloads",
+        "raw_result",
+        "raw_arguments",
+        "provenance",
+        "payload",
+        "transcript",
+        "messages",
+    }
+)
+
+
 def _freeze_control_json(value: Any) -> Any:
     """递归冻结 control request 的 JSON 值，避免事件发布后被改写。"""
 
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze_control_json(item) for key, item in value.items()})
+        return MappingProxyType(
+            {
+                str(key): _freeze_control_json(item)
+                for key, item in value.items()
+                if str(key).lower() not in _SENSITIVE_CONTROL_KEYS
+            }
+        )
     if isinstance(value, list | tuple):
         return tuple(_freeze_control_json(item) for item in value)
     return value

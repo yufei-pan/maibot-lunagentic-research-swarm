@@ -61,8 +61,12 @@ _SENSITIVE_PAYLOAD_KEYS = frozenset(
         "raw_payload",
         "raw_provenance",
         "raw_payloads",
+        "raw_result",
+        "raw_arguments",
         "provenance",
         "payload",
+        "transcript",
+        "messages",
     }
 )
 

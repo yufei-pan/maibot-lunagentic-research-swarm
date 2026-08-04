@@ -112,3 +112,42 @@ def test_core_control_requests_are_frozen_and_survive_event_round_trip() -> None
     assert decoded.controls.control_requests[0].arguments["reason"]["nested"] == "value"
     with pytest.raises(TypeError):
         decoded.controls.control_requests[0].arguments["reason"]["nested"] = "mutated"  # type: ignore[index]
+
+
+def test_core_control_arguments_do_not_persist_raw_payload_or_transcripts() -> None:
+    _, controls = split_procedure_requests(
+        [
+            ProcedureRequest(
+                procedure_id=CORE_COMPACT_ID,
+                arguments={
+                    "reason": "保留控制参数",
+                    "raw_payload": "SECRET_CONTROL_RAW",
+                    "reasoning": "SECRET_CONTROL_REASONING",
+                    "raw_result": "SECRET_CONTROL_RESULT",
+                    "raw_arguments": "SECRET_CONTROL_ARGUMENTS",
+                    "transcript": "SECRET_CONTROL_TRANSCRIPT",
+                    "messages": "SECRET_CONTROL_MESSAGES",
+                },
+            )
+        ]
+    )
+    event = ProcedureBatchCompleted(
+        event_id="event-control-sensitive",
+        task_id="task-1",
+        round_id="round-1",
+        generation=1,
+        controls=controls,
+    )
+
+    encoded = event_to_json(event)
+
+    assert "保留控制参数" in encoded
+    for secret in (
+        "SECRET_CONTROL_RAW",
+        "SECRET_CONTROL_REASONING",
+        "SECRET_CONTROL_RESULT",
+        "SECRET_CONTROL_ARGUMENTS",
+        "SECRET_CONTROL_TRANSCRIPT",
+        "SECRET_CONTROL_MESSAGES",
+    ):
+        assert secret not in encoded
