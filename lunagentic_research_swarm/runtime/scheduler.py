@@ -135,6 +135,7 @@ class FairScheduler:
         self._closed = False
         self._wake: asyncio.Event | None = None
         self._dispatcher: asyncio.Task[Any] | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def _validate_limit(value: int, name: str) -> int:
@@ -191,6 +192,7 @@ class FairScheduler:
                 cursor = self._cursor.get(priority)
                 if cursor in task_queues and cursor != task_id:
                     task_queues.move_to_end(task_id, last=False)
+                    self._cursor[priority] = task_id
         task_queues[task_id].append(entry)
         self._signal()
         return True
@@ -299,25 +301,27 @@ class FairScheduler:
     async def close(self) -> None:
         """Stop intake, cancel queued local futures, and await started wrappers."""
 
-        if self._closed:
-            return
-        self._closing = True
-        self._closed = True
-        for task_queues in self._queues.values():
-            for queue in task_queues.values():
-                while queue:
-                    self._cancel_future(queue.popleft().future)
-        self._queues.clear()
-        self._cursor.clear()
-        self._dispatched.clear()
-        self._signal()
+        if self._close_task is None:
+            self._closing = True
+            caller = asyncio.current_task()
+            for task_queues in self._queues.values():
+                for queue in task_queues.values():
+                    while queue:
+                        self._cancel_future(queue.popleft().future)
+            self._queues.clear()
+            self._cursor.clear()
+            self._dispatched.clear()
+            self._signal()
+            self._close_task = asyncio.create_task(self._finish_close(caller), name="lrs-fair-scheduler-close")
+        await asyncio.shield(self._close_task)
 
-        current = asyncio.current_task()
-        if self._dispatcher is not None and self._dispatcher is not current:
+    async def _finish_close(self, excluded_task: asyncio.Task[Any] | None) -> None:
+        if self._dispatcher is not None and self._dispatcher is not excluded_task:
             await self._dispatcher
-        active_tasks = [active.task for active in self._active.values() if active.task is not current]
+        active_tasks = [active.task for active in self._active.values() if active.task is not excluded_task]
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
+        self._closed = True
 
     def stats(self) -> dict[str, Any]:
         """Return queue/capacity telemetry without effect payloads or prompts."""
@@ -365,12 +369,37 @@ class FairScheduler:
                 },
             }
 
+        global_kind_stats: dict[str, dict[str, Any]] = {}
+        for entry in queued_entries:
+            kind = str(entry.effect.kind)
+            data = global_kind_stats.setdefault(kind, {"active": 0, "queued": 0, "wait_latency_seconds": 0.0})
+            data["queued"] += 1
+            data["wait_latency_seconds"] += max(0.0, now - entry.queued_at)
+        for item in self._active.values():
+            kind = str(item.entry.effect.kind)
+            data = global_kind_stats.setdefault(kind, {"active": 0, "queued": 0, "wait_latency_seconds": 0.0})
+            data["active"] += 1
+            data["wait_latency_seconds"] += max(0.0, item.started_at - item.entry.queued_at)
+        global_waits = [max(0.0, now - entry.queued_at) for entry in queued_entries]
+        global_waits.extend(
+            max(0.0, item.started_at - item.entry.queued_at) for item in self._active.values()
+        )
+        global_average_wait = sum(global_waits) / len(global_waits) if global_waits else 0.0
         global_stats = {
             "active": len(self._active),
             "queued": len(queued_entries),
             "llm_active": self._global_llm_active,
             "llm_limit": self.global_llm,
             "limits": dict(self._limits),
+            "kind": global_kind_stats,
+            "active_by_kind": {key: value["active"] for key, value in global_kind_stats.items()},
+            "queued_by_kind": {key: value["queued"] for key, value in global_kind_stats.items()},
+            "wait_latency_seconds": global_average_wait,
+            "wait_latency": {
+                "samples": len(global_waits),
+                "average_seconds": global_average_wait,
+                "max_seconds": max(global_waits, default=0.0),
+            },
         }
         return {
             "started": self._started and not self._closed,
@@ -438,7 +467,7 @@ class FairScheduler:
             self._cancel_future(entry.future)
             raise
         except Exception as exc:
-            self._errors.append({"kind": type(exc).__name__, "message": str(exc)})
+            self._errors.append({"kind": type(exc).__name__})
             if not entry.future.done():
                 entry.future.set_exception(exc)
                 entry.future.add_done_callback(self._consume_future_exception)
@@ -512,6 +541,8 @@ class FairScheduler:
             selected = self._take_from_priority(priority, task_queues)
             if selected is not None:
                 return selected
+            if priority == "barrier" and task_queues:
+                return None
         return None
 
     def _take_from_priority(

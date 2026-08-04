@@ -32,3 +32,30 @@ worker wrapper 不实现 Host HTTP retry。
   不会中断已经进入 Host 的请求；迟到结果仍必须由 reducer 的 generation 检查丢弃。
 - scheduler 只实现本任务的队列与 wrapper；Procedure/turn/controller/reporting 接线留给
   后续计划任务。
+
+## 正式审查修复 Round 1
+
+### RED
+
+为五个 Important finding 分别增加行为回归；修复前逐项得到预期失败：
+
+- live queue 中 A 已 active 且仍有 queued work 时加入 B，实际前两项为 `a0,a1`，
+  新 task 没有取得下一轮；
+- global LLM 容量被占满时，blocked report barrier 后的普通 Procedure child 先启动；
+- 第一个 `close()` 等待在途 wrapper 时，第二个并发 `close()` 已提前完成；
+- `stats()["global"]` 没有 `kind` 与 `wait_latency` 聚合；
+- worker 异常中的 secret prompt 通过 `errors[].message` 出现在 `stats()`。
+
+### GREEN
+
+- 新 task 加入已开始 dispatch 的 priority 时，同时更新下一 cursor；同优先级动态
+  round-robin 顺序为 `a0,b0`；
+- 未满足启动条件的 barrier priority 阻止 lower-priority dequeue，容量释放后顺序为
+  `inflight,report,child`；
+- 所有并发 `close()` 调用 shield-await 同一个关闭 task，首次调用仍立即停止 intake 并
+  清除 queued futures；
+- global stats 现在提供与 per-task 一致的 kind active/queued 和 wait-latency
+  samples/average/max 聚合；
+- 错误 telemetry 只保留结构化异常类型，不保存 `str(exc)` 或 effect payload。
+
+修复后 scheduler focused suite 为 `13 passed`，Task 1/2 指定回归为 `39 passed`。

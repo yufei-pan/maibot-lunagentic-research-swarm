@@ -68,12 +68,48 @@ async def test_wide_task_cannot_starve_other_task(fake_worker: FakeWorker) -> No
 
 
 @pytest.mark.asyncio
+async def test_task_joining_live_queue_gets_next_round_robin_turn(fake_worker: FakeWorker) -> None:
+    fake_worker.block = True
+    scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=fake_worker)
+    await scheduler.start()
+    await scheduler.enqueue(effect("A", "a0"))
+    await scheduler.enqueue(effect("A", "a1"))
+    await fake_worker.wait_started(1)
+
+    await scheduler.enqueue(effect("B", "b0"))
+    fake_worker.release.set()
+    await fake_worker.wait_started(2)
+
+    assert fake_worker.started[:2] == ["a0", "b0"]
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_control_barrier_precedes_child_launch(fake_worker: FakeWorker) -> None:
     scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=fake_worker)
     await scheduler.enqueue(effect("A", "child", kind="agent", priority="normal"))
     await scheduler.enqueue(effect("A", "continue", kind="control", priority="barrier"))
     await fake_worker.wait_started(1)
     assert fake_worker.started[0] == "continue"
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_blocked_barrier_prevents_lower_priority_child_launch(fake_worker: FakeWorker) -> None:
+    fake_worker.block = True
+    scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=fake_worker)
+    await scheduler.start()
+    await scheduler.enqueue(effect("A", "inflight", kind="agent"))
+    await fake_worker.wait_started(1)
+
+    await scheduler.enqueue(effect("A", "report", kind="summarizer", priority="barrier"))
+    await scheduler.enqueue(effect("A", "child", kind="procedure", priority="normal"))
+    await asyncio.sleep(0)
+
+    assert fake_worker.started == ["inflight"]
+    fake_worker.release.set()
+    await fake_worker.wait_started(3)
+    assert fake_worker.started == ["inflight", "report", "child"]
     await scheduler.close()
 
 
@@ -163,6 +199,47 @@ async def test_close_waits_for_started_wrappers_and_cancels_queue(fake_worker: F
 
 
 @pytest.mark.asyncio
+async def test_concurrent_close_callers_wait_for_same_shutdown(fake_worker: FakeWorker) -> None:
+    fake_worker.block = True
+    scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=fake_worker)
+    await scheduler.enqueue(effect("A", "inflight"))
+    await fake_worker.wait_started(1)
+
+    first = asyncio.create_task(scheduler.close())
+    await asyncio.sleep(0)
+    second = asyncio.create_task(scheduler.close())
+    await asyncio.sleep(0)
+
+    assert not first.done()
+    assert not second.done()
+    fake_worker.release.set()
+    await asyncio.gather(first, second)
+    assert scheduler.stats()["closed"]
+
+
+@pytest.mark.asyncio
+async def test_global_stats_aggregate_kind_and_wait_latency(fake_worker: FakeWorker) -> None:
+    fake_worker.block = True
+    scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=fake_worker)
+    await scheduler.enqueue(effect("A", "active", kind="agent"))
+    await fake_worker.wait_started(1)
+    await scheduler.enqueue(effect("B", "queued", kind="summarizer"))
+
+    snapshot = scheduler.stats()["global"]
+    assert snapshot["kind"]["agent"]["active"] == 1
+    assert snapshot["kind"]["agent"]["queued"] == 0
+    assert snapshot["kind"]["summarizer"]["active"] == 0
+    assert snapshot["kind"]["summarizer"]["queued"] == 1
+    assert snapshot["active_by_kind"] == {"agent": 1, "summarizer": 0}
+    assert snapshot["queued_by_kind"] == {"agent": 0, "summarizer": 1}
+    assert snapshot["wait_latency"]["samples"] == 2
+    assert snapshot["wait_latency"]["max_seconds"] >= snapshot["wait_latency"]["average_seconds"] >= 0.0
+
+    fake_worker.release.set()
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_stats_are_observable_without_prompt_payload(fake_worker: FakeWorker) -> None:
     fake_worker.block = True
     scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=fake_worker)
@@ -173,4 +250,23 @@ async def test_stats_are_observable_without_prompt_payload(fake_worker: FakeWork
     assert "prompt" not in repr(snapshot)
     assert snapshot["tasks"]["A"]["kind"]["agent"]["active"] == 1
     fake_worker.release.set()
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_stats_do_not_expose_worker_exception_payload() -> None:
+    secret = "secret prompt from worker exception"
+    failed = asyncio.Event()
+
+    async def failing_worker(item: Effect, token: object) -> None:
+        failed.set()
+        raise RuntimeError(f"provider rejected {secret}")
+
+    scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=failing_worker)
+    await scheduler.enqueue(effect("A", "failure", prompt=secret))
+    await failed.wait()
+
+    snapshot = scheduler.stats()
+    assert secret not in repr(snapshot)
+    assert snapshot["errors"] == ({"kind": "RuntimeError"},)
     await scheduler.close()
