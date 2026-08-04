@@ -128,11 +128,12 @@ class PhysicalPinningAdapter:
             return _error("physical_pinning_unsupported", "当前 Host 的物理模型固定接口签名不兼容")
 
         fallback_temperature = temperature if temperature is not None else 0.3
+        synthetic_max_tokens = max_tokens if max_tokens is not None and max_tokens > 0 else 65536
         try:
             task_config = TaskConfig(
                 model_list=[physical_name],
                 temperature=fallback_temperature,
-                max_tokens=65536,
+                max_tokens=synthetic_max_tokens,
                 selection_strategy="random",
                 slow_threshold=30.0,
             )

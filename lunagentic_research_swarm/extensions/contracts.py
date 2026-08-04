@@ -26,6 +26,31 @@ class CatalogDelta:
     updated: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ExtensionRefreshEvent:
+    """一次 refresh 对一个 provider 或 discovery 边界的不可变审计事件。"""
+
+    provider_plugin_id: str
+    extension_kind: Literal["agents", "procedures", "discovery"]
+    availability: Literal["available", "invalid", "removed"]
+    fingerprint: str
+    errors: tuple[str, ...]
+    created_at: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "errors", tuple(self.errors))
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionRefreshDelta:
+    """一次 refresh 完成后交给 service 的完整持久化增量。"""
+
+    events: tuple[ExtensionRefreshEvent, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "events", tuple(self.events))
+
+
 class _StrictContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 

@@ -3,6 +3,8 @@
 from .contracts import (
     AgentDefinition,
     CatalogDelta,
+    ExtensionRefreshDelta,
+    ExtensionRefreshEvent,
     ProcedureDefinition,
     ProcedureInvocation,
     ProcedureResult,
@@ -13,6 +15,8 @@ from .validation import canonical_fingerprint
 __all__ = [
     "AgentDefinition",
     "CatalogDelta",
+    "ExtensionRefreshDelta",
+    "ExtensionRefreshEvent",
     "ProcedureDefinition",
     "ProcedureInvocation",
     "ProcedureResult",

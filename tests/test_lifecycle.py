@@ -13,7 +13,7 @@ from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, ON_MODEL_CONFIG_RELOAD
 from maibot_sdk.context import PluginContext, PluginPaths
 
 from lunagentic_research_swarm.config import LRSConfig
-from lunagentic_research_swarm.extensions.contracts import AgentDefinition
+from lunagentic_research_swarm.extensions.contracts import AgentDefinition, ProcedureDefinition
 from lunagentic_research_swarm.llm.physical_pinning import PhysicalPinningStatus
 
 
@@ -40,6 +40,9 @@ class FakeStore:
     async def close(self) -> None:
         self.events.append("store.close")
         self.close_count += 1
+
+    async def transact(self, commands: Any) -> None:
+        assert commands
 
 
 class FakeDiscovery:
@@ -116,8 +119,10 @@ class DiscoveryFactory:
         procedures: Any,
         *,
         refresh_interval_seconds: float,
+        refresh_listener: Any = None,
     ) -> FakeDiscovery:
         assert ctx.api is not None
+        del refresh_listener
         instance = FakeDiscovery(
             self.events,
             agents,
@@ -157,6 +162,19 @@ def agent_payload(agent_id: str, *, selector: str = "task:utils") -> AgentDefini
             "character_prompt": "只执行测试任务。",
             "model_selector": selector,
             "can_be_root": True,
+        }
+    )
+
+
+def procedure_payload(procedure_id: str) -> ProcedureDefinition:
+    return ProcedureDefinition.model_validate(
+        {
+            "procedure_id": procedure_id,
+            "version": "1",
+            "display_name": "测试 Procedure",
+            "description": "用于基础服务测试",
+            "arguments_schema": {"type": "object"},
+            "result_schema": {"type": "object"},
         }
     )
 
@@ -709,7 +727,83 @@ async def test_self_reload_updates_only_live_safety_refresh_and_boundary_health(
         "version": "self-v2",
         "next_round": ["catalog", "selectors", "prompt"],
     }
-    assert plugin._services.health()["root_agent"]["agent_id"] == "builtin.quick_thinker"
+    assert plugin._services.health()["root_agent"]["agent_id"] == "other.root"
+    await plugin.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_self_reload_atomically_replaces_detached_next_round_snapshot(plugin_module, tmp_path: Path) -> None:
+    """若 reload 仍只改 live limits，新 round 会继续使用旧目录、selector、预算和价格。"""
+
+    def providers(agents: Any, procedures: Any) -> None:
+        agents.replace_provider(
+            "provider.agents",
+            [agent_payload("agents.old_root"), agent_payload("agents.new_root")],
+        )
+        procedures.replace_provider("provider.tools", [procedure_payload("tools.fetch")])
+
+    initial = config_with(
+        plugin={"root_agent": "agents.old_root"},
+        llm={"force_selector": "task:old_force"},
+        summarizer={"selector": "task:old_summary"},
+        budget={"default_effort_credits": 25.0},
+        pricing={"models": {"priced": {"price_in": 1.0}}},
+        agents={"agents.old_root": {"selector": "task:old_agent"}},
+        procedures={"tools.fetch": {"timeout_seconds": 11.0}},
+    )
+    container, context, _, _, _ = build_container(
+        plugin_module,
+        tmp_path,
+        config=initial,
+        discovery_factory=DiscoveryFactory([], providers),
+        snapshot_loader=lambda: {
+            "models": [{"name": "priced", "price_in": 9.0}],
+            "model_task_config": {
+                "old_force": {"model_list": ["priced"]},
+                "new_force": {"model_list": ["priced"]},
+            },
+        },
+    )
+    await container.start()
+    before = await container.snapshot_next_round()
+    plugin = plugin_module.create_plugin()
+    plugin._set_context(context)
+    plugin.set_plugin_config(initial.model_dump(mode="python"))
+    plugin._services = container
+    updated = config_with(
+        plugin={"root_agent": "agents.new_root"},
+        llm={"force_selector": "task:new_force"},
+        summarizer={"selector": "task:new_summary"},
+        budget={"default_effort_credits": 250.0},
+        pricing={"models": {"priced": {"price_in": 2.0, "price_out": 3.0}}},
+        agents={"agents.new_root": {"selector": "task:new_agent"}},
+        procedures={"tools.fetch": {"timeout_seconds": 22.0}},
+    ).model_dump(mode="python")
+
+    await plugin.on_config_update(CONFIG_RELOAD_SCOPE_SELF, updated, "self-v3")
+    updated["plugin"]["root_agent"] = "mutated.root"
+    updated["agents"]["agents.new_root"]["selector"] = "task:mutated"
+    updated["pricing"]["models"]["priced"]["price_in"] = 99.0
+    after = await container.snapshot_next_round()
+
+    assert before.root_agent == "agents.old_root"
+    assert before.root_force_selector == "task:old_force"
+    assert before.summarizer_selector == "task:old_summary"
+    assert before.default_effort_credits == 25.0
+    assert before.agent_catalog.get("agents.old_root").definition.model_selector == "task:old_agent"
+    assert before.procedure_catalog.get("tools.fetch").definition.timeout_seconds == 11.0
+    assert before.price_catalog.resolve_model("priced").profile.price_in == 1.0
+
+    assert after.root_agent == "agents.new_root"
+    assert after.root_force_selector == "task:new_force"
+    assert after.summarizer_selector == "task:new_summary"
+    assert after.default_effort_credits == 250.0
+    assert after.agent_catalog.get("agents.new_root").definition.model_selector == "task:new_agent"
+    assert after.procedure_catalog.get("tools.fetch").definition.timeout_seconds == 22.0
+    assert after.price_catalog.resolve_model("priced").profile.price_in == 2.0
+    assert after.price_catalog.resolve_model("priced").profile.price_out == 3.0
+    assert after.price_catalog is not before.price_catalog
+    assert container.agent_registry.snapshot({}).root_agent == "agents.new_root"
     await plugin.on_unload()
 
 

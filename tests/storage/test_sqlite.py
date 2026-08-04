@@ -87,6 +87,84 @@ async def test_unknown_command_rolls_back_prior_commands(tmp_path) -> None:
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_missing_task_formalization_target_raises_and_rolls_back_prior_mutation(tmp_path) -> None:
+    """若 formalization UPDATE 静默 no-op，reducer 会提交一个不存在的正式任务。"""
+
+    store = SQLiteStateStore(tmp_path / "state.sqlite3")
+    await store.open()
+    try:
+        with pytest.raises(LookupError, match="不存在"):
+            await store.transact(
+                [
+                    _task("lrs_prior_formalization"),
+                    StoreCommand(
+                        "update_task_formalization",
+                        {
+                            "task_id": "lrs_missing",
+                            "formalized_text": "不存在的任务",
+                            "formalized_sha256": "missing_hash",
+                            "updated_at": 2.0,
+                        },
+                    ),
+                ]
+            )
+        assert await store.load_task("lrs_prior_formalization") is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_current_round_target_raises_and_rolls_back_prior_mutation(tmp_path) -> None:
+    """若 current round UPDATE 静默 no-op，后续读取会继续选中旧 round。"""
+
+    store = SQLiteStateStore(tmp_path / "state.sqlite3")
+    await store.open()
+    try:
+        with pytest.raises(LookupError, match="不存在"):
+            await store.transact(
+                [
+                    _task("lrs_prior_current_round"),
+                    StoreCommand(
+                        "set_task_current_round",
+                        {
+                            "task_id": "lrs_missing",
+                            "current_round_number": 2,
+                            "updated_at": 2.0,
+                        },
+                    ),
+                ]
+            )
+        assert await store.load_task("lrs_prior_current_round") is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_round_status_target_raises_and_rolls_back_prior_mutation(tmp_path) -> None:
+    """若 round status UPDATE 静默 no-op，内存状态会领先于 SQLite 权威状态。"""
+
+    store = SQLiteStateStore(tmp_path / "state.sqlite3")
+    await store.open()
+    try:
+        with pytest.raises(LookupError, match="不存在"):
+            await store.transact(
+                [
+                    _task("lrs_prior_round_status"),
+                    StoreCommand(
+                        "update_round_status",
+                        {
+                            "round_id": "rnd_missing",
+                            "status": TaskStatus.RUNNING.value,
+                        },
+                    ),
+                ]
+            )
+        assert await store.load_task("lrs_prior_round_status") is None
+    finally:
+        await store.close()
+
+
 def test_store_command_copies_and_freezes_values() -> None:
     """若调用方能在排队后改写 values，transaction 内容将取决于竞态。"""
 

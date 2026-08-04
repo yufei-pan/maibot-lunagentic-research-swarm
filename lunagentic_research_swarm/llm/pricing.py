@@ -252,6 +252,17 @@ class PriceCatalog:
         self._host_priced_models = replacement._host_priced_models
         self._refresh_fingerprint()
 
+    def with_plugin_overrides(self, plugin_overrides: Mapping[str, Any]) -> PriceCatalog:
+        """复用已脱敏 Host 状态构造新目录，不原地污染已冻结 round。"""
+
+        return type(self)(
+            plugin_overrides=plugin_overrides,
+            host_models=self._host_models,
+            task_models=self._task_models,
+            host_available=self._host_available,
+            host_priced_models=self._host_priced_models,
+        )
+
     def _refresh_fingerprint(self) -> None:
         payload = {
             "host_available": self._host_available,

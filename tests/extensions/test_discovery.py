@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from lunagentic_research_swarm.agents.registry import AgentRegistry
+from lunagentic_research_swarm.extensions.contracts import ExtensionRefreshDelta, ExtensionRefreshEvent
 from lunagentic_research_swarm.extensions.discovery import ExtensionDiscovery
 from lunagentic_research_swarm.procedures.registry import ProcedureRegistry
 
@@ -110,6 +111,26 @@ class FakeAPI:
 class FakeContext:
     def __init__(self, api: FakeAPI) -> None:
         self.api = api
+
+
+def test_refresh_delta_detaches_mutable_sequences() -> None:
+    errors = ["字面错误"]
+    events = [
+        ExtensionRefreshEvent(
+            provider_plugin_id="provider.agents",
+            extension_kind="agents",
+            availability="invalid",
+            fingerprint="literal_fingerprint",
+            errors=errors,  # type: ignore[arg-type]
+            created_at=1.0,
+        )
+    ]
+    delta = ExtensionRefreshDelta(events)  # type: ignore[arg-type]
+
+    errors.append("外部修改")
+    events.clear()
+
+    assert delta.events[0].errors == ("字面错误",)
 
 
 @pytest.mark.asyncio
@@ -268,7 +289,8 @@ async def test_overlapping_direct_refresh_calls_share_one_scan_and_result() -> N
     api.release_list.set()
     results = await asyncio.gather(first, second)
 
-    assert results == [None, None]
+    assert results[0] == results[1]
+    assert results[0].events[1].availability == "invalid"
     assert api.list_count == 1
     assert api.calls == [("provider.agents.describe_agents", "1", {})]
     assert agents.health["provider.agents"].status == "invalid"

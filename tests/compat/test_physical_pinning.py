@@ -90,7 +90,7 @@ async def test_physical_pinning_uses_synthetic_single_model_and_host_max_token_p
         {
             "model_list": ["physical"],
             "temperature": 0.6,
-            "max_tokens": 65536,
+            "max_tokens": 4096,
             "selection_strategy": "random",
             "slow_threshold": 30.0,
         }
@@ -104,8 +104,10 @@ async def test_physical_pinning_uses_synthetic_single_model_and_host_max_token_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("max_tokens", [0, None])
 async def test_physical_pinning_zero_max_tokens_uses_65536_synthetic_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    max_tokens: int | None,
 ) -> None:
     class LLMOrchestrator:
         def __init__(self, task_name: str, request_type: str = "", session_id: str = "") -> None:
@@ -128,7 +130,7 @@ async def test_physical_pinning_zero_max_tokens_uses_65536_synthetic_fallback(
 
     task_configs = _install_host_fakes(monkeypatch, LLMOrchestrator)
     result = await PhysicalPinningAdapter().generate(
-        physical_name="physical", prompt="hello", tools=None, temperature=None, max_tokens=None
+        physical_name="physical", prompt="hello", tools=None, temperature=None, max_tokens=max_tokens
     )
     assert task_configs[0]["max_tokens"] == 65536
     assert result["success"] is True

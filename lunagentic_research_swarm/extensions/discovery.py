@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from types import MappingProxyType
 from typing import Any
@@ -11,7 +12,12 @@ from typing import Any
 from lunagentic_research_swarm.agents.registry import AgentRegistry
 from lunagentic_research_swarm.procedures.registry import ProcedureRegistry
 
-from .contracts import AgentDefinition, ProcedureDefinition
+from .contracts import (
+    AgentDefinition,
+    ExtensionRefreshDelta,
+    ExtensionRefreshEvent,
+    ProcedureDefinition,
+)
 from .validation import canonical_fingerprint
 
 
@@ -49,6 +55,7 @@ class ExtensionDiscovery:
         procedure_registry: ProcedureRegistry,
         *,
         refresh_interval_seconds: float,
+        refresh_listener: Callable[[ExtensionRefreshDelta], Awaitable[None]] | None = None,
     ) -> None:
         if refresh_interval_seconds <= 0:
             raise ValueError("扩展刷新间隔必须大于 0")
@@ -56,8 +63,9 @@ class ExtensionDiscovery:
         self._agents = agent_registry
         self._procedures = procedure_registry
         self._refresh_interval_seconds = float(refresh_interval_seconds)
+        self._refresh_listener = refresh_listener
         self._refresh_lock = asyncio.Lock()
-        self._inflight_refresh: asyncio.Task[None] | None = None
+        self._inflight_refresh: asyncio.Task[ExtensionRefreshDelta] | None = None
         self._refresh_requested = asyncio.Event()
         self._background_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -75,47 +83,71 @@ class ExtensionDiscovery:
     def closed(self) -> bool:
         return self._closed
 
-    async def refresh(self) -> None:
+    async def refresh(self) -> ExtensionRefreshDelta:
         """共享同一个在途扫描；单个 provider 失败不阻断其他批次。"""
 
         if self._closed:
-            return
+            return ExtensionRefreshDelta()
         task = self._inflight_refresh
         if task is None or task.done():
             task = asyncio.create_task(self._refresh_once(), name="lrs-extension-refresh-once")
             self._inflight_refresh = task
         try:
-            await asyncio.shield(task)
+            return await asyncio.shield(task)
         finally:
             if self._inflight_refresh is task and task.done():
                 self._inflight_refresh = None
 
-    async def _refresh_once(self) -> None:
-        """执行一次实际 Host 扫描。"""
+    async def _refresh_once(self) -> ExtensionRefreshDelta:
+        delta = await self._scan_once()
+        if self._refresh_listener is not None and delta.events:
+            await self._refresh_listener(delta)
+        return delta
+
+    async def _scan_once(self) -> ExtensionRefreshDelta:
+        """执行一次实际 Host 扫描并产生不可变审计增量。"""
 
         async with self._refresh_lock:
             if self._closed:
-                return
+                return ExtensionRefreshDelta()
+            refreshed_at = time.time()
+            events: list[ExtensionRefreshEvent] = []
             try:
                 raw_infos = await self._ctx.api.list()
                 if not isinstance(raw_infos, list):
                     raise TypeError("ctx.api.list() 必须返回 API metadata 列表")
             except Exception as exc:
-                self._record_global_error(exc)
-                return
+                events.append(self._record_global_error(exc, refreshed_at))
+                return ExtensionRefreshDelta(tuple(events))
             self._extension_fingerprints.pop("discovery", None)
             for key in tuple(self._extension_fingerprints):
                 if key.startswith("descriptor:"):
                     self._extension_fingerprints.pop(key, None)
             if self._closed:
-                return
+                return ExtensionRefreshDelta()
+            events.append(
+                ExtensionRefreshEvent(
+                    provider_plugin_id="host-api",
+                    extension_kind="discovery",
+                    availability="available",
+                    fingerprint=canonical_fingerprint({"status": "available"}),
+                    errors=(),
+                    created_at=refreshed_at,
+                )
+            )
 
             agent_descriptors: dict[str, Mapping[str, Any]] = {}
             procedure_descriptors: dict[str, Mapping[str, Any]] = {}
             invalid_candidates: list[tuple[int, str, str, str]] = []
             for index, raw_info in enumerate(raw_infos):
                 if not isinstance(raw_info, Mapping):
-                    self._record_descriptor_error(index, "API metadata 必须为 Mapping")
+                    events.append(
+                        self._record_descriptor_error(
+                            index,
+                            "API metadata 必须为 Mapping",
+                            refreshed_at,
+                        )
+                    )
                     continue
                 metadata = raw_info.get("metadata")
                 tagged_kind = metadata.get("lunagentic_extension") if isinstance(metadata, Mapping) else None
@@ -126,7 +158,13 @@ class ExtensionDiscovery:
                         or not provider_id
                         or provider_id != provider_id.strip()
                     ):
-                        self._record_descriptor_error(index, "descriptor plugin_id 无效")
+                        events.append(
+                            self._record_descriptor_error(
+                                index,
+                                "descriptor plugin_id 无效",
+                                refreshed_at,
+                            )
+                        )
                         continue
                 if _is_agent_descriptor(raw_info):
                     self._collect_descriptor(agent_descriptors, raw_info, "agents", index, invalid_candidates)
@@ -142,29 +180,30 @@ class ExtensionDiscovery:
             visible_agents = set(agent_descriptors)
             visible_procedures = set(procedure_descriptors)
             for index, kind, provider_id, error in invalid_candidates:
-                self._record_descriptor_error(index, error)
+                events.append(self._record_descriptor_error(index, error, refreshed_at))
                 if kind == "agents":
                     visible_agents.add(provider_id)
-                    self._reject_agents(provider_id, [error])
+                    events.append(self._reject_agents(provider_id, [error], refreshed_at))
                 else:
                     visible_procedures.add(provider_id)
-                    self._reject_procedures(provider_id, [error])
+                    events.append(self._reject_procedures(provider_id, [error], refreshed_at))
 
             for provider_id, descriptor in sorted(agent_descriptors.items()):
                 if self._closed:
-                    return
-                await self._refresh_agents(provider_id, descriptor)
+                    return ExtensionRefreshDelta(tuple(events))
+                events.append(await self._refresh_agents(provider_id, descriptor, refreshed_at))
             for provider_id, descriptor in sorted(procedure_descriptors.items()):
                 if self._closed:
-                    return
-                await self._refresh_procedures(provider_id, descriptor)
+                    return ExtensionRefreshDelta(tuple(events))
+                events.append(await self._refresh_procedures(provider_id, descriptor, refreshed_at))
 
             for provider_id in self._agents.provider_ids - visible_agents:
                 self._agents.remove_provider(provider_id)
-                self._record_health("agents", provider_id, self._agents.health[provider_id].fingerprint)
+                events.append(self._record_health("agents", provider_id, refreshed_at))
             for provider_id in self._procedures.provider_ids - visible_procedures:
                 self._procedures.remove_provider(provider_id)
-                self._record_health("procedures", provider_id, self._procedures.health[provider_id].fingerprint)
+                events.append(self._record_health("procedures", provider_id, refreshed_at))
+            return ExtensionRefreshDelta(tuple(events))
 
     @staticmethod
     def _collect_descriptor(
@@ -186,7 +225,12 @@ class ExtensionDiscovery:
             return
         target[provider_id] = info
 
-    async def _refresh_agents(self, provider_id: str, descriptor: Mapping[str, Any]) -> None:
+    async def _refresh_agents(
+        self,
+        provider_id: str,
+        descriptor: Mapping[str, Any],
+        refreshed_at: float,
+    ) -> ExtensionRefreshEvent:
         del descriptor
         api_name = f"{provider_id}.describe_agents"
         try:
@@ -195,11 +239,15 @@ class ExtensionDiscovery:
             definitions = tuple(AgentDefinition.model_validate(payload) for payload in payloads)
             self._agents.replace_provider(provider_id, definitions)
         except Exception as exc:
-            self._reject_agents(provider_id, [str(exc)])
-            return
-        self._record_health("agents", provider_id, self._agents.health[provider_id].fingerprint)
+            return self._reject_agents(provider_id, [str(exc)], refreshed_at)
+        return self._record_health("agents", provider_id, refreshed_at)
 
-    async def _refresh_procedures(self, provider_id: str, descriptor: Mapping[str, Any]) -> None:
+    async def _refresh_procedures(
+        self,
+        provider_id: str,
+        descriptor: Mapping[str, Any],
+        refreshed_at: float,
+    ) -> ExtensionRefreshEvent:
         del descriptor
         api_name = f"{provider_id}.describe_procedures"
         try:
@@ -208,9 +256,8 @@ class ExtensionDiscovery:
             definitions = tuple(ProcedureDefinition.model_validate(payload) for payload in payloads)
             self._procedures.replace_provider(provider_id, definitions)
         except Exception as exc:
-            self._reject_procedures(provider_id, [str(exc)])
-            return
-        self._record_health("procedures", provider_id, self._procedures.health[provider_id].fingerprint)
+            return self._reject_procedures(provider_id, [str(exc)], refreshed_at)
+        return self._record_health("procedures", provider_id, refreshed_at)
 
     @staticmethod
     def _validate_envelope(envelope: Any, item_key: str) -> Sequence[Mapping[str, Any]]:
@@ -228,25 +275,75 @@ class ExtensionDiscovery:
             raise ValueError(f"descriptor {item_key} 的每一项必须为 Mapping")
         return payloads
 
-    def _reject_agents(self, provider_id: str, errors: Sequence[str]) -> None:
+    def _reject_agents(
+        self,
+        provider_id: str,
+        errors: Sequence[str],
+        refreshed_at: float,
+    ) -> ExtensionRefreshEvent:
         self._agents.reject_provider(provider_id, errors)
-        self._record_health("agents", provider_id, self._agents.health[provider_id].fingerprint)
+        return self._record_health("agents", provider_id, refreshed_at)
 
-    def _reject_procedures(self, provider_id: str, errors: Sequence[str]) -> None:
+    def _reject_procedures(
+        self,
+        provider_id: str,
+        errors: Sequence[str],
+        refreshed_at: float,
+    ) -> ExtensionRefreshEvent:
         self._procedures.reject_provider(provider_id, errors)
-        self._record_health("procedures", provider_id, self._procedures.health[provider_id].fingerprint)
+        return self._record_health("procedures", provider_id, refreshed_at)
 
-    def _record_health(self, kind: str, provider_id: str, fingerprint: str) -> None:
-        self._extension_fingerprints[f"{kind}:{provider_id}"] = fingerprint
-
-    def _record_global_error(self, exc: Exception) -> None:
-        self._extension_fingerprints["discovery"] = canonical_fingerprint(
-            {"status": "invalid", "error": str(exc)}
+    def _record_health(
+        self,
+        kind: str,
+        provider_id: str,
+        refreshed_at: float,
+    ) -> ExtensionRefreshEvent:
+        registry = self._agents if kind == "agents" else self._procedures
+        health = registry.health[provider_id]
+        self._extension_fingerprints[f"{kind}:{provider_id}"] = health.fingerprint
+        availability = "available" if health.status == "healthy" else health.status
+        return ExtensionRefreshEvent(
+            provider_plugin_id=provider_id,
+            extension_kind=kind,  # type: ignore[arg-type]
+            availability=availability,  # type: ignore[arg-type]
+            fingerprint=health.fingerprint,
+            errors=tuple(health.errors),
+            created_at=refreshed_at,
         )
 
-    def _record_descriptor_error(self, index: int, error: str) -> None:
-        self._extension_fingerprints[f"descriptor:{index}"] = canonical_fingerprint(
+    def _record_global_error(self, exc: Exception, refreshed_at: float) -> ExtensionRefreshEvent:
+        fingerprint = canonical_fingerprint(
+            {"status": "invalid", "error": str(exc)}
+        )
+        self._extension_fingerprints["discovery"] = fingerprint
+        return ExtensionRefreshEvent(
+            provider_plugin_id="host-api",
+            extension_kind="discovery",
+            availability="invalid",
+            fingerprint=fingerprint,
+            errors=(str(exc),),
+            created_at=refreshed_at,
+        )
+
+    def _record_descriptor_error(
+        self,
+        index: int,
+        error: str,
+        refreshed_at: float,
+    ) -> ExtensionRefreshEvent:
+        fingerprint = canonical_fingerprint(
             {"status": "invalid", "error": str(error)}
+        )
+        provider_id = f"descriptor:{index}"
+        self._extension_fingerprints[provider_id] = fingerprint
+        return ExtensionRefreshEvent(
+            provider_plugin_id=provider_id,
+            extension_kind="discovery",
+            availability="invalid",
+            fingerprint=fingerprint,
+            errors=(str(error),),
+            created_at=refreshed_at,
         )
 
     def start(self) -> None:

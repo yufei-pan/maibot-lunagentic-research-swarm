@@ -86,6 +86,15 @@ ACTIVE_STATUSES = (
 )
 
 
+class MissingStoreTargetError(LookupError):
+    """单目标状态 mutation 未匹配到唯一权威记录。"""
+
+
+def _require_single_target(cursor: sqlite3.Cursor, *, target_kind: str, target_id: Any) -> None:
+    if cursor.rowcount != 1:
+        raise MissingStoreTargetError(f"{target_kind} {target_id} 不存在或不唯一")
+
+
 class SQLiteStateStore:
     """所有数据库访问经同一个 asyncio lock 串行提交到工作线程。"""
 
@@ -577,7 +586,7 @@ class SQLiteStateStore:
 
     @staticmethod
     def _update_task_formalization(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
-        connection.execute(
+        cursor = connection.execute(
             """
             UPDATE tasks
             SET formalized_text = ?, formalized_sha256 = ?, updated_at = ?
@@ -585,19 +594,21 @@ class SQLiteStateStore:
             """,
             (values["formalized_text"], values["formalized_sha256"], values["updated_at"], values["task_id"]),
         )
+        _require_single_target(cursor, target_kind="Task", target_id=values["task_id"])
 
     @staticmethod
     def _set_task_current_round(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
-        connection.execute(
+        cursor = connection.execute(
             """
             UPDATE tasks SET current_round_number = ?, updated_at = ? WHERE task_id = ?
             """,
             (values["current_round_number"], values["updated_at"], values["task_id"]),
         )
+        _require_single_target(cursor, target_kind="Task", target_id=values["task_id"])
 
     @staticmethod
     def _update_round_status(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
-        connection.execute(
+        cursor = connection.execute(
             """
             UPDATE investigation_rounds
             SET status = ?, report_deadline_at = ?, ended_at = ?
@@ -610,6 +621,7 @@ class SQLiteStateStore:
                 values["round_id"],
             ),
         )
+        _require_single_target(cursor, target_kind="Round", target_id=values["round_id"])
 
     @staticmethod
     def _row_to_round(row: sqlite3.Row) -> StoredRound:
