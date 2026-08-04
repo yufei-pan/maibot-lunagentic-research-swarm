@@ -218,6 +218,71 @@ async def test_concurrent_close_callers_wait_for_same_shutdown(fake_worker: Fake
 
 
 @pytest.mark.asyncio
+async def test_active_worker_reentrant_close_does_not_wait_on_its_own_shutdown() -> None:
+    started = asyncio.Event()
+    enter_reentrant_close = asyncio.Event()
+    outcomes: list[str] = []
+    scheduler: FairScheduler
+
+    async def worker(item: Effect, token: object) -> None:
+        started.set()
+        await enter_reentrant_close.wait()
+        try:
+            await asyncio.wait_for(scheduler.close(), timeout=0.05)
+        except TimeoutError:
+            outcomes.append("timed_out")
+        else:
+            outcomes.append("returned")
+
+    scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=worker)
+    await scheduler.enqueue(effect("A", "worker"))
+    await started.wait()
+    external_close = asyncio.create_task(scheduler.close())
+    while not scheduler.stats()["closing"]:
+        await asyncio.sleep(0)
+
+    enter_reentrant_close.set()
+    await external_close
+
+    assert outcomes == ["returned"]
+    assert scheduler.stats()["closed"]
+
+
+@pytest.mark.asyncio
+async def test_active_initial_close_caller_waits_for_other_active_wrappers() -> None:
+    both_started = asyncio.Event()
+    start_close = asyncio.Event()
+    release_other = asyncio.Event()
+    close_returned = asyncio.Event()
+    started_count = 0
+    scheduler: FairScheduler
+
+    async def worker(item: Effect, token: object) -> None:
+        nonlocal started_count
+        started_count += 1
+        if started_count == 2:
+            both_started.set()
+        if item.payload["effect_id"] == "closer":
+            await start_close.wait()
+            await scheduler.close()
+            close_returned.set()
+        else:
+            await release_other.wait()
+
+    scheduler = FairScheduler(global_llm=2, per_task_llm=2, per_task_procedure=1, worker=worker)
+    await scheduler.enqueue(effect("A", "closer"))
+    await scheduler.enqueue(effect("A", "other"))
+    await both_started.wait()
+
+    start_close.set()
+    await asyncio.sleep(0)
+    assert not close_returned.is_set()
+    release_other.set()
+    await close_returned.wait()
+    assert scheduler.stats()["closed"]
+
+
+@pytest.mark.asyncio
 async def test_global_stats_aggregate_kind_and_wait_latency(fake_worker: FakeWorker) -> None:
     fake_worker.block = True
     scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=fake_worker)

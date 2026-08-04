@@ -59,3 +59,22 @@ worker wrapper 不实现 Host HTTP retry。
 - 错误 telemetry 只保留结构化异常类型，不保存 `str(exc)` 或 effect payload。
 
 修复后 scheduler focused suite 为 `13 passed`，Task 1/2 指定回归为 `39 passed`。
+
+## 正式审查修复 Round 2
+
+### RED
+
+新增 active worker 可重入关闭用例：外部调用者已启动共享 close flow 后，worker 在
+wrapper 内再次调用 `close()`；修复前 reentrant close 在 50ms 内无法返回并记录为
+`timed_out`，因为共享 `_finish_close` 正等待同一个 worker。保持性测试同时确认，由
+active worker 首次发起 close 时必须继续等待另一 active wrapper。
+
+### GREEN
+
+当共享 close task 已存在时，只有仍登记在 scheduler active 集合中的当前调用 task
+可以安全返回，避免等待一个正在等待自身的 shutdown；普通外部并发 close 仍 shield-await
+共享 close task。active worker 首次发起 close 仍作为 excluded caller 等待所有其他
+active wrappers，不削弱 queued cancellation 或正常关闭语义。
+
+修复后 close focused 用例为 `3 passed`，scheduler focused suite 为 `15 passed`，
+Task 1/2 指定回归为 `39 passed`。

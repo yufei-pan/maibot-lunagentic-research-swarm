@@ -301,18 +301,23 @@ class FairScheduler:
     async def close(self) -> None:
         """Stop intake, cancel queued local futures, and await started wrappers."""
 
-        if self._close_task is None:
-            self._closing = True
-            caller = asyncio.current_task()
-            for task_queues in self._queues.values():
-                for queue in task_queues.values():
-                    while queue:
-                        self._cancel_future(queue.popleft().future)
-            self._queues.clear()
-            self._cursor.clear()
-            self._dispatched.clear()
-            self._signal()
-            self._close_task = asyncio.create_task(self._finish_close(caller), name="lrs-fair-scheduler-close")
+        caller = asyncio.current_task()
+        if self._close_task is not None:
+            if caller is not None and any(active.task is caller for active in self._active.values()):
+                return
+            await asyncio.shield(self._close_task)
+            return
+
+        self._closing = True
+        for task_queues in self._queues.values():
+            for queue in task_queues.values():
+                while queue:
+                    self._cancel_future(queue.popleft().future)
+        self._queues.clear()
+        self._cursor.clear()
+        self._dispatched.clear()
+        self._signal()
+        self._close_task = asyncio.create_task(self._finish_close(caller), name="lrs-fair-scheduler-close")
         await asyncio.shield(self._close_task)
 
     async def _finish_close(self, excluded_task: asyncio.Task[Any] | None) -> None:
