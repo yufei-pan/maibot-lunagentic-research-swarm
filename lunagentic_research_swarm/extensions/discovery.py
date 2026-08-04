@@ -104,32 +104,45 @@ class ExtensionDiscovery:
                 self._record_global_error(exc)
                 return
             self._extension_fingerprints.pop("discovery", None)
+            for key in tuple(self._extension_fingerprints):
+                if key.startswith("descriptor:"):
+                    self._extension_fingerprints.pop(key, None)
             if self._closed:
                 return
 
             agent_descriptors: dict[str, Mapping[str, Any]] = {}
             procedure_descriptors: dict[str, Mapping[str, Any]] = {}
-            invalid_candidates: list[tuple[str, str, str]] = []
+            invalid_candidates: list[tuple[int, str, str, str]] = []
             for index, raw_info in enumerate(raw_infos):
                 if not isinstance(raw_info, Mapping):
-                    self._extension_fingerprints[f"descriptor:{index}"] = canonical_fingerprint(
-                        {"status": "invalid", "error": "API metadata 必须为 Mapping"}
-                    )
+                    self._record_descriptor_error(index, "API metadata 必须为 Mapping")
                     continue
                 metadata = raw_info.get("metadata")
                 tagged_kind = metadata.get("lunagentic_extension") if isinstance(metadata, Mapping) else None
+                if tagged_kind in {"agents", "procedures"}:
+                    provider_id = raw_info.get("plugin_id")
+                    if (
+                        not isinstance(provider_id, str)
+                        or not provider_id
+                        or provider_id != provider_id.strip()
+                    ):
+                        self._record_descriptor_error(index, "descriptor plugin_id 无效")
+                        continue
                 if _is_agent_descriptor(raw_info):
-                    self._collect_descriptor(agent_descriptors, raw_info, "agents", invalid_candidates)
+                    self._collect_descriptor(agent_descriptors, raw_info, "agents", index, invalid_candidates)
                 elif _is_procedure_descriptor(raw_info):
-                    self._collect_descriptor(procedure_descriptors, raw_info, "procedures", invalid_candidates)
+                    self._collect_descriptor(procedure_descriptors, raw_info, "procedures", index, invalid_candidates)
                 elif tagged_kind in {"agents", "procedures"}:
                     provider_id = raw_info.get("plugin_id")
-                    if isinstance(provider_id, str) and provider_id:
-                        invalid_candidates.append((tagged_kind, provider_id, "descriptor metadata 与契约不完整匹配"))
+                    assert isinstance(provider_id, str)
+                    invalid_candidates.append(
+                        (index, tagged_kind, provider_id, "descriptor metadata 与契约不完整匹配")
+                    )
 
             visible_agents = set(agent_descriptors)
             visible_procedures = set(procedure_descriptors)
-            for kind, provider_id, error in invalid_candidates:
+            for index, kind, provider_id, error in invalid_candidates:
+                self._record_descriptor_error(index, error)
                 if kind == "agents":
                     visible_agents.add(provider_id)
                     self._reject_agents(provider_id, [error])
@@ -158,18 +171,18 @@ class ExtensionDiscovery:
         target: dict[str, Mapping[str, Any]],
         info: Mapping[str, Any],
         kind: str,
-        invalid_candidates: list[tuple[str, str, str]],
+        index: int,
+        invalid_candidates: list[tuple[int, str, str, str]],
     ) -> None:
         provider_id = info.get("plugin_id")
-        if not isinstance(provider_id, str) or not provider_id or provider_id != provider_id.strip():
-            return
+        assert isinstance(provider_id, str) and provider_id and provider_id == provider_id.strip()
         expected_name = f"{provider_id}.describe_{kind}"
         if info.get("full_name") != expected_name:
-            invalid_candidates.append((kind, provider_id, "Host API full_name 与 plugin_id 不一致"))
+            invalid_candidates.append((index, kind, provider_id, "Host API full_name 与 plugin_id 不一致"))
             return
         if provider_id in target:
             target.pop(provider_id, None)
-            invalid_candidates.append((kind, provider_id, "同一 provider 存在重复 descriptor"))
+            invalid_candidates.append((index, kind, provider_id, "同一 provider 存在重复 descriptor"))
             return
         target[provider_id] = info
 
@@ -229,6 +242,11 @@ class ExtensionDiscovery:
     def _record_global_error(self, exc: Exception) -> None:
         self._extension_fingerprints["discovery"] = canonical_fingerprint(
             {"status": "invalid", "error": str(exc)}
+        )
+
+    def _record_descriptor_error(self, index: int, error: str) -> None:
+        self._extension_fingerprints[f"descriptor:{index}"] = canonical_fingerprint(
+            {"status": "invalid", "error": str(error)}
         )
 
     def start(self) -> None:

@@ -340,8 +340,11 @@ class LRSServiceContainer:
 
     def _extension_discovery_health(self) -> dict[str, str]:
         assert self._discovery is not None
-        if "discovery" in self._discovery.extension_fingerprints:
+        fingerprints = self._discovery.extension_fingerprints
+        if "discovery" in fingerprints:
             return {"status": "degraded", "code": "extension_discovery_failed"}
+        if any(key.startswith("descriptor:") for key in fingerprints):
+            return {"status": "degraded", "code": "extension_descriptor_invalid"}
         return dict(self._status["extension_discovery"])
 
     def health(self) -> dict[str, Any]:

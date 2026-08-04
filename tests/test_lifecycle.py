@@ -407,6 +407,87 @@ async def test_real_discovery_health_tracks_periodic_failure_and_recovery(plugin
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_infos",
+    [
+        [None],
+        [
+            {
+                "name": "describe_agents",
+                "full_name": ".describe_agents",
+                "plugin_id": "",
+                "description": "无效 provider 身份",
+                "version": "1",
+                "public": True,
+                "enabled": True,
+                "dynamic": False,
+                "offline_reason": "",
+                "metadata": {
+                    "description": "无效 provider 身份",
+                    "version": "1",
+                    "public": True,
+                    "enabled": True,
+                    "handler_name": "describe_agents",
+                    "dynamic": False,
+                    "lunagentic_extension": "agents",
+                    "lunagentic_contract": "1",
+                },
+            }
+        ],
+    ],
+)
+async def test_real_descriptor_validation_failure_degrades_and_clean_scan_recovers(
+    plugin_module,
+    tmp_path: Path,
+    malformed_infos: list[Any],
+) -> None:
+    visible_infos = malformed_infos
+
+    async def rpc(
+        method: str,
+        plugin_id: str,
+        payload: dict[str, Any] | None,
+        *,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]:
+        assert method == "cap.call"
+        assert plugin_id == "com.0-hz.lunagentic-research-swarm"
+        assert timeout_ms is None
+        assert payload is not None and payload["capability"] == "api.list"
+        return {"success": True, "apis": list(visible_infos)}
+
+    context = PluginContext(
+        "com.0-hz.lunagentic-research-swarm",
+        rpc_call=rpc,
+        paths=PluginPaths(data_dir=tmp_path / "data", runtime_dir=tmp_path / "runtime"),
+    )
+    events: list[str] = []
+    store = FakeStore(events)
+    store.data_dir = context.paths.data_dir
+    store.runtime_dir = context.paths.runtime_dir
+    container = plugin_module.LRSServiceContainer(
+        context,
+        LRSConfig(),
+        store_factory=lambda path: store,
+        host_snapshot_loader=lambda: {"models": [], "model_task_config": {}},
+        physical_pinning=FakePinning(False),
+    )
+    await container.start()
+
+    assert container.health()["extension_discovery"] == {
+        "status": "degraded",
+        "code": "extension_descriptor_invalid",
+    }
+    assert (await container.refresh_extensions(reason="provider_request"))["status"] == "degraded"
+
+    visible_infos = []
+    await container._discovery.refresh()
+    assert container.health()["extension_discovery"] == {"status": "healthy"}
+    assert (await container.refresh_extensions(reason="provider_request"))["status"] == "healthy"
+    await container.close()
+
+
+@pytest.mark.asyncio
 async def test_health_is_explicit_for_root_summarizer_and_physical_pinning(plugin_module, tmp_path: Path) -> None:
     unavailable, _, _, _, _ = build_container(
         plugin_module,
