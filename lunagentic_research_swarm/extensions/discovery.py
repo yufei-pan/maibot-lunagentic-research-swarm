@@ -369,7 +369,12 @@ class ExtensionDiscovery:
             except asyncio.TimeoutError:
                 pass
             self._refresh_requested.clear()
-            await self.refresh()
+            try:
+                await self.refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._ctx.logger.error("LRS 周期扩展刷新失败；将在下一周期重试", exc_info=True)
 
     async def close(self) -> None:
         """取消并等待周期 task，保证卸载后不会再触发 Host RPC。"""

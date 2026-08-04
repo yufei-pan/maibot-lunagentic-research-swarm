@@ -508,6 +508,21 @@ class LRSServiceContainer:
                 "code": "extension_fingerprint_persistence_failed",
             }
         assert self._discovery is not None
+        background_task = self._discovery.background_task
+        if background_task is None or background_task.cancelled():
+            return {
+                "status": "critical",
+                "code": "extension_refresh_background_stopped",
+            }
+        if background_task.done():
+            return {
+                "status": "critical",
+                "code": (
+                    "extension_refresh_background_failed"
+                    if background_task.exception() is not None
+                    else "extension_refresh_background_stopped"
+                ),
+            }
         fingerprints = self._discovery.extension_fingerprints
         if "discovery" in fingerprints:
             return {"status": "degraded", "code": "extension_discovery_failed"}

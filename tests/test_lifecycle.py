@@ -4,6 +4,7 @@ import asyncio
 import gc
 import weakref
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -421,6 +422,119 @@ async def test_real_discovery_health_tracks_periodic_failure_and_recovery(plugin
     fail_listing = False
     await container._discovery.refresh()
     assert container.health()["extension_discovery"] == {"status": "healthy"}
+    await container.close()
+
+
+@pytest.mark.asyncio
+async def test_periodic_persistence_failure_recovers_without_stopping_background_loop(
+    plugin_module,
+    tmp_path: Path,
+) -> None:
+    list_count = 0
+
+    async def rpc(
+        method: str,
+        plugin_id: str,
+        payload: dict[str, Any] | None,
+        *,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]:
+        nonlocal list_count
+        assert method == "cap.call"
+        assert plugin_id == "com.0-hz.lunagentic-research-swarm"
+        assert timeout_ms is None
+        assert payload is not None and payload["capability"] == "api.list"
+        list_count += 1
+        return {"success": True, "apis": []}
+
+    class FlakyStore(FakeStore):
+        def __init__(self, events: list[str]) -> None:
+            super().__init__(events)
+            self.fail_next = False
+            self.failed = asyncio.Event()
+            self.persisted = asyncio.Event()
+
+        async def transact(self, commands: Any) -> None:
+            assert commands
+            if self.fail_next:
+                self.fail_next = False
+                self.failed.set()
+                raise RuntimeError("字面 periodic SQLite persistence 失败")
+            self.persisted.set()
+
+    context = PluginContext(
+        "com.0-hz.lunagentic-research-swarm",
+        rpc_call=rpc,
+        paths=PluginPaths(data_dir=tmp_path / "data", runtime_dir=tmp_path / "runtime"),
+    )
+    events: list[str] = []
+    store = FlakyStore(events)
+    store.data_dir = context.paths.data_dir
+    store.runtime_dir = context.paths.runtime_dir
+    container = plugin_module.LRSServiceContainer(
+        context,
+        LRSConfig(),
+        store_factory=lambda path: store,
+        host_snapshot_loader=lambda: {"models": [], "model_task_config": {}},
+        physical_pinning=FakePinning(False),
+    )
+    await container.start()
+    try:
+        store.fail_next = True
+        container._discovery.request_refresh()
+        await asyncio.wait_for(store.failed.wait(), timeout=1)
+        for _ in range(20):
+            if container._discovery._inflight_refresh is None:
+                break
+            await asyncio.sleep(0)
+        assert container.health()["extension_discovery"] == {
+            "status": "critical",
+            "code": "extension_fingerprint_persistence_failed",
+        }
+
+        store.persisted = asyncio.Event()
+        recovered = await container.refresh_extensions(reason="provider_request")
+        assert recovered["status"] == "healthy"
+        assert container.health()["extension_discovery"] == {"status": "healthy"}
+        assert not container._discovery.background_task.done()
+
+        store.persisted = asyncio.Event()
+        scans_before = list_count
+        container._discovery.request_refresh()
+        await asyncio.wait_for(store.persisted.wait(), timeout=1)
+        assert list_count == scans_before + 1
+        assert container.health()["extension_discovery"] == {"status": "healthy"}
+    finally:
+        with suppress(Exception):
+            await container.close()
+
+
+@pytest.mark.asyncio
+async def test_health_reports_unexpectedly_finished_extension_background_task(
+    plugin_module,
+    tmp_path: Path,
+) -> None:
+    container, _, _, factory, _ = build_container(plugin_module, tmp_path)
+    await container.start()
+    discovery = factory.instances[0]
+    assert discovery.background_task is not None
+    discovery.background_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await discovery.background_task
+
+    async def crash() -> None:
+        raise RuntimeError("字面 background crash")
+
+    discovery.background_task = asyncio.create_task(crash())
+    await asyncio.sleep(0)
+
+    assert container.health()["extension_discovery"] == {
+        "status": "critical",
+        "code": "extension_refresh_background_failed",
+    }
+    with suppress(RuntimeError):
+        await discovery.background_task
+    discovery.background_task = None
     await container.close()
 
 
