@@ -584,6 +584,15 @@ def reconcile_usage(
         status = "actual" if actual_model_name else "estimated"
         adjustment = estimated - actual
 
+        # 核销审计必须描述实际计费快照，而不是沿用 reservation 时的
+        # 估算模型/价格来源。没有实际模型名时，使用明确的 estimated
+        # fallback 模型解析当前目录；该状态仍由上面的 status 标记。
+        if catalog is not None:
+            provenance_model_name = actual_model_name or estimated_model_name or ""
+            resolved = catalog.resolve_model(provenance_model_name, actual=bool(actual_model_name))
+            price_source = charged.price.source if charged is not None else resolved.source
+            price_fingerprint = catalog.fingerprint
+
     metadata_values = {
         "estimated_model_name": estimated_model_name,
         "actual_model_name": actual_model_name,

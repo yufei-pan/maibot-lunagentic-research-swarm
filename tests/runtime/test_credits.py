@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import FrozenInstanceError
 
@@ -201,3 +202,43 @@ def test_summarizer_reconciliation_has_usage_telemetry_without_research_ledger()
     )
     assert result.ledger_command is None
     assert result.commands == (result.usage_command,)
+
+
+def test_reconcile_usage_uses_actual_price_provenance_when_model_changes() -> None:
+    catalog = PriceCatalog.from_sources(
+        {"actual-model": PriceProfile(price_in=2.0, price_out=3.0)},
+        {"estimated-model": PriceProfile(price_in=10.0, price_out=20.0)},
+        {"research": ["estimated-model"]},
+    )
+    reservation = reserve_input(
+        estimated_charge=4.0,
+        task_id="task_1",
+        round_id="round_1",
+        branch_id="branch_1",
+        call_id="call_1",
+        usage_id="usage_1",
+        role="agent",
+        selector="task:research",
+        estimated_model_name="estimated-model",
+        price_source="host_config",
+        price_fingerprint="estimate-fingerprint",
+        prompt_tokens=100,
+    )
+
+    result = reconcile_usage(
+        reservation,
+        catalog=catalog,
+        actual_model_name="actual-model",
+        usage=TokenUsage(10_000, 0, 0, 10_000, source="actual"),
+    )
+
+    assert result.charged is not None
+    assert result.charged.price.source == "plugin_override"
+    assert result.usage_command.values["actual_model_name"] == "actual-model"
+    assert result.usage_command.values["price_source"] == "plugin_override"
+    assert result.usage_command.values["price_fingerprint"] == catalog.fingerprint
+    assert result.ledger_command is not None
+    metadata = json.loads(result.ledger_command.values["metadata_json"])
+    assert metadata["actual_model_name"] == "actual-model"
+    assert metadata["price_source"] == "plugin_override"
+    assert metadata["price_fingerprint"] == catalog.fingerprint
