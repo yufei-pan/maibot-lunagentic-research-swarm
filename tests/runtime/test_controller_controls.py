@@ -14,6 +14,7 @@ from lunagentic_research_swarm.runtime.events import (
     StopRequested,
 )
 from lunagentic_research_swarm.runtime.reducer import (
+    Effect,
     PerformAgentCall,
     PerformProcedureBatch,
     PerformTaskSummary,
@@ -500,6 +501,92 @@ async def test_pause_waits_for_queued_procedure_during_agent_to_procedure_handof
     release_agent.set()
     await procedure_started.wait()
     await asyncio.sleep(0)
+    assert (await manager.status(result["task_id"]))["status"] == "PAUSING"
+
+    release_procedure.set()
+    await manager.wait_idle(result["task_id"])
+    assert (await manager.status(result["task_id"]))["status"] == "PAUSED"
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_waits_for_own_normal_procedure_despite_other_task_high_queue(harness) -> None:
+    """A high-priority queue from another task must not hide this task's handoff procedure."""
+
+    manager, _, _, _, _, _ = harness
+    agent_started = asyncio.Event()
+    release_agent = asyncio.Event()
+    procedure_started = asyncio.Event()
+    release_procedure = asyncio.Event()
+    other_high_started = asyncio.Event()
+    handoff_pause_queued = 0
+    other_high_queued = 0
+    scheduler: FairScheduler
+
+    async def worker(effect, token):
+        if isinstance(effect, PerformAgentCall):
+            agent_started.set()
+            await release_agent.wait()
+            return AgentCallCompleted(
+                event_id="agent-completed",
+                task_id=effect.task_id,
+                round_id=effect.round_id,
+                generation=effect.generation,
+                branch_id=effect.payload["branch_id"],
+                call_id="call",
+                result_id="result",
+                actual_charge=0.0,
+                balance_before_reconciliation=100.0,
+                protocol_result={"report": "完成", "procedures": (), "delegations": ()},
+            )
+        if isinstance(effect, PerformProcedureBatch):
+            procedure_started.set()
+            await release_procedure.wait()
+            return ProcedureBatchCompleted(
+                event_id="procedures-completed",
+                task_id=effect.task_id,
+                round_id=effect.round_id,
+                generation=effect.generation,
+                branch_id=effect.payload["branch_id"],
+                call_id=effect.payload["call_id"],
+                credits_after=float(effect.payload["credits_after"]),
+            )
+        if effect.event_id == "other-high":
+            other_high_started.set()
+        return None
+
+    async def on_result(effect, result, token) -> None:
+        nonlocal handoff_pause_queued, other_high_queued
+        if isinstance(result, AgentCallCompleted):
+            await scheduler.enqueue(
+                Effect(
+                    task_id="other-task",
+                    round_id="other-round",
+                    generation=0,
+                    kind="procedure",
+                    priority="high",
+                    event_id="other-high",
+                )
+            )
+            await manager.handle_runtime_event(result)
+            snapshot = scheduler.stats()["tasks"]
+            handoff_pause_queued = snapshot[str(effect.task_id)]["pause_runnable_queued"]
+            other_high_queued = snapshot["other-task"]["kind"]["procedure"]["queued"]
+
+    scheduler = FairScheduler(worker=worker, on_result=on_result)
+    manager.scheduler = scheduler
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await agent_started.wait()
+
+    paused = await manager.pause(result["task_id"])
+    assert paused["status"] == "PAUSING"
+    release_agent.set()
+    await other_high_started.wait()
+    await procedure_started.wait()
+    await asyncio.sleep(0)
+
+    assert other_high_queued == 1
+    assert handoff_pause_queued == 1
     assert (await manager.status(result["task_id"]))["status"] == "PAUSING"
 
     release_procedure.set()

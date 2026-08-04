@@ -359,10 +359,9 @@ class FairScheduler:
             tasks[task_id] = {
                 "active": len(active),
                 "queued": len(queued),
-                # This mirrors _take_runnable()'s priority/barrier gate rather
-                # than counting every pause-permitted resource.  In
-                # particular, a paused summarizer barrier that cannot launch
-                # prevents a lower-priority procedure from ever dispatching.
+                # This counts all local handoff work that remains launchable
+                # after pause.  A paused non-permitted barrier still blocks
+                # every lower priority, exactly as _take_runnable() does.
                 "pause_runnable_queued": pause_runnable_queued.get(task_id, 0),
                 "llm_active": self._task_llm_active.get(task_id, 0),
                 "llm_limit": self.per_task_llm,
@@ -557,28 +556,35 @@ class FairScheduler:
         return None
 
     def _pause_runnable_queued_counts(self) -> Counter[str]:
-        """Return per-task queued candidates selectable by the next dispatch pass.
+        """Return all queued pause-permitted work that can settle a task.
 
-        The pause-settlement telemetry must follow the same barrier short
-        circuit as :meth:`_take_runnable`.  It intentionally reports one
-        fair-queue candidate per task at the highest currently dispatchable
-        priority: after any such candidate starts or completes, the next
-        telemetry read reevaluates the exact scheduler state.
+        Capacity is deliberately ignored: in-flight effects can release a
+        resource later, so a procedure must keep its task in ``PAUSING`` even
+        when it cannot start at this exact instant.  Only a paused task's
+        queued agent/summarizer barrier is a permanent pause-time block.  It
+        retains :meth:`_take_runnable`'s barrier gate for lower priorities
+        without allowing an unrelated high-priority queue to hide another
+        task's handoff work.
         """
 
+        counts: Counter[str] = Counter()
         for priority in sorted(self._queues, key=self._priority_rank, reverse=True):
             task_queues = self._queues.get(priority)
             if task_queues is None:
                 continue
-            candidates: Counter[str] = Counter()
+            barrier_blocked = False
             for task_id, queue in task_queues.items():
-                if any(self._can_start(entry.effect) for entry in queue):
-                    candidates[task_id] += 1
-            if candidates:
-                return candidates
-            if priority == "barrier" and task_queues:
-                return Counter()
-        return Counter()
+                for entry in queue:
+                    effect = entry.effect
+                    if self._is_generation_cancelled(task_id, int(effect.generation)):
+                        continue
+                    if self._is_pause_permitted(effect):
+                        counts[task_id] += 1
+                    elif priority == "barrier" and task_id in self._paused:
+                        barrier_blocked = True
+            if priority == "barrier" and barrier_blocked:
+                break
+        return counts
 
     def _take_from_priority(
         self, priority: str, task_queues: OrderedDict[str, deque[_QueuedEffect]]
