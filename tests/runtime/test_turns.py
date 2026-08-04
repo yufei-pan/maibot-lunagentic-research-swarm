@@ -156,6 +156,8 @@ async def test_removed_agent_edge_is_finalized_without_blocking_sibling() -> Non
         actual_charge=0.0,
         procedures=RecordingProcedures(),
         live_agents={"agent.valid"},
+        limits=TurnLimits(max_agent_calls_per_task=256),
+        agent_calls_started=255,
     )
 
     assert [child.agent_id for child in result.children] == ["agent.valid"]
@@ -506,6 +508,112 @@ def test_procedure_completion_materializes_valid_sibling_and_finalizes_rejected_
     assert edges[0].payload["messages"][-1]["content"].endswith("agent_unavailable")
     with pytest.raises(TypeError):
         edges[0].payload["messages"][0]["content"] = "mutated"  # type: ignore[index]
+
+
+def test_missing_agent_does_not_consume_last_task_call_slot_before_valid_sibling() -> None:
+    event = ProcedureBatchCompleted(
+        event_id="evt-missing-before-valid",
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        branch_id="branch-1",
+        call_id="call-1",
+        credits_after=2.0,
+        delegations=(
+            {"agent_id": "agent.removed", "task": "removed assignment", "credits": 1.0},
+            {"agent_id": "agent.valid", "task": "valid assignment", "credits": 1.0},
+        ),
+        live_agent_ids=("agent.valid",),
+        max_agent_calls_per_task=256,
+        agent_calls_started=255,
+    )
+
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.RUNNING, generation=0, active_round_id="round-1"),
+        event,
+    )
+
+    children = [
+        item
+        for item in transition.effects
+        if isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
+    ]
+    edges = [item for item in transition.effects if isinstance(item, PerformBranchSummary)]
+    assert [item.payload["agent_id"] for item in children] == ["agent.valid"]
+    assert [(item.payload["agent_id"], item.payload["reason"]) for item in edges] == [
+        ("agent.removed", "agent_unavailable")
+    ]
+
+
+def test_reducer_atomically_reserves_task_call_slot_across_stale_procedure_events() -> None:
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.RUNNING,
+        generation=0,
+        active_round_id="round-1",
+        agent_calls_started=255,
+    )
+
+    def completion(event_id: str, branch_id: str, agent_id: str) -> ProcedureBatchCompleted:
+        return ProcedureBatchCompleted(
+            event_id=event_id,
+            task_id="task-1",
+            round_id="round-1",
+            generation=0,
+            branch_id=branch_id,
+            call_id=f"{branch_id}:call",
+            credits_after=1.0,
+            delegations=({"agent_id": agent_id, "task": "child", "credits": 1.0},),
+            live_agent_ids=(agent_id,),
+            max_agent_calls_per_task=256,
+            # 两个并发 worker 都观察到同一旧快照；reducer state 必须具有权威性。
+            agent_calls_started=255,
+        )
+
+    first = reduce_event(state, completion("evt-first", "branch-a", "agent.a"))
+    second = reduce_event(first.next_state, completion("evt-second", "branch-b", "agent.b"))
+
+    first_child = next(
+        item
+        for item in first.effects
+        if isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
+    )
+    assert first.next_state.agent_calls_started == 256
+    assert first_child.payload["agent_calls_started"] == 256
+    assert first_child.payload["max_agent_calls_per_task"] == 256
+    assert second.next_state.agent_calls_started == 256
+    assert not any(
+        isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
+        for item in second.effects
+    )
+    second_edge = next(item for item in second.effects if isinstance(item, PerformBranchSummary))
+    assert second_edge.payload["reason"] == "agent_call_limit_exceeded"
+
+
+def test_procedure_completion_preserves_monotonic_call_counter_through_continue_barrier() -> None:
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.RUNNING,
+        generation=0,
+        active_round_id="round-1",
+        active_leaves={"branch-1": 1.0},
+        continue_barrier=True,
+        agent_calls_started=254,
+    )
+    event = ProcedureBatchCompleted(
+        event_id="evt-continue-counter",
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        branch_id="branch-1",
+        call_id="call-1",
+        credits_after=1.0,
+        agent_calls_started=255,
+    )
+
+    transition = reduce_event(state, event)
+
+    assert transition.next_state.agent_calls_started == 255
 
 
 @pytest.mark.parametrize(

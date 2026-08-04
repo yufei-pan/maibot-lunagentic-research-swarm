@@ -112,8 +112,15 @@ class RuntimeState:
     report_epoch: int = 0
     raw_context_released: bool = False
     continue_barrier: bool = False
+    agent_calls_started: int = 0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.agent_calls_started, bool)
+            or not isinstance(self.agent_calls_started, int)
+            or self.agent_calls_started < 0
+        ):
+            raise ValueError("agent_calls_started 必须为非负整数")
         object.__setattr__(self, "active_leaves", _freeze(self.active_leaves))
 
     @property
@@ -404,7 +411,11 @@ def _positive_limit(value: Any, name: str) -> int:
     return value
 
 
-def _delegation_effects(event: ProcedureBatchCompleted, credits_after: float) -> tuple[Effect, ...]:
+def _delegation_effects(
+    event: ProcedureBatchCompleted,
+    credits_after: float,
+    agent_calls_started: int,
+) -> tuple[tuple[Effect, ...], int]:
     """在 Procedure durable boundary 把每条 delegation 解析为显式 immutable effect。"""
 
     max_delegations = _positive_limit(event.max_delegations_per_turn, "max_delegations_per_turn")
@@ -421,7 +432,8 @@ def _delegation_effects(event: ProcedureBatchCompleted, credits_after: float) ->
 
     normalized: list[tuple[int, str, str, float, str | None]] = []
     allocatable: list[tuple[str, float]] = []
-    available_calls = max(0, max_calls - event.agent_calls_started)
+    live_agents = None if event.live_agent_ids is None else frozenset(event.live_agent_ids)
+    reserved_calls = 0
     for index, raw in enumerate(event.delegations):
         if not isinstance(raw, Mapping):
             raise ValueError(f"delegations[{index}] 必须为对象")
@@ -439,21 +451,22 @@ def _delegation_effects(event: ProcedureBatchCompleted, credits_after: float) ->
             reason = "delegation_limit_exceeded"
         elif event.parent_depth >= max_depth:
             reason = "branch_depth_exceeded"
-        elif index >= available_calls:
+        elif live_agents is not None and agent_id not in live_agents:
+            reason = "agent_unavailable"
+        elif agent_calls_started + reserved_calls >= max_calls:
             reason = "agent_call_limit_exceeded"
+        else:
+            reserved_calls += 1
         normalized.append((index, agent_id, assignment, float(requested_credits), reason))
-        if reason is None:
+        if reason is None or reason == "agent_unavailable":
             allocatable.append((str(index), float(requested_credits)))
 
     allocations = allocate_children(credits_after, allocatable).allocations
-    live_agents = None if event.live_agent_ids is None else frozenset(event.live_agent_ids)
+    calls_after_reservation = agent_calls_started + reserved_calls
     effects: list[Effect] = []
-    for index, agent_id, assignment, _requested_credits, structural_reason in normalized:
+    for index, agent_id, assignment, _requested_credits, reason in normalized:
         child_branch_id = f"{event.branch_id}:{index + 1}"
         credits = float(allocations.get(str(index), 0.0))
-        reason = structural_reason
-        if reason is None and live_agents is not None and agent_id not in live_agents:
-            reason = "agent_unavailable"
         if reason is not None:
             edge_messages = (
                 *event.parent_messages,
@@ -474,7 +487,7 @@ def _delegation_effects(event: ProcedureBatchCompleted, credits_after: float) ->
                         "agent_id": agent_id,
                         "assignment": assignment,
                         "reason": reason,
-                        "credits": credits if structural_reason is None else 0.0,
+                        "credits": credits if reason == "agent_unavailable" else 0.0,
                         "depth": event.parent_depth + 1,
                         "messages": edge_messages,
                     },
@@ -495,10 +508,15 @@ def _delegation_effects(event: ProcedureBatchCompleted, credits_after: float) ->
                     "credits": credits,
                     "depth": event.parent_depth + 1,
                     "messages": (*event.parent_messages, {"role": "user", "content": f"assignment: {assignment}"}),
+                    "live_agent_ids": event.live_agent_ids,
+                    "max_delegations_per_turn": max_delegations,
+                    "max_branch_depth": max_depth,
+                    "max_agent_calls_per_task": max_calls,
+                    "agent_calls_started": calls_after_reservation,
                 },
             )
         )
-    return tuple(effects)
+    return tuple(effects), calls_after_reservation
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -1133,7 +1151,9 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                 )
             )
 
-        next_state = state
+        state_calls_started = int(getattr(state, "agent_calls_started", 0))
+        authoritative_calls_started = max(state_calls_started, event.agent_calls_started)
+        next_state = _replace_state(state, agent_calls_started=authoritative_calls_started)
         credits_after = event.credits_after
         if bool(getattr(state, "continue_barrier", False)):
             leaves = _state_leaves(state)
@@ -1141,7 +1161,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             redistribution = redistribute_pool(_state_credit_pool(state), 0.0, leaves)
             credits_after = redistribution.balances.get(event.branch_id, credits_after)
             next_state = _replace_state(
-                state,
+                next_state,
                 active_leaves={key: value for key, value in redistribution.balances.items() if value >= 0},
                 credit_pool=redistribution.pool_after,
                 continue_barrier=False,
@@ -1164,9 +1184,14 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             reason = "no_further_work"
         else:
             try:
-                materialization_effects = _delegation_effects(event, credits_after)
+                materialization_effects, calls_after_reservation = _delegation_effects(
+                    event,
+                    credits_after,
+                    authoritative_calls_started,
+                )
             except (TypeError, ValueError) as exc:
                 return _invalid(next_state, event, f"ProcedureBatchCompleted delegation 无效：{exc}")
+            next_state = _replace_state(next_state, agent_calls_started=calls_after_reservation)
             return Transition(
                 next_state,
                 commands=tuple(commands),

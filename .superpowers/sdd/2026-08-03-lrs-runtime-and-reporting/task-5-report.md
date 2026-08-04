@@ -79,3 +79,50 @@ Impacted: PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
 ```
 
 本轮仍未修改 controller、reporting 或 Task 6+ 文件。
+
+## Review fix round 2
+
+第二轮复审指出 task-call 配额仍有两个相互关联的竞争边界，本轮在 Task 5 runtime
+materialization boundary 内完成修复：
+
+- delegation 先按 per-turn/depth 与 live-agent availability 分类，missing agent 仍逐 edge
+  终结并保留原 credits/messages，但不再消耗 task-call slot；因此仅剩一个 slot 时，位于
+  missing edge 后的合法 sibling 仍能物化。
+- `RuntimeState.agent_calls_started` 成为 reducer 的任务级单调权威计数。每个
+  `ProcedureBatchCompleted` 先取 state/event 快照最大值，只为实际发出的 live
+  `materialize_child` edge 原子预留，并把批次预留后的权威计数及三项结构限制传播到每个
+  child effect。两个携带相同旧快照的 completion 顺序归约时，第二个不会超过任务上限。
+- continue-barrier redistribution 从已同步的 `next_state` 派生，避免覆盖单调计数。
+- `resolve_completed_turn` 的前置纯解析路径采用同一排序，并保持 edge finalization 的原输入顺序。
+
+### Fix-round 2 TDD 与验证
+
+```text
+RED missing-before-valid:
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
+  tests/runtime/test_turns.py::test_missing_agent_does_not_consume_last_task_call_slot_before_valid_sibling -q
+→ 1 failed（children == []，预期 ["agent.valid"]）
+
+RED atomic state:
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
+  tests/runtime/test_turns.py::test_reducer_atomically_reserves_task_call_slot_across_stale_procedure_events -q
+→ 1 failed（RuntimeState 尚无 agent_calls_started）
+
+RED continue barrier:
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
+  tests/runtime/test_turns.py::test_procedure_completion_preserves_monotonic_call_counter_through_continue_barrier -q
+→ 1 failed（得到 254，预期 255）
+
+GREEN focused:
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
+  tests/runtime/test_turns.py tests/runtime/test_context_invariance.py -q
+→ 25 passed
+
+Impacted:
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/python -m pytest \
+  tests/runtime tests/procedures tests/test_events.py -q
+→ 99 passed
+```
+
+另外通过 `.venv/bin/python -m compileall -q lunagentic_research_swarm/runtime` 与
+`git diff --check`。本轮仍未修改 controller、reporting 或 Task 6+ 文件。

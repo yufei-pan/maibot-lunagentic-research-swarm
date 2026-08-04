@@ -79,15 +79,11 @@ def _limit_reason(
     index: int,
     branch: BranchRuntime,
     limits: TurnLimits,
-    agent_calls_started: int,
 ) -> str | None:
     if index >= limits.max_delegations_per_turn:
         return "delegation_limit_exceeded"
     if branch.depth >= limits.max_branch_depth:
         return "branch_depth_exceeded"
-    available_calls = max(0, limits.max_agent_calls_per_task - agent_calls_started)
-    if index >= available_calls:
-        return "agent_call_limit_exceeded"
     return None
 
 
@@ -136,50 +132,54 @@ async def resolve_completed_turn(
         return CompletedTurnResult(finalize_reason="no_further_work", credits_after_call=branch.credits)
 
     structurally_valid: list[tuple[int, DelegationRequest]] = []
-    rejected: list[tuple[DelegationRequest, str]] = []
+    structural_reasons: dict[int, str] = {}
     for index, request in enumerate(envelope.delegations):
         reason = _limit_reason(
             index=index,
             branch=branch,
             limits=active_limits,
-            agent_calls_started=agent_calls_started,
         )
         if reason is None:
             structurally_valid.append((index, request))
         else:
-            rejected.append((request, reason))
+            structural_reasons[index] = reason
 
+    available_calls = max(0, active_limits.max_agent_calls_per_task - agent_calls_started)
+    reasons = dict(structural_reasons)
+    launchable_count = 0
+    for index, request in structurally_valid:
+        if request.agent_id not in live_agents:
+            reasons[index] = "agent_unavailable"
+        elif launchable_count >= available_calls:
+            reasons[index] = "agent_call_limit_exceeded"
+        else:
+            launchable_count += 1
     allocations = allocate_children(
         branch.credits,
-        [(str(index), request.credits) for index, request in structurally_valid],
+        [
+            (str(index), request.credits)
+            for index, request in structurally_valid
+            if reasons.get(index) in {None, "agent_unavailable"}
+        ],
     )
     children: list[ChildLaunch] = []
-    edge_finalizations: list[EdgeFinalization] = [
-        EdgeFinalization(
-            request.agent_id,
-            request.task,
-            reason,
-            0.0,
-            _edge_messages(branch, request, reason),
-        )
-        for request, reason in rejected
-    ]
-    for index, request in structurally_valid:
-        credits = allocations.allocations[str(index)]
-        child_messages = [dict(message) for message in branch.build_prompt_messages()]
-        child_messages.append({"role": "user", "content": f"assignment: {request.task}"})
-        if request.agent_id not in live_agents:
-            reason = "agent_unavailable"
+    edge_finalizations: list[EdgeFinalization] = []
+    for index, request in enumerate(envelope.delegations):
+        reason = reasons.get(index)
+        credits = float(allocations.allocations.get(str(index), 0.0))
+        if reason is not None:
             edge_finalizations.append(
                 EdgeFinalization(
                     request.agent_id,
                     request.task,
                     reason,
-                    credits,
+                    credits if reason == "agent_unavailable" else 0.0,
                     _edge_messages(branch, request, reason),
                 )
             )
             continue
+        child_messages = [dict(message) for message in branch.build_prompt_messages()]
+        child_messages.append({"role": "user", "content": f"assignment: {request.task}"})
         children.append(
             ChildLaunch(
                 branch_id=f"{branch.branch_id}:{index + 1}",
