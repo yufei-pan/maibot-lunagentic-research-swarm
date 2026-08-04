@@ -13,7 +13,12 @@ from lunagentic_research_swarm.runtime.events import (
     ProcedureBatchCompleted,
     StopRequested,
 )
-from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformProcedureBatch, RuntimeState
+from lunagentic_research_swarm.runtime.reducer import (
+    PerformAgentCall,
+    PerformProcedureBatch,
+    PerformTaskSummary,
+    RuntimeState,
+)
 from lunagentic_research_swarm.runtime.scheduler import FairScheduler
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
 
@@ -386,6 +391,60 @@ async def test_pause_settles_with_queued_agent_then_runs_it_only_after_continue(
     assert continued["status"] == "RUNNING"
     await second_agent_started.wait()
     assert agent_starts == [first_branch_id, queued_branch_id]
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_settles_when_blocked_summary_barrier_prevents_queued_procedure_dispatch(harness) -> None:
+    """A paused summarizer barrier also makes lower-priority procedure work non-runnable."""
+
+    manager, _, _, _, _, _ = harness
+    agent_started = asyncio.Event()
+    release_agent = asyncio.Event()
+    procedure_started = asyncio.Event()
+
+    async def worker(effect, token) -> None:
+        if isinstance(effect, PerformAgentCall):
+            agent_started.set()
+            await release_agent.wait()
+        elif isinstance(effect, PerformProcedureBatch):
+            procedure_started.set()
+
+    scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=worker)
+    manager.scheduler = scheduler
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await agent_started.wait()
+    before_pause = await manager.status(result["task_id"])
+
+    await scheduler.enqueue(
+        PerformTaskSummary(
+            result["task_id"],
+            before_pause["round_id"],
+            before_pause["generation"],
+            priority="barrier",
+            payload={"kind": "FINAL"},
+        )
+    )
+    await scheduler.enqueue(
+        PerformProcedureBatch(
+            result["task_id"],
+            before_pause["round_id"],
+            before_pause["generation"],
+            payload={"branch_id": "queued-branch", "call_id": "call", "credits_after": 100.0},
+        )
+    )
+
+    paused = await manager.pause(result["task_id"])
+    assert paused["status"] == "PAUSING"
+    release_agent.set()
+    await asyncio.wait_for(manager.wait_idle(result["task_id"]), timeout=0.5)
+
+    assert (await manager.status(result["task_id"]))["status"] == "PAUSED"
+    assert not procedure_started.is_set()
+    task_stats = scheduler.stats()["tasks"][result["task_id"]]
+    assert task_stats["pause_runnable_queued"] == 0
+    assert task_stats["kind"]["task_summary"]["queued"] == 1
+    assert task_stats["kind"]["procedure"]["queued"] == 1
     await scheduler.close()
 
 

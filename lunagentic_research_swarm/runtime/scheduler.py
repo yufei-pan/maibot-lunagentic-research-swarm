@@ -336,6 +336,7 @@ class FairScheduler:
         task_ids = {str(entry.effect.task_id) for entry in queued_entries}
         task_ids.update(str(active.entry.effect.task_id) for active in self._active.values())
         task_ids.update(self._paused)
+        pause_runnable_queued = self._pause_runnable_queued_counts()
 
         tasks: dict[str, Any] = {}
         for task_id in sorted(task_ids):
@@ -358,10 +359,11 @@ class FairScheduler:
             tasks[task_id] = {
                 "active": len(active),
                 "queued": len(queued),
-                # A pause blocks agent/summarizer launches only.  Procedure
-                # and control/other effects remain eligible and therefore
-                # must still be included in a pause-settlement barrier.
-                "pause_runnable_queued": sum(self._is_pause_permitted(entry.effect) for entry in queued),
+                # This mirrors _take_runnable()'s priority/barrier gate rather
+                # than counting every pause-permitted resource.  In
+                # particular, a paused summarizer barrier that cannot launch
+                # prevents a lower-priority procedure from ever dispatching.
+                "pause_runnable_queued": pause_runnable_queued.get(task_id, 0),
                 "llm_active": self._task_llm_active.get(task_id, 0),
                 "llm_limit": self.per_task_llm,
                 "procedure_active": self._task_procedure_active.get(task_id, 0),
@@ -553,6 +555,30 @@ class FairScheduler:
             if priority == "barrier" and task_queues:
                 return None
         return None
+
+    def _pause_runnable_queued_counts(self) -> Counter[str]:
+        """Return per-task queued candidates selectable by the next dispatch pass.
+
+        The pause-settlement telemetry must follow the same barrier short
+        circuit as :meth:`_take_runnable`.  It intentionally reports one
+        fair-queue candidate per task at the highest currently dispatchable
+        priority: after any such candidate starts or completes, the next
+        telemetry read reevaluates the exact scheduler state.
+        """
+
+        for priority in sorted(self._queues, key=self._priority_rank, reverse=True):
+            task_queues = self._queues.get(priority)
+            if task_queues is None:
+                continue
+            candidates: Counter[str] = Counter()
+            for task_id, queue in task_queues.items():
+                if any(self._can_start(entry.effect) for entry in queue):
+                    candidates[task_id] += 1
+            if candidates:
+                return candidates
+            if priority == "barrier" and task_queues:
+                return Counter()
+        return Counter()
 
     def _take_from_priority(
         self, priority: str, task_queues: OrderedDict[str, deque[_QueuedEffect]]
