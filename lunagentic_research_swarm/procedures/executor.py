@@ -52,13 +52,32 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _strip_reasoning(value: Any) -> Any:
-    """从 provider metadata 中移除不应跨 runtime 边界传播的 reasoning。"""
+# Provider contract 只允许结构化 data/error/metadata；这些字段若原样跨过
+# event/storage 边界就会把 raw payload、原始 provenance 或 reasoning 带入默认库。
+# 其余业务字段（例如 title、answer、items）不做猜测式裁剪。
+_SENSITIVE_PAYLOAD_KEYS = frozenset(
+    {
+        "reasoning",
+        "raw_payload",
+        "raw_provenance",
+        "raw_payloads",
+        "provenance",
+        "payload",
+    }
+)
+
+
+def _sanitize_payload(value: Any) -> Any:
+    """递归移除 provider raw/reasoning 字段，同时保留普通业务 JSON。"""
 
     if isinstance(value, Mapping):
-        return {str(key): _strip_reasoning(item) for key, item in value.items() if key != "reasoning"}
+        return {
+            str(key): _sanitize_payload(item)
+            for key, item in value.items()
+            if str(key).lower() not in _SENSITIVE_PAYLOAD_KEYS
+        }
     if isinstance(value, list | tuple):
-        return [_strip_reasoning(item) for item in value]
+        return [_sanitize_payload(item) for item in value]
     return value
 
 
@@ -142,7 +161,7 @@ def _structured_error(
         "duration_ms": duration_ms,
     }
     if metadata:
-        result_metadata.update(_strip_reasoning(dict(metadata)))
+        result_metadata.update(_sanitize_payload(dict(metadata)))
     if "attempts" in result_metadata:
         result_metadata.setdefault("attempt", result_metadata["attempts"])
     return ProcedureResult(
@@ -331,11 +350,16 @@ class ProcedureExecutor:
                 duration_ms=duration_ms,
                 metadata={"attempts": attempts},
             )
-        metadata = dict(_strip_reasoning(result.metadata))
-        metadata.setdefault("provider_plugin_id", str(ProcedureExecutor._entry_value(entry, "provider_plugin_id", "")))
-        metadata.setdefault("api_name", str(ProcedureExecutor._entry_value(entry, "api_name", "")))
-        metadata.setdefault("api_version", str(ProcedureExecutor._entry_value(entry, "api_version", "1")))
-        metadata.setdefault("request_id", request_id)
+        metadata = dict(_sanitize_payload(result.metadata))
+        # These values are authority data from the frozen catalog/request. Provider
+        # metadata is untrusted telemetry and must never override them.
+        metadata["provider_plugin_id"] = str(ProcedureExecutor._entry_value(entry, "provider_plugin_id", ""))
+        metadata["api_name"] = str(ProcedureExecutor._entry_value(entry, "api_name", ""))
+        metadata["api_version"] = str(ProcedureExecutor._entry_value(entry, "api_version", "1"))
+        metadata["procedure_id"] = procedure_id
+        metadata["request_id"] = request_id
+        sanitized_data = _sanitize_payload(result.data)
+        sanitized_error = _sanitize_payload(result.error)
         metadata["duration_ms"] = duration_ms
         metadata["attempts"] = attempts
         metadata["attempt"] = attempts
@@ -344,8 +368,8 @@ class ProcedureExecutor:
         return ProcedureResult.model_validate(
             {
                 "success": result.success,
-                "data": result.data,
-                "error": result.error,
+                "data": sanitized_data,
+                "error": sanitized_error,
                 "metadata": metadata,
             },
             strict=True,
@@ -423,7 +447,7 @@ class ProcedureExecutor:
                 )
             except Exception as exc:
                 duration_ms = int((time.perf_counter() - started) * 1000)
-                retryable = bool(getattr(exc, "retryable", False))
+                retryable = getattr(exc, "retryable", None) is True
                 if idempotent and retryable and attempts == 1:
                     continue
                 result = _structured_error(

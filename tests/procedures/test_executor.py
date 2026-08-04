@@ -194,3 +194,108 @@ async def test_batch_event_round_trip_preserves_order_and_frozen_result_metadata
     assert decoded == event
     with pytest.raises(TypeError):
         decoded.results[0].result.metadata["mutated"] = True  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_provider_payload_and_error_sensitive_fields_are_removed_before_event_json() -> None:
+    api = FakeAPI(
+        {
+            "builtin.safe": {
+                "success": True,
+                "data": {
+                    "answer": "业务字段保留",
+                    "nested": {
+                        "normal": "保留",
+                        "reasoning": "secret-reasoning",
+                        "raw_payload": {"token": "secret-raw"},
+                        "provenance": {"secret": "secret-provenance"},
+                        "payload": {"secret": "secret-payload"},
+                    },
+                },
+                "error": None,
+                "metadata": {},
+            },
+            "builtin.safe_error": {
+                "success": False,
+                "data": None,
+                "error": {
+                    "code": "provider_failed",
+                    "message": "业务错误",
+                    "reasoning": "secret-error-reasoning",
+                    "raw_payload": {"token": "secret-error-raw"},
+                    "provenance": {"secret": "secret-error-provenance"},
+                    "payload": {"secret": "secret-error-payload"},
+                },
+                "metadata": {},
+            },
+        }
+    )
+    executor = ProcedureExecutor(catalog(definition("builtin.safe"), definition("builtin.safe_error")), api=api)
+
+    event = await executor.invoke_many(
+        effect([ProcedureRequest(procedure_id="builtin.safe"), ProcedureRequest(procedure_id="builtin.safe_error")])
+    )
+    encoded = event_to_json(event)
+
+    assert "业务字段保留" in encoded and "保留" in encoded
+    for secret in (
+        "secret-reasoning",
+        "secret-raw",
+        "secret-provenance",
+        "secret-payload",
+        "secret-error-reasoning",
+        "secret-error-raw",
+        "secret-error-provenance",
+        "secret-error-payload",
+    ):
+        assert secret not in encoded
+
+
+@pytest.mark.asyncio
+async def test_catalog_provenance_overwrites_provider_spoofed_result_metadata() -> None:
+    api = FakeAPI(
+        {
+            "builtin.identity": {
+                "success": True,
+                "data": {"ok": True},
+                "error": None,
+                "metadata": {
+                    "provider_plugin_id": "evil.provider",
+                    "api_name": "evil.invoke_procedure",
+                    "api_version": "999",
+                    "request_id": "evil-request",
+                },
+            }
+        }
+    )
+    executor = ProcedureExecutor(catalog(definition("builtin.identity")), api=api)
+
+    event = await executor.invoke_many(effect([ProcedureRequest(procedure_id="builtin.identity")]))
+    item = event.results[0]
+
+    assert item.result.metadata["provider_plugin_id"] == "provider.tools"
+    assert item.result.metadata["api_name"] == "provider.tools.invoke_procedure"
+    assert item.result.metadata["api_version"] == "1"
+    assert item.result.metadata["request_id"] == item.request_id
+
+
+@pytest.mark.asyncio
+async def test_string_retryable_exception_is_not_treated_as_explicit_retry() -> None:
+    class StringRetryableError(RuntimeError):
+        retryable = "true"
+
+    api = FakeAPI(
+        {
+            "builtin.once": [
+                StringRetryableError(),
+                {"success": True, "data": {}, "error": None, "metadata": {}},
+            ]
+        }
+    )
+    executor = ProcedureExecutor(catalog(definition("builtin.once", idempotent=True)), api=api)
+
+    event = await executor.invoke_many(effect([ProcedureRequest(procedure_id="builtin.once")]))
+
+    assert len(api.calls) == 1
+    assert event.results[0].attempts == 1
+    assert event.results[0].result.error["code"] == "provider_call_failed"

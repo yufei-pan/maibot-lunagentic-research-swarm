@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from lunagentic_research_swarm.extensions.contracts import ProcedureResult
@@ -39,6 +40,60 @@ def _request_procedure_id(request: Any) -> str:
     return str(value) if value is not None else ""
 
 
+def _freeze_control_json(value: Any) -> Any:
+    """递归冻结 control request 的 JSON 值，避免事件发布后被改写。"""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze_control_json(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_control_json(item) for item in value)
+    return value
+
+
+def _thaw_control_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_control_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_control_json(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenControlRequest:
+    """可安全放入 CoreProcedureDecision/event 的控制请求值。"""
+
+    procedure_id: str
+    arguments: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "procedure_id", str(self.procedure_id))
+        object.__setattr__(self, "arguments", _freeze_control_json(dict(self.arguments)))
+
+    @classmethod
+    def from_request(cls, request: Any) -> "FrozenControlRequest":
+        if isinstance(request, cls):
+            return request
+        if isinstance(request, Mapping):
+            return cls(
+                procedure_id=str(request.get("procedure_id", "")),
+                arguments=dict(request.get("arguments", {}) or {}),
+            )
+        model_dump = getattr(request, "model_dump", None)
+        if callable(model_dump):
+            payload = model_dump(mode="python")
+            return cls(
+                procedure_id=str(payload.get("procedure_id", "")),
+                arguments=dict(payload.get("arguments", {}) or {}),
+            )
+        return cls(
+            procedure_id=str(getattr(request, "procedure_id", "")),
+            arguments=dict(getattr(request, "arguments", {}) or {}),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"procedure_id": self.procedure_id, "arguments": _thaw_control_json(self.arguments)}
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class CoreProcedureDecision:
     """一批 turn 请求中的 core 控制决定。
@@ -52,7 +107,7 @@ class CoreProcedureDecision:
     checkpoint: bool
     terminate: bool
     _ignored_controls: tuple[str, ...] = field(default=(), repr=False, compare=False)
-    control_requests: tuple[Any, ...] = field(default=(), repr=False, compare=False)
+    control_requests: tuple[FrozenControlRequest, ...] = field(default=(), repr=False, compare=False)
 
     def __init__(
         self,
@@ -67,7 +122,11 @@ class CoreProcedureDecision:
         object.__setattr__(self, "checkpoint", bool(checkpoint))
         object.__setattr__(self, "terminate", bool(terminate))
         object.__setattr__(self, "_ignored_controls", tuple(str(item) for item in ignored_controls))
-        object.__setattr__(self, "control_requests", tuple(control_requests))
+        object.__setattr__(
+            self,
+            "control_requests",
+            tuple(FrozenControlRequest.from_request(item) for item in control_requests),
+        )
 
     @property
     def ignored_controls(self) -> list[str]:
@@ -85,6 +144,7 @@ class CoreProcedureDecision:
             "checkpoint": self.checkpoint,
             "terminate": self.terminate,
             "ignored_controls": self.ignored_controls,
+            "control_requests": [item.as_dict() for item in self.control_requests],
         }
 
 
@@ -265,6 +325,7 @@ __all__ = [
     "CoreProcedureContext",
     "CoreProcedureDecision",
     "CoreProcedureExecutor",
+    "FrozenControlRequest",
     "execute_core_procedure",
     "is_core_procedure",
     "run_core_procedure",

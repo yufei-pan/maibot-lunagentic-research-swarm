@@ -11,6 +11,11 @@ from lunagentic_research_swarm.procedures.core import (
     split_procedure_requests,
 )
 from lunagentic_research_swarm.llm.protocol import ProcedureRequest
+from lunagentic_research_swarm.runtime.events import (
+    ProcedureBatchCompleted,
+    event_from_json,
+    event_to_json,
+)
 
 
 def test_terminate_dominates_other_control_procedures() -> None:
@@ -83,3 +88,27 @@ def test_core_ids_are_not_treated_as_external_procedures() -> None:
 
     assert [item.procedure_id for item in ordinary] == ["builtin.search"]
     assert controls.terminate
+
+
+def test_core_control_requests_are_frozen_and_survive_event_round_trip() -> None:
+    _, controls = split_procedure_requests(
+        [ProcedureRequest(procedure_id=CORE_COMPACT_ID, arguments={"reason": {"nested": "value"}})]
+    )
+    event = ProcedureBatchCompleted(
+        event_id="event-control",
+        task_id="task-1",
+        round_id="round-1",
+        generation=1,
+        controls=controls,
+    )
+
+    with pytest.raises(TypeError):
+        controls.control_requests[0].arguments["reason"] = "mutated"  # type: ignore[index]
+
+    decoded = event_from_json(event_to_json(event))
+
+    assert decoded.controls.compact
+    assert decoded.controls.control_requests[0].procedure_id == CORE_COMPACT_ID
+    assert decoded.controls.control_requests[0].arguments["reason"]["nested"] == "value"
+    with pytest.raises(TypeError):
+        decoded.controls.control_requests[0].arguments["reason"]["nested"] = "mutated"  # type: ignore[index]

@@ -42,3 +42,27 @@ timeout 30s env PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
 ## Commit
 
 `46f3dd1 feat: add procedure execution and core controls`
+
+## 审查修复 Round 1
+
+### RED
+
+新增四项 Important 回归后，修复前 focused suite 为 `10 passed, 4 failed`：
+
+- 合法 provider `data/error` 的 nested `reasoning/raw_payload/provenance/payload` 仍进入 event JSON；
+- provider 返回的伪造 provenance metadata 被 `setdefault` 接受；
+- `retryable="true"` 被 truthiness 误判为可重试；
+- core `control_requests` 可变且 `as_dict`/event round-trip 丢失控制请求。
+
+### GREEN
+
+- 新增递归 JSON sanitizer，作用于 ProcedureResult 的 data/error/metadata；只移除明确
+  sensitive key，保留普通业务字段，并在 event 边界再次验证冻结结果；
+- provider plugin/API/version/request_id/procedure_id 由 frozen catalog 和稳定 request ID 强制覆盖；
+- exception retry 只接受 `retryable is True`；
+- 新增 `FrozenControlRequest`，递归冻结 arguments；CoreProcedureDecision 序列化并恢复
+  control requests，控制语义在 round-trip 后保持。
+
+修复后 focused + Task1–3 回归：`68 passed in 0.35s`。
+
+修复提交：本报告随 `fix: harden Procedure privacy, provenance, retry and core event immutability` 提交。

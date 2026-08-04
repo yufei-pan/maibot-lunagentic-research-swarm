@@ -170,6 +170,7 @@ class ProcedureBatchCompleted(Event):
                         checkpoint=bool(self.controls.get("checkpoint", False)),
                         terminate=bool(self.controls.get("terminate", False)),
                         ignored_controls=self.controls.get("ignored_controls", ()),
+                        control_requests=self.controls.get("control_requests", ()),
                     ),
                 )
             except (ImportError, TypeError, ValueError):
