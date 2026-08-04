@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, TypeAlias
+
+from pydantic import BaseModel
 
 
 def _now() -> datetime:
@@ -44,6 +46,12 @@ def _freeze_value(value: Any) -> Any:
 def _json_value(value: Any) -> Any:
     """将冻结的 JSON 数据还原为标准 JSON 值。"""
 
+    if hasattr(value, "as_dict") and callable(value.as_dict):
+        return _json_value(value.as_dict())
+    if isinstance(value, BaseModel):
+        return _json_value(value.model_dump(mode="json"))
+    if is_dataclass(value):
+        return {item.name: _json_value(getattr(value, item.name)) for item in fields(value)}
     if isinstance(value, Mapping):
         return {key: _json_value(item) for key, item in value.items()}
     if isinstance(value, tuple):
@@ -118,6 +126,54 @@ class ProcedureBatchCompleted(Event):
     branch_id: str = ""
     call_id: str = ""
     result_id: str = ""
+    # 实际元素由 procedures.executor 提供；Any 用于解除 events ↔ procedures 的
+    # 导入环，executor 完成时已使用 ProcedureResult.model_validate() 校验。
+    results: tuple[Any, ...] = ()
+    controls: Any | None = None
+
+    def __post_init__(self) -> None:
+        normalized: list[Any] = []
+        for item in self.results:
+            if isinstance(item, Mapping) and "result" in item and "procedure_id" in item:
+                # 只在解码 persisted event 时走这个兼容分支；执行器本身已经返回
+                # frozen ProcedureExecutionResult 值对象。
+                try:
+                    from lunagentic_research_swarm.extensions.contracts import ProcedureResult
+                    from lunagentic_research_swarm.procedures.executor import ProcedureExecutionResult
+
+                    normalized.append(
+                        ProcedureExecutionResult(
+                            procedure_id=str(item["procedure_id"]),
+                            request_id=str(item.get("request_id", "")),
+                            result=ProcedureResult.model_validate(item["result"], strict=True),
+                            provider_plugin_id=str(item.get("provider_plugin_id", "")),
+                            api_name=str(item.get("api_name", "")),
+                            api_version=str(item.get("api_version", "1")),
+                            attempts=int(item.get("attempts", 1)),
+                            duration_ms=int(item.get("duration_ms", 0)),
+                        )
+                    )
+                    continue
+                except (ImportError, TypeError, ValueError):
+                    pass
+            normalized.append(item)
+        object.__setattr__(self, "results", tuple(_freeze_value(normalized)))
+        if isinstance(self.controls, Mapping):
+            try:
+                from lunagentic_research_swarm.procedures.core import CoreProcedureDecision
+
+                object.__setattr__(
+                    self,
+                    "controls",
+                    CoreProcedureDecision(
+                        compact=bool(self.controls.get("compact", False)),
+                        checkpoint=bool(self.controls.get("checkpoint", False)),
+                        terminate=bool(self.controls.get("terminate", False)),
+                        ignored_controls=self.controls.get("ignored_controls", ()),
+                    ),
+                )
+            except (ImportError, TypeError, ValueError):
+                object.__setattr__(self, "controls", _freeze_value(self.controls))
 
 
 @_register
