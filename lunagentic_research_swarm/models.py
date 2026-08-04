@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -84,6 +86,116 @@ class SummaryKind(str, Enum):
     CHECKPOINT = "CHECKPOINT"
     BRANCH_FINAL = "BRANCH_FINAL"
     TASK_FINAL = "TASK_FINAL"
+
+
+def _credit_number(value: Any, field_name: str, *, nonnegative: bool = False) -> float:
+    """校验 credits 数字；账本不得接受 NaN、无穷或布尔值。"""
+
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        qualifier = "非负有限数" if nonnegative else "有限数"
+        raise ValueError(f"{field_name} 必须为{qualifier}")
+    normalized = float(value)
+    if not math.isfinite(normalized) or (nonnegative and normalized < 0):
+        qualifier = "非负有限数" if nonnegative else "有限数"
+        raise ValueError(f"{field_name} 必须为{qualifier}")
+    return normalized
+
+
+def _metadata_contains_reasoning(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(key == "reasoning" or _metadata_contains_reasoning(item) for key, item in value.items())
+    if isinstance(value, list | tuple):
+        return any(_metadata_contains_reasoning(item) for item in value)
+    return False
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class CreditBalance:
+    """不可变的 branch/task credits 快照。
+
+    ``balance`` 是当前可用于该 branch 的有符号余额，``pool`` 是 dormant task
+    pool。两者保持独立，只有 continue 屏障才会把 pool 分配给活动叶子。
+    ``available``/``dormant_pool`` 是便于调用方阅读的只读别名，不是额外状态。
+    """
+
+    balance: float
+    pool: float
+
+    def __init__(
+        self,
+        balance: float = 0.0,
+        pool: float = 0.0,
+        *,
+        available: float | None = None,
+        dormant_pool: float | None = None,
+    ) -> None:
+        if available is not None:
+            if balance != 0.0 and float(balance) != float(available):
+                raise ValueError("balance 与 available 不一致")
+            balance = available
+        if dormant_pool is not None:
+            if pool != 0.0 and float(pool) != float(dormant_pool):
+                raise ValueError("pool 与 dormant_pool 不一致")
+            pool = dormant_pool
+        object.__setattr__(self, "balance", _credit_number(balance, "balance"))
+        object.__setattr__(self, "pool", _credit_number(pool, "pool"))
+
+    @property
+    def available(self) -> float:
+        return self.balance
+
+    @property
+    def dormant_pool(self) -> float:
+        return self.pool
+
+    @property
+    def amount(self) -> float:
+        """兼容账本调用方使用的 amount 只读别名。"""
+
+        return self.balance
+
+    @property
+    def credits(self) -> float:
+        return self.balance
+
+
+@dataclass(frozen=True, slots=True)
+class CreditLedgerEntry:
+    """与 SQLite ``credit_ledger`` 行一一对应的不可变账本条目。"""
+
+    ledger_id: str = ""
+    task_id: str = ""
+    round_id: str = ""
+    branch_id: str | None = None
+    call_id: str | None = None
+    entry_kind: str = ""
+    amount: float = 0.0
+    balance_after: float | None = None
+    metadata_json: str = "{}"
+    created_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "amount", _credit_number(self.amount, "amount"))
+        if self.balance_after is not None:
+            object.__setattr__(self, "balance_after", _credit_number(self.balance_after, "balance_after"))
+        if not isinstance(self.metadata_json, str):
+            raise ValueError("metadata_json 必须为 JSON 字符串")
+        try:
+            metadata = json.loads(self.metadata_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("metadata_json 必须为有效 JSON") from exc
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata_json 必须编码 JSON 对象")
+        if _metadata_contains_reasoning(metadata):
+            raise ValueError("账本 metadata 不得包含 reasoning")
+        object.__setattr__(self, "created_at", _credit_number(self.created_at, "created_at"))
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """返回新对象，调用方无法通过它改写账本条目。"""
+
+        value = json.loads(self.metadata_json)
+        return dict(value)
 
 
 @dataclass(frozen=True, slots=True)
