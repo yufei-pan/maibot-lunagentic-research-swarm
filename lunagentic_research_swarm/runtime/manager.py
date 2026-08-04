@@ -345,10 +345,12 @@ class ResearchManager:
         stats = getattr(self.scheduler, "stats", None)
         if callable(stats):
             task = dict(stats().get("tasks", {}).get(task_id, {}))
-            # A worker may enqueue the next procedure before it releases its
-            # own active slot.  The pause barrier is therefore idle only after
-            # both sides of that handoff have drained.
-            return max(0, int(task.get("active", 0))) + max(0, int(task.get("queued", 0)))
+            # A paused FairScheduler deliberately retains queued agent and
+            # summarizer work for continue().  It must not make that retained
+            # work block PAUSING forever.  Its telemetry separately exposes
+            # effects still permitted while paused: procedure plus control and
+            # other local handoff effects.
+            return max(0, int(task.get("active", 0))) + max(0, int(task.get("pause_runnable_queued", 0)))
         return 0
 
     def _sync_branch_credits(self, task_id: str, controller: TaskController) -> None:

@@ -337,6 +337,59 @@ async def test_pause_uses_fair_scheduler_public_stats_when_task_wait_api_is_abse
 
 
 @pytest.mark.asyncio
+async def test_pause_settles_with_queued_agent_then_runs_it_only_after_continue(harness) -> None:
+    """A paused agent queue must not hold the pause barrier open forever."""
+
+    manager, _, _, _, _, _ = harness
+    first_agent_started = asyncio.Event()
+    second_agent_started = asyncio.Event()
+    release_first_agent = asyncio.Event()
+    agent_starts: list[str] = []
+
+    async def worker(effect, token) -> None:
+        if not isinstance(effect, PerformAgentCall):
+            return
+        agent_starts.append(str(effect.payload["branch_id"]))
+        if len(agent_starts) == 1:
+            first_agent_started.set()
+            await release_first_agent.wait()
+        else:
+            second_agent_started.set()
+
+    scheduler = FairScheduler(global_llm=1, per_task_llm=1, per_task_procedure=1, worker=worker)
+    manager.scheduler = scheduler
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await first_agent_started.wait()
+    before_pause = await manager.status(result["task_id"])
+    first_branch_id = before_pause["active_leaves"][0]["branch_id"]
+    queued_branch_id = "queued-branch"
+    await scheduler.enqueue(
+        PerformAgentCall(
+            result["task_id"],
+            before_pause["round_id"],
+            before_pause["generation"],
+            payload={"branch_id": queued_branch_id},
+        )
+    )
+    assert scheduler.stats()["tasks"][result["task_id"]]["kind"]["agent"]["queued"] == 1
+
+    paused = await manager.pause(result["task_id"])
+    assert paused["status"] == "PAUSING"
+    release_first_agent.set()
+    await asyncio.wait_for(manager.wait_idle(result["task_id"]), timeout=0.5)
+
+    assert (await manager.status(result["task_id"]))["status"] == "PAUSED"
+    assert agent_starts == [first_branch_id]
+    assert scheduler.stats()["tasks"][result["task_id"]]["kind"]["agent"]["queued"] == 1
+
+    continued = await manager.continue_task(result["task_id"])
+    assert continued["status"] == "RUNNING"
+    await second_agent_started.wait()
+    assert agent_starts == [first_branch_id, queued_branch_id]
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_pause_waits_for_queued_procedure_during_agent_to_procedure_handoff(harness) -> None:
     manager, _, _, _, _, _ = harness
     agent_started = asyncio.Event()

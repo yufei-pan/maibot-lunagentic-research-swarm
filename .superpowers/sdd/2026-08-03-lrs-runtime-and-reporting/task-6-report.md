@@ -62,6 +62,20 @@ generation，迟到结果被忽略。continue 在 pause barrier 重新分配 poo
   commands 或 effect override。负余额 restart 不会产生 phantom leaf 或重置
   `raw_context_released`。
 
+## Review fix round 4
+
+- 根因：FairScheduler 在暂停时保留 queued agent/summarizer，并只允许 procedure 与
+  control/other 类 effect 启动；manager 却把所有 queued effect 计入 pause barrier。global
+  和 per-task LLM 并发均为 1 时，已启动 agent 释放后，第二个 queued agent 因而会让
+  `PAUSING` 永远不能结算。
+- FairScheduler 的 task telemetry 现在明确提供 `pause_runnable_queued`，它按与实际
+  launch gate 相同的 resource 分类，只包含暂停后仍被允许的 procedure、control 和其他
+  local handoff work。manager 以 `active + pause_runnable_queued` 作为 settle 条件；保留
+  queued agent/summarizer 由 continue 后恢复调度，不阻塞 PAUSED。
+- 新增真实 FairScheduler 回归：两个同 task agent、global/per-task LLM 都为 1。第一个
+  active 时 pause，释放后任务进入 PAUSED，第二个 agent 仍 queued 且未启动；continue
+  后才启动。既有 queued procedure agent→procedure handoff 测试继续覆盖 pause barrier。
+
 ## 验证
 
 - `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest tests/runtime/test_controller_start.py tests/runtime/test_controller_controls.py -v` → `14 passed`。
@@ -73,3 +87,9 @@ generation，迟到结果被忽略。continue 在 pause barrier 重新分配 poo
   tests/runtime/test_reducer.py tests/runtime/test_reducer_persistence.py
   tests/runtime/test_scheduler.py tests/runtime/test_turns.py
   tests/runtime/test_context_invariance.py -v` → `75 passed`。
+- Fix round 4 focused: `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest
+  tests/runtime/test_controller_controls.py::test_pause_settles_with_queued_agent_then_runs_it_only_after_continue
+  tests/runtime/test_controller_controls.py::test_pause_waits_for_queued_procedure_during_agent_to_procedure_handoff
+  tests/runtime/test_scheduler.py::test_pause_blocks_new_agent_and_summarizer_but_allows_procedure -v`
+  → `3 passed`。
+- Fix round 4 full: `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest -v` → `356 passed`。

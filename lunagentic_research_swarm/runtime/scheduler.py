@@ -358,6 +358,10 @@ class FairScheduler:
             tasks[task_id] = {
                 "active": len(active),
                 "queued": len(queued),
+                # A pause blocks agent/summarizer launches only.  Procedure
+                # and control/other effects remain eligible and therefore
+                # must still be included in a pause-settlement barrier.
+                "pause_runnable_queued": sum(self._is_pause_permitted(entry.effect) for entry in queued),
                 "llm_active": self._task_llm_active.get(task_id, 0),
                 "llm_limit": self.per_task_llm,
                 "procedure_active": self._task_procedure_active.get(task_id, 0),
@@ -617,7 +621,7 @@ class FairScheduler:
         if self._is_generation_cancelled(task_id, int(effect.generation)):
             return False
         resource = self._resource_kind(effect.kind)
-        if task_id in self._paused and resource in {"agent", "summarizer"}:
+        if task_id in self._paused and not self._is_pause_permitted(effect):
             return False
         if resource == "agent":
             return self._global_llm_active < self.global_llm and self._task_llm_active[task_id] < self.per_task_llm
@@ -626,6 +630,11 @@ class FairScheduler:
         if resource == "procedure":
             return self._task_procedure_active[task_id] < self.per_task_procedure
         return True
+
+    def _is_pause_permitted(self, effect: Effect) -> bool:
+        """Whether an effect remains launchable after its task is paused."""
+
+        return self._resource_kind(effect.kind) not in {"agent", "summarizer"}
 
     def _reserve(self, resource: str, task_id: str) -> None:
         if resource in {"agent", "summarizer"}:
