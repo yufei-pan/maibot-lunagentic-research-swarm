@@ -93,3 +93,14 @@ generation，迟到结果被忽略。continue 在 pause barrier 重新分配 poo
   tests/runtime/test_scheduler.py::test_pause_blocks_new_agent_and_summarizer_but_allows_procedure -v`
   → `3 passed`。
 - Fix round 4 full: `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest -v` → `356 passed`。
+
+## Review fix round 5
+
+- 修复 FairScheduler 的 barrier 优先级边界：暂停时排队的不可启动 summary barrier 会阻塞更低优先级 procedure，telemetry 不再把这类 procedure 误报为可结算工作；新增同 task barrier+procedure 回归。
+- focused（新回归、queued procedure handoff、scheduler pause）→ `3 passed`；完整套件 → `357 passed`。
+
+## Review fix round 6
+
+- 修复跨任务优先级边界：pause settlement telemetry 不再只返回全局最高优先级的一组候选，而是按 task 保留所有会在暂停期间推进的本地 procedure/control handoff；只有已暂停 task 的不可启动 barrier 才截断更低优先级计数。generation 已取消的队列项被排除。
+- 新增 task A normal procedure 与 task B high-priority work 同时排队的真实 FairScheduler 回归，确认 A 不会在其 procedure 完成前进入 `PAUSED`。
+- focused controller/scheduler → `31 passed`；完整套件 → `358 passed`；正式 scoped review → `PASS`；`git diff --check` 通过。
