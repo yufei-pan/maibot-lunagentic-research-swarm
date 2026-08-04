@@ -323,22 +323,34 @@ def _command(kind: str, values: Mapping[str, Any]) -> StoreCommand:
     return StoreCommand(kind, values)
 
 
-def _lifecycle_commands(event: RuntimeEvent, old: TaskStatus, new: TaskStatus) -> tuple[StoreCommand, ...]:
-    """生成同一 transaction 中的 round 状态与 lifecycle event 行。"""
+def _lifecycle_event_command(
+    event: RuntimeEvent,
+    old: TaskStatus,
+    new: TaskStatus,
+    *,
+    round_id: str | None = None,
+) -> StoreCommand:
+    """构造 lifecycle event 行；round_id 可指向同 transaction 新建的 round。"""
 
-    occurred_at = event.occurred_at.timestamp()
     event_values = {
         "event_id": event.event_id,
         "task_id": event.task_id,
-        "round_id": event.round_id,
+        "round_id": event.round_id if round_id is None else round_id,
         "event_type": type(event).__name__,
         "from_status": old.value,
         "to_status": new.value,
         "metadata_json": _metadata_json(
             {name: getattr(event, name) for name in event.__dataclass_fields__ if name not in {"event_id", "task_id", "round_id", "generation", "occurred_at"}}
         ),
-        "created_at": occurred_at,
+        "created_at": event.occurred_at.timestamp(),
     }
+    return _command("insert_lifecycle_event", event_values)
+
+
+def _lifecycle_commands(event: RuntimeEvent, old: TaskStatus, new: TaskStatus) -> tuple[StoreCommand, ...]:
+    """生成同一 transaction 中的 round 状态与 lifecycle event 行。"""
+
+    occurred_at = event.occurred_at.timestamp()
     ended_at = occurred_at if new in _TERMINAL_STATUSES else None
     return (
         _command(
@@ -350,7 +362,7 @@ def _lifecycle_commands(event: RuntimeEvent, old: TaskStatus, new: TaskStatus) -
                 "ended_at": ended_at,
             },
         ),
-        _command("insert_lifecycle_event", event_values),
+        _lifecycle_event_command(event, old, new),
     )
 
 
@@ -481,7 +493,9 @@ def _formalization_failed(state: Any, event: FormalizationFailed) -> Transition:
 def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
     """终态 continue 屏障：有叶子再分配，无叶子创建新 round 或明确不足。"""
 
-    leaves = dict(event.active_leaves) if event.active_leaves else _state_leaves(state)
+    # ``None`` means the caller omitted a snapshot; an explicit empty mapping means
+    # there are no active leaves and must be allowed to start a new round.
+    leaves = dict(event.active_leaves) if event.active_leaves is not None else _state_leaves(state)
     redistribution = redistribute_pool(_state_credit_pool(state), event.adjustment, leaves)
     if leaves:
         # 负叶子在 barrier 处保持终结；非负叶子允许继续运行。
@@ -491,17 +505,6 @@ def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
             state,
             event,
             TaskStatus.RUNNING,
-            extra_commands=(
-                _command(
-                    "update_round_status",
-                    {
-                        "round_id": event.round_id,
-                        "status": TaskStatus.RUNNING.value,
-                        "report_deadline_at": None,
-                        "ended_at": None,
-                    },
-                ),
-            ),
             active_leaves=running,
             credit_pool=redistribution.pool_after,
             continue_barrier=False,
@@ -566,6 +569,8 @@ def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
         generation=next_generation,
         payload={"root": True, "credit_balance": restart_balance},
     )
+    # This is a new round transition.  The old terminal round remains untouched;
+    # only the INSERT and the new round's lifecycle row are committed here.
     return Transition(
         _replace_state(
             state,
@@ -577,7 +582,16 @@ def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
             failure_code=None,
             continue_barrier=False,
         ),
-        commands=(next_round, current_round_number, *_lifecycle_commands(event, _state_status(state), TaskStatus.RUNNING)),
+        commands=(
+            next_round,
+            current_round_number,
+            _lifecycle_event_command(
+                event,
+                _state_status(state),
+                TaskStatus.RUNNING,
+                round_id=next_round_id,
+            ),
+        ),
         effects=(root_effect,),
     )
 
@@ -719,8 +733,8 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     # never mutate authoritative state directly; they merely schedule the next explicit
     # phase. A stopped/new-generation event was already filtered above.
     if isinstance(event, AgentCallRequested):
-        if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING}:
-            return _invalid(state, event, "AgentCallRequested 只能用于活跃 round")
+        if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING}:
+            return _invalid(state, event, "AgentCallRequested 只能用于 RUNNING/REPORTING")
         return Transition(
             state,
             effects=(
@@ -779,6 +793,8 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         return Transition(state)
 
     if isinstance(event, OutboxDelivered):
+        if status not in {TaskStatus.COMPLETED, TaskStatus.COMPLETED_WITH_ERRORS}:
+            return _invalid(state, event, "OutboxDelivered 只能用于已完成 round")
         # Delivery is idempotent and does not reopen a completed round.
         return Transition(state)
 
@@ -821,10 +837,18 @@ class TaskController:
         self._inbox: deque[RuntimeEvent] = deque()
         self.stopped = False
 
-    async def submit(self, event: RuntimeEvent) -> None:
+    async def submit(self, event: RuntimeEvent) -> bool:
+        if self.stopped:
+            # A failed best-effort FAILED write is a terminal controller failure;
+            # accepting another event here could launch work against unknown state.
+            return False
         self._inbox.append(event)
+        return True
 
     async def drain_once(self) -> bool:
+        if self.stopped:
+            self._inbox.clear()
+            return False
         if not self._inbox:
             return False
         event = self._inbox.popleft()
@@ -832,7 +856,7 @@ class TaskController:
         return True
 
     async def drain(self) -> None:
-        while self._inbox:
+        while self._inbox and not self.stopped:
             await self.drain_once()
 
     async def _apply(self, event: RuntimeEvent) -> None:
@@ -877,6 +901,7 @@ class TaskController:
             await self.store.transact(fallback)
         except Exception as fallback_exc:
             self.stopped = True
+            self._inbox.clear()
             self._record_health(
                 {
                     "status": "degraded",

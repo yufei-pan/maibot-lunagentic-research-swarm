@@ -18,6 +18,8 @@ from lunagentic_research_swarm.runtime.events import (
     PauseExpired,
     event_from_json,
     event_to_json,
+    AgentCallRequested,
+    OutboxDelivered,
 )
 from lunagentic_research_swarm.runtime.reducer import RuntimeState, reduce_event
 
@@ -142,3 +144,89 @@ def test_extended_events_round_trip_without_reducer_clock() -> None:
 
     assert decoded == event
     assert decoded.active_leaves == {"a": 2.0}
+
+
+def test_terminal_continue_never_reopens_old_round() -> None:
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.COMPLETED,
+        generation=2,
+        active_round_id="round-old",
+        credit_pool=2.0,
+    )
+    event = ContinueRequested(
+        "evt-new-round",
+        "task-1",
+        "round-old",
+        2,
+        next_round_id="round-new",
+        next_generation=3,
+        round_number=2,
+    )
+
+    transition = reduce_event(state, event)
+
+    updates = [command for command in transition.commands if command.kind == "update_round_status"]
+    assert updates == []
+    assert all(
+        command.values.get("round_id") != "round-old"
+        for command in transition.commands
+        if command.kind in {"update_round_status", "insert_lifecycle_event"}
+    )
+    lifecycle = [command for command in transition.commands if command.kind == "insert_lifecycle_event"]
+    assert lifecycle and lifecycle[0].values["round_id"] == "round-new"
+
+
+def test_continue_empty_event_leaves_override_state_leaves() -> None:
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.COMPLETED,
+        generation=2,
+        active_round_id="round-old",
+        credit_pool=2.0,
+        active_leaves={"still-running": 1.0},
+    )
+    event = ContinueRequested(
+        "evt-empty-leaves",
+        "task-1",
+        "round-old",
+        2,
+        active_leaves={},
+        next_round_id="round-new",
+        next_generation=3,
+        round_number=2,
+    )
+
+    transition = reduce_event(state, event)
+
+    assert transition.next_state.active_round_id == "round-new"
+    assert transition.next_state.status is TaskStatus.RUNNING
+    assert any(command.kind == "insert_round" for command in transition.commands)
+
+
+def test_pausing_rejects_new_agent_call_without_effect() -> None:
+    event = AgentCallRequested(
+        "evt-agent",
+        "task-1",
+        "round-1",
+        0,
+        branch_id="branch-1",
+        call_id="call-1",
+        agent_id="agent-1",
+    )
+
+    transition = reduce_event(RuntimeState("task-1", TaskStatus.PAUSING, active_round_id="round-1"), event)
+
+    assert transition.error is not None
+    assert transition.error.code == "invalid_state"
+    assert not any(type(effect).__name__ == "PerformAgentCall" for effect in transition.effects)
+
+
+def test_outbox_delivery_is_invalid_before_completed_terminal_status() -> None:
+    event = OutboxDelivered("evt-outbox", "task-1", "round-1", 0, outbox_id="out-1")
+
+    transition = reduce_event(RuntimeState("task-1", TaskStatus.RUNNING, active_round_id="round-1"), event)
+
+    assert transition.error is not None
+    assert transition.error.code == "invalid_state"
+    assert any(type(effect).__name__ == "NotifyToolWaiter" for effect in transition.effects)

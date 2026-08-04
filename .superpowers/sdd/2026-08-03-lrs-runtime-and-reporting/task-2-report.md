@@ -37,3 +37,25 @@ effects。事务失败时先把内存快照置为 `FAILED`，再做单条 best-e
   不生成 ID，也不会猜测缺失的 round identity。
 - `update_round_generation` 是 foundation SQLite schema 的兼容 command handler，无迁移版本
   变化；后续 controller 应继续把它与 status/lifecycle 写入同一 transaction。
+
+## 审查修复 Round 1
+
+### RED
+
+为五项审查 finding 增加 focused 回归后，修复前测试得到 `5 failed, 15 passed`：
+
+- fallback FAILED 写入再次失败后，controller 仍接受并处理后续事件；
+- terminal continue 的 command 向旧 round 写 `RUNNING`；
+- 显式 `active_leaves={}` 被错误回退为 state leaves；
+- PAUSING 仍发起 `PerformAgentCall`；
+- RUNNING 状态无条件接受 `OutboxDelivered`。
+
+### GREEN
+
+- controller 在 stopped 状态拒收事件、清空 inbox，`drain_once/drain` 不再执行后续 work，
+  并保留 `storage_commit_failed` health 记录；
+- no-leaf 新 round 只提交 `insert_round`、`set_task_current_round` 与指向新 round 的
+  lifecycle row，不更新旧 terminal round；active-leaf barrier 去掉重复 status update；
+- `None` 与显式空 leaves 分离；PAUSING 拒绝新的 agent request；OutboxDelivered 仅接受
+  `COMPLETED`/`COMPLETED_WITH_ERRORS`；
+- fix focused `20 passed`；foundation events/models/runtime 回归 `48 passed`。
