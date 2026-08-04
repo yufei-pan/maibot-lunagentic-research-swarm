@@ -1,0 +1,321 @@
+"""Tool-facing task lifecycle manager.
+
+Raw tool input is deliberately held only by the formalization coroutine.  The
+SQLite command payloads below contain identifiers, formalized text, and public
+summary-layer data only.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import time
+import uuid
+from dataclasses import replace
+from typing import Any
+
+from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
+from lunagentic_research_swarm.models import BranchLifecycle, FormalizedTask, TaskStatus, new_branch_id, new_round_id, new_task_id
+from lunagentic_research_swarm.runtime.controller import TaskController
+from lunagentic_research_swarm.runtime.events import AgentCallCompleted
+from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformFormalization, RuntimeState
+from lunagentic_research_swarm.storage.sqlite import StoreCommand
+
+
+def _event_id() -> str:
+    return f"evt_{uuid.uuid4().hex}"
+
+
+def _now() -> float:
+    return time.time()
+
+
+class ResearchManager:
+    """Creates and controls independently durable research tasks."""
+
+    def __init__(
+        self,
+        *,
+        ctx: Any,
+        store: Any,
+        summarizer: Any,
+        scheduler: Any,
+        snapshot_provider: Any,
+        recent_message_limit: int = 20,
+        pause_timeout_seconds: int = 1200,
+        grace_period_seconds: int = 60,
+    ) -> None:
+        self.ctx, self.store, self.summarizer, self.scheduler = ctx, store, summarizer, scheduler
+        self._snapshot_provider = snapshot_provider
+        self._recent_message_limit = recent_message_limit
+        self._pause_timeout_seconds = pause_timeout_seconds
+        self._grace_period_seconds = grace_period_seconds
+        self._controllers: dict[str, TaskController] = {}
+        self._round_numbers: dict[str, int] = {}
+        self._branches: dict[str, dict[str, dict[str, Any]]] = {}
+        self._jobs: dict[str, set[asyncio.Task[Any]]] = {}
+        self._pause_jobs: dict[str, asyncio.Task[Any]] = {}
+
+    async def start(
+        self,
+        *,
+        objective: str,
+        stream_id: str,
+        time_budget_seconds: int,
+        effort_level: float = 1.0,
+        planner_context: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(objective, str) or not objective.strip():
+            raise ValueError("objective 不能为空")
+        if isinstance(time_budget_seconds, bool) or not isinstance(time_budget_seconds, int) or time_budget_seconds <= 0:
+            raise ValueError("time_budget_seconds 必须为正整数")
+        if isinstance(effort_level, bool) or not isinstance(effort_level, (int, float)) or effort_level < 0:
+            raise ValueError("effort_level 必须为非负数")
+        snapshot = await self._snapshot_provider()
+        root = snapshot.agent_catalog.get(snapshot.root_agent)
+        if root is None or not getattr(root.definition, "enabled", False) or not getattr(root.definition, "can_be_root", False):
+            raise ValueError("root agent 不可用")
+        if not str(snapshot.summarizer_selector).strip():
+            raise ValueError("summarizer selector 不能为空")
+        selector = str(snapshot.root_force_selector or root.definition.model_selector)
+        credits = float(snapshot.default_effort_credits) * float(effort_level)
+        warning = snapshot.price_catalog.low_budget_warning(selector, credits)
+        if warning:
+            self.ctx.logger.warning("%s（按 500000 cache-miss 输入与 50000 输出 token 重新估算）", warning)
+
+        task_id, round_id, created_at = new_task_id(), new_round_id(), _now()
+        state = RuntimeState(task_id, TaskStatus.FORMALIZING, generation=0, active_round_id=round_id)
+        controller = TaskController(state, store=self.store, scheduler=self.scheduler)
+        initial = (
+            StoreCommand("insert_task", {"task_id": task_id, "stream_id": stream_id, "current_round_number": 1, "created_at": created_at}),
+            StoreCommand("insert_round", {
+                "round_id": round_id, "task_id": task_id, "round_number": 1, "generation": 0,
+                "status": TaskStatus.FORMALIZING.value, "time_budget_seconds": time_budget_seconds,
+                "grace_period_seconds": self._grace_period_seconds, "credit_pool": 0.0,
+                "catalog_fingerprint": snapshot.agent_catalog.fingerprint, "started_at": created_at,
+            }),
+            self._lifecycle(task_id, round_id, "TaskCreated", None, TaskStatus.FORMALIZING, created_at),
+        )
+        await self.store.transact(initial)
+        self._controllers[task_id] = controller
+        self._round_numbers[task_id] = 1
+        self._branches[task_id] = {}
+        await self.scheduler.enqueue(PerformFormalization(task_id, round_id, 0, payload={"stream_id": stream_id}))
+        self._track(task_id, self._formalize(task_id, objective, stream_id, planner_context, credits, snapshot, time_budget_seconds))
+        return {"task_id": task_id, "status": TaskStatus.FORMALIZING.value, "initial_credits": credits}
+
+    async def _formalize(self, task_id: str, objective: str, stream_id: str, planner_context: str | None, credits: float, snapshot: Any, time_budget_seconds: int) -> None:
+        """Collect public context and immediately drop the raw bundle after use."""
+        controller = self._controllers[task_id]
+        raw_context = ""
+        try:
+            recent = await self.ctx.message.get_recent(stream_id, self._recent_message_limit)
+            readable = await self.ctx.message.build_readable(recent)
+            values = []
+            for key in ("bot.nickname", "personality.personality", "personality.behavior_style", "personality.reply_style"):
+                values.append((key, await self.ctx.config.get(key)))
+            raw_context = json.dumps({"objective": objective, "planner_context": planner_context or "", "persona": values}, ensure_ascii=False)
+            result = await self.summarizer.formalize_task(FormalizationRequest(raw_context=raw_context, chat_messages=readable))
+            if not result.success or not result.text.strip():
+                raise RuntimeError(getattr(getattr(result, "error", None), "message", "formalization_failed"))
+            formalized = FormalizedTask.create(result.text)
+            branch_id, now = new_branch_id(), _now()
+            commands = (
+                StoreCommand("update_task_formalization", {"task_id": task_id, "formalized_text": formalized.text, "formalized_sha256": formalized.sha256, "updated_at": now}),
+                StoreCommand("insert_vector_job", {"job_id": f"vec_{uuid.uuid4().hex}", "source_kind": "formalized_task", "source_id": task_id, "generation": 0, "status": "PENDING", "created_at": now}),
+                StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": controller.state.active_round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": 0, "created_at": now}),
+                StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.RUNNING.value, "report_deadline_at": None, "ended_at": None}),
+                self._lifecycle(task_id, controller.state.active_round_id, "FormalizationSucceeded", TaskStatus.FORMALIZING, TaskStatus.RUNNING, now),
+            )
+            await self.store.transact(commands)
+            controller.state = replace(controller.state, status=TaskStatus.RUNNING, formalized_task=formalized, active_leaves={branch_id: credits})
+            self._branches[task_id][branch_id] = {"credits": credits, "pending_context": []}
+            await self.scheduler.enqueue(PerformAgentCall(task_id, controller.state.active_round_id, controller.state.generation, payload={"root": True, "branch_id": branch_id, "formalized_text": formalized.text, "credit_balance": credits}))
+        except Exception as exc:
+            now = _now()
+            await self.store.transact((
+                StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.FAILED.value, "report_deadline_at": None, "ended_at": now}),
+                self._lifecycle(task_id, controller.state.active_round_id, "FormalizationFailed", TaskStatus.FORMALIZING, TaskStatus.FAILED, now, {"error": str(exc)}),
+            ))
+            controller.state = replace(controller.state, status=TaskStatus.FAILED, failure_code="formalization_failed")
+        finally:
+            # objective, readable messages and personality are never retained on the controller.
+            raw_context = ""
+            objective = ""
+            planner_context = None
+
+    async def pause(self, task_id: str) -> dict[str, Any]:
+        controller = self._controller(task_id)
+        if controller.state.status not in {TaskStatus.RUNNING, TaskStatus.REPORTING}:
+            raise ValueError("task 不在可暂停状态")
+        now = _now()
+        await self.store.transact((
+            StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.PAUSING.value, "report_deadline_at": None, "ended_at": None}),
+            self._lifecycle(task_id, controller.state.active_round_id, "PauseRequested", controller.state.status, TaskStatus.PAUSING, now),
+        ))
+        controller.state = replace(controller.state, status=TaskStatus.PAUSING)
+        self.scheduler.pause_task(task_id)
+        if self.scheduler.task_inflight_count(task_id):
+            self._track(task_id, self._settle_pause(task_id))
+        else:
+            await self._mark_paused(task_id)
+        return self._status(controller)
+
+    async def _settle_pause(self, task_id: str) -> None:
+        wait = getattr(self.scheduler, "wait_task_idle", None)
+        if wait is not None:
+            await wait(task_id)
+        await self._mark_paused(task_id)
+
+    async def _mark_paused(self, task_id: str) -> None:
+        controller = self._controller(task_id)
+        if controller.state.status is not TaskStatus.PAUSING:
+            return
+        now = _now()
+        await self.store.transact((
+            StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.PAUSED.value, "report_deadline_at": None, "ended_at": None}),
+            self._lifecycle(task_id, controller.state.active_round_id, "AllInflightSettled", TaskStatus.PAUSING, TaskStatus.PAUSED, now),
+        ))
+        controller.state = replace(controller.state, status=TaskStatus.PAUSED)
+        self._pause_jobs[task_id] = asyncio.create_task(self._expiry_wait(task_id))
+
+    async def _expiry_wait(self, task_id: str) -> None:
+        await asyncio.sleep(self._pause_timeout_seconds)
+        await self.expire_pause(task_id)
+
+    async def expire_pause(self, task_id: str) -> None:
+        controller = self._controller(task_id)
+        if controller.state.status is not TaskStatus.PAUSED:
+            return
+        now = _now()
+        await self.store.transact((
+            StoreCommand("update_round_status", {"round_id": controller.state.active_round_id, "status": TaskStatus.EXPIRED.value, "report_deadline_at": None, "ended_at": now}),
+            self._lifecycle(task_id, controller.state.active_round_id, "PauseExpired", TaskStatus.PAUSED, TaskStatus.EXPIRED, now),
+        ))
+        controller.state = replace(controller.state, status=TaskStatus.EXPIRED, raw_context_released=True, active_leaves={})
+        self._branches[task_id].clear()
+
+    async def stop(self, task_id: str, *, reason: str = "") -> dict[str, Any]:
+        controller = self._controller(task_id)
+        state, now = controller.state, _now()
+        if state.status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.PAUSED}:
+            raise ValueError("task 不在可停止状态")
+        self.scheduler.cancel_generation(task_id, state.generation)
+        await self.store.transact((
+            StoreCommand("update_round_generation", {"round_id": state.active_round_id, "generation": state.generation + 1}),
+            StoreCommand("update_round_status", {"round_id": state.active_round_id, "status": TaskStatus.STOPPED.value, "report_deadline_at": None, "ended_at": now}),
+            self._lifecycle(task_id, state.active_round_id, "StopRequested", state.status, TaskStatus.STOPPED, now, {"reason": reason}),
+        ))
+        controller.state = replace(state, status=TaskStatus.STOPPED, generation=state.generation + 1, raw_context_released=True, active_leaves={})
+        self._branches[task_id].clear()
+        return self._status(controller)
+
+    async def add_context(self, task_id: str, context: str) -> dict[str, Any]:
+        controller = self._controller(task_id)
+        if not isinstance(context, str) or not context.strip():
+            raise ValueError("context 不能为空")
+        await self.store.transact((self._lifecycle(task_id, controller.state.active_round_id, "ContextSupplied", controller.state.status, controller.state.status, _now(), {"context": context}),))
+        for branch in self._branches[task_id].values():
+            branch["pending_context"].append(context)
+        return self._status(controller)
+
+    async def continue_task(self, task_id: str, *, credit_adjustment: float = 0.0, time_budget_seconds: int | None = None) -> dict[str, Any]:
+        controller = self._controller(task_id)
+        if time_budget_seconds is not None and (isinstance(time_budget_seconds, bool) or time_budget_seconds <= 0):
+            raise ValueError("time_budget_seconds 必须为正整数")
+        state, branches = controller.state, self._branches[task_id]
+        effective_time = time_budget_seconds or self._stored_time_budget(task_id) or 120
+        if state.status is TaskStatus.PAUSED and branches:
+            cancelled = self._pause_jobs.pop(task_id, None)
+            if cancelled:
+                cancelled.cancel()
+            total = state.credit_pool + float(credit_adjustment)
+            shares = total / len(branches)
+            for branch_id, branch in list(branches.items()):
+                branch["credits"] += shares
+                if branch["credits"] < 0:
+                    del branches[branch_id]
+            leaves = {key: item["credits"] for key, item in branches.items()}
+            controller.state = replace(state, status=TaskStatus.RUNNING, active_leaves=leaves, credit_pool=0.0, continue_barrier=False)
+            self.scheduler.resume_task(task_id)
+            return {**self._status(controller), "effective_time_budget_seconds": effective_time}
+        if not branches and state.status in {TaskStatus.STOPPED, TaskStatus.EXPIRED, TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            balance = state.credit_pool + float(credit_adjustment)
+            if balance < 0:
+                return {"success": False, "error": {"code": "task_finished_insufficient_funds", "message": "任务没有可用于新 round 的 credits"}}
+            if state.formalized_task is None:
+                return {"success": False, "error": {"code": "task_not_formalized", "message": "任务尚未形式化"}}
+            await self._restart_round(task_id, balance, effective_time)
+            return {**self._status(controller), "effective_time_budget_seconds": effective_time}
+        raise ValueError("task 不在可继续状态")
+
+    async def _restart_round(self, task_id: str, credits: float, time_budget_seconds: int) -> None:
+        controller, state = self._controller(task_id), self._controller(task_id).state
+        snapshot = await self._snapshot_provider()
+        round_id, branch_id, now = new_round_id(), new_branch_id(), _now()
+        number, generation = self._round_numbers[task_id] + 1, state.generation + 1
+        layer = await self.store.load_summary_layer(task_id)
+        summary_context = {"summaries": list(layer.summaries), "reports": list(layer.reports), "feedback": list(layer.feedback), "supplied_context": list(layer.supplied_context)} if layer else {}
+        await self.store.transact((
+            StoreCommand("insert_round", {"round_id": round_id, "task_id": task_id, "round_number": number, "generation": generation, "status": TaskStatus.RUNNING.value, "time_budget_seconds": time_budget_seconds, "grace_period_seconds": self._grace_period_seconds, "credit_pool": 0.0, "catalog_fingerprint": snapshot.agent_catalog.fingerprint, "started_at": now}),
+            StoreCommand("set_task_current_round", {"task_id": task_id, "current_round_number": number, "updated_at": now}),
+            StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": generation, "created_at": now}),
+            self._lifecycle(task_id, round_id, "ContinueRequested", state.status, TaskStatus.RUNNING, now),
+        ))
+        self._round_numbers[task_id] = number
+        controller.state = replace(state, status=TaskStatus.RUNNING, active_round_id=round_id, generation=generation, active_leaves={branch_id: credits}, credit_pool=0.0, raw_context_released=False)
+        self._branches[task_id] = {branch_id: {"credits": credits, "pending_context": list(summary_context.get("supplied_context", []))}}
+        await self.scheduler.enqueue(PerformAgentCall(task_id, round_id, generation, payload={"root": True, "branch_id": branch_id, "formalized_text": state.formalized_task.text, "summary_layer": summary_context}))
+
+    async def handle_runtime_event(self, event: Any) -> None:
+        controller = self._controllers.get(event.task_id)
+        if controller is None or event.generation != controller.state.generation or event.round_id != controller.state.active_round_id:
+            return
+        if controller.state.status in {TaskStatus.STOPPED, TaskStatus.EXPIRED, TaskStatus.FAILED}:
+            return
+        if isinstance(event, AgentCallCompleted):
+            return
+
+    async def wait_idle(self, task_id: str) -> None:
+        while True:
+            jobs = [job for job in self._jobs.get(task_id, set()) if not job.done()]
+            if not jobs:
+                return
+            await asyncio.gather(*jobs, return_exceptions=True)
+
+    async def status(self, task_id: str) -> dict[str, Any]:
+        return self._status(self._controller(task_id))
+
+    async def list_tasks(self) -> list[dict[str, Any]]:
+        return [self._status(controller) for controller in self._controllers.values()]
+
+    def _status(self, controller: TaskController) -> dict[str, Any]:
+        state = controller.state
+        branches = self._branches.get(state.task_id, {})
+        leaves = []
+        for key, item in branches.items():
+            leaf = {"branch_id": key, "credits": item["credits"]}
+            if item["pending_context"]:
+                leaf["pending_context"] = list(item["pending_context"])
+            leaves.append(leaf)
+        return {"task_id": state.task_id, "status": state.status.value, "round_id": state.active_round_id, "round_number": self._round_numbers.get(state.task_id, 1), "generation": state.generation, "active_leaves": leaves, "raw_context_released": state.raw_context_released}
+
+    def _stored_time_budget(self, task_id: str) -> int | None:
+        return None
+
+    def _controller(self, task_id: str) -> TaskController:
+        try:
+            return self._controllers[task_id]
+        except KeyError as exc:
+            raise LookupError(f"task {task_id} 不存在") from exc
+
+    def _track(self, task_id: str, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        bucket = self._jobs.setdefault(task_id, set())
+        bucket.add(task)
+        task.add_done_callback(bucket.discard)
+
+    @staticmethod
+    def _lifecycle(task_id: str, round_id: str | None, event_type: str, old: TaskStatus | None, new: TaskStatus, now: float, metadata: dict[str, Any] | None = None) -> StoreCommand:
+        return StoreCommand("insert_lifecycle_event", {"event_id": _event_id(), "task_id": task_id, "round_id": round_id, "event_type": event_type, "from_status": old.value if old else None, "to_status": new.value, "metadata_json": json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True), "created_at": now})

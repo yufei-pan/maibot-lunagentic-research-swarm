@@ -1372,8 +1372,18 @@ __all__ = [
     "ReleaseRawContext",
     "ReducerState",
     "RuntimeState",
-    "TaskController",
     "TaskRuntimeState",
+    "TaskController",
     "Transition",
     "reduce_event",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Keep the Task 2 import path while the controller lives in its own module."""
+
+    if name == "TaskController":
+        from lunagentic_research_swarm.runtime.controller import TaskController
+
+        return TaskController
+    raise AttributeError(name)
