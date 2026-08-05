@@ -107,7 +107,7 @@ class WebSearchService:
         return False
 
     def replace_config(self, config: WebSearchSection) -> None:
-        """配置热更新时替换快照（不重建 HTTP client）。"""
+        """配置热更新时替换快照；HTTP 请求按当前 timeout_seconds 逐次覆盖 client 超时。"""
 
         self._config = config
         self._tavily_key = SecretStr(config.tavily_api_key) if config.tavily_api_key else None
@@ -299,7 +299,12 @@ class WebSearchService:
         headers: Mapping[str, str] | None,
     ) -> Any:
         try:
-            response = await self._http.get(url, params=params, headers=headers)
+            response = await self._http.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=self._config.timeout_seconds,
+            )
         except Exception as exc:
             raise _HttpSearchError("HTTP 请求失败", status_class="network") from exc
         return self._read_json_response(response)
@@ -312,7 +317,12 @@ class WebSearchService:
         headers: Mapping[str, str],
     ) -> Any:
         try:
-            response = await self._http.post(url, json=json_body, headers=headers)
+            response = await self._http.post(
+                url,
+                json=json_body,
+                headers=headers,
+                timeout=self._config.timeout_seconds,
+            )
         except Exception as exc:
             raise _HttpSearchError("HTTP 请求失败", status_class="network") from exc
         return self._read_json_response(response)

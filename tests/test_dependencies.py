@@ -59,16 +59,20 @@ def test_runtime_dependencies_are_synced_across_pyproject_requirements_and_manif
         req_spec = requirements[name]
         man_spec = manifest[name]
         assert py_spec == req_spec, f"{name}: pyproject={py_spec!r} requirements={req_spec!r}"
-        # manifest 可省略上界，但下界须与 pyproject/requirements 一致
-        lower = re.match(r">=([^,<\s]+)", py_spec)
-        assert lower is not None
-        assert man_spec.startswith(f">={lower.group(1)}")
+        if name == "ddgs":
+            assert man_spec == py_spec, f"ddgs: pyproject={py_spec!r} manifest={man_spec!r}"
+        else:
+            # 其余包允许 manifest 省略上界，但下界须与 pyproject/requirements 一致
+            lower = re.match(r">=([^,<\s]+)", py_spec)
+            assert lower is not None
+            assert man_spec.startswith(f">={lower.group(1)}")
 
 
 def test_ddgs_dependency_pin_matches_brief() -> None:
     pyproject = _pyproject_runtime_deps()
     requirements = _requirements_runtime_deps()
-    assert pyproject["ddgs"] == ">=9.14.4,<10.0.0"
-    assert requirements["ddgs"] == ">=9.14.4,<10.0.0"
     manifest = _manifest_runtime_deps()
-    assert manifest["ddgs"] == ">=9.14.4"
+    expected = ">=9.14.4,<10.0.0"
+    assert pyproject["ddgs"] == expected
+    assert requirements["ddgs"] == expected
+    assert manifest["ddgs"] == expected

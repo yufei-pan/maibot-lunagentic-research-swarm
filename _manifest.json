@@ -34,7 +34,7 @@
     {
       "type": "python_package",
       "name": "ddgs",
-      "version_spec": ">=9.14.4"
+      "version_spec": ">=9.14.4,<10.0.0"
     }
   ],
   "capabilities": [

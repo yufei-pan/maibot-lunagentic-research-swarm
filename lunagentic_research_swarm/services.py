@@ -305,12 +305,22 @@ class LRSServiceContainer:
         self.manager = None
         self.scheduler = None
         self._effect_runner = None
+        provider = self._bundled_procedure_provider
+        self._bundled_procedure_provider = None
         if manager is not None:
             try:
                 await manager.shutdown()
             except BaseException as exc:
                 self._ctx.logger.error(
                     "LRS 启动失败后的 manager 清理异常：resource=runtime_manager；error_type=%s",
+                    type(exc).__name__,
+                )
+        if provider is not None:
+            try:
+                await provider.aclose()
+            except BaseException as exc:
+                self._ctx.logger.error(
+                    "LRS 启动失败后的资源清理异常：resource=bundled_procedure_provider；error_type=%s",
                     type(exc).__name__,
                 )
         for resource_name, resource in resources:

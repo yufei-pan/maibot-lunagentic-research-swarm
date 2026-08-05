@@ -40,8 +40,22 @@ class FakeHttp:
     post_response: _FakeResponse | None = None
     get_by_url: dict[str, _FakeResponse] = field(default_factory=dict)
 
-    async def get(self, url: str, *, params: Mapping[str, Any] | None = None, headers: Mapping[str, str] | None = None):
-        self.gets.append({"url": url, "params": dict(params or {}), "headers": dict(headers or {})})
+    async def get(
+        self,
+        url: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ):
+        self.gets.append(
+            {
+                "url": url,
+                "params": dict(params or {}),
+                "headers": dict(headers or {}),
+                "timeout": timeout,
+            }
+        )
         if url in self.get_by_url:
             return self.get_by_url[url]
         if self.get_response is None:
@@ -54,8 +68,16 @@ class FakeHttp:
         *,
         json: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
     ):
-        self.posts.append({"url": url, "json": dict(json or {}), "headers": dict(headers or {})})
+        self.posts.append(
+            {
+                "url": url,
+                "json": dict(json or {}),
+                "headers": dict(headers or {}),
+                "timeout": timeout,
+            }
+        )
         if self.post_response is None:
             raise AssertionError(f"未配置 POST 响应：{url}")
         return self.post_response
@@ -357,3 +379,28 @@ async def test_provider_exposes_web_search_invoke() -> None:
     )
     assert result.success
     assert result.data["engine"] == "duckduckgo"
+
+
+@pytest.mark.asyncio
+async def test_replace_config_applies_new_timeout_per_http_request(web_harness) -> None:
+    web_harness.configure("searxng")
+    web_harness.section.timeout_seconds = 12.0
+    service = web_harness.service()
+    await service.search("searxng", "q", max_results=3, language="en", recency=None)
+    assert web_harness.http.gets[-1]["timeout"] == 12.0
+
+    refreshed = WebSearchSection(
+        enabled_engines=["duckduckgo", "searxng", "tavily", "you"],
+        searxng_url="https://searx.example",
+        tavily_api_key="tvly-secret",
+        you_base_url="https://api.you.example/search",
+        you_api_key="you-secret",
+        timeout_seconds=45.0,
+    )
+    service.replace_config(refreshed)
+    await service.search("searxng", "q2", max_results=3, language="en", recency=None)
+    assert web_harness.http.gets[-1]["timeout"] == 45.0
+
+    web_harness.configure("tavily")
+    await service.search("tavily", "q3", max_results=2, language="en", recency=None)
+    assert web_harness.http.posts[-1]["timeout"] == 45.0
