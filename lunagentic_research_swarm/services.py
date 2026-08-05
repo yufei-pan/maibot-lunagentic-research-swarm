@@ -29,7 +29,11 @@ from lunagentic_research_swarm.llm.gateway import (
 from lunagentic_research_swarm.llm.physical_pinning import PhysicalPinningAdapter, PhysicalPinningStatus
 from lunagentic_research_swarm.llm.pricing import PriceCatalog
 from lunagentic_research_swarm.llm.summarizer import SummarizerService
-from lunagentic_research_swarm.procedures.executor import ProcedureExecutor
+from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
+from lunagentic_research_swarm.procedures.executor import (
+    ProcedureExecutor,
+    bundled_procedure_invoker,
+)
 from lunagentic_research_swarm.procedures.registry import ProcedureCatalogSnapshot, ProcedureRegistry
 from lunagentic_research_swarm.runtime.effect_runner import RuntimeEffectRunner
 from lunagentic_research_swarm.runtime.manager import ResearchManager
@@ -40,7 +44,7 @@ from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreComm
 
 StoreFactory = Callable[[Path], Any]
 DiscoveryFactory = Callable[..., Any]
-BuiltinProviderLoader = Callable[[AgentRegistry, ProcedureRegistry], None]
+BuiltinProviderLoader = Callable[..., Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,18 +106,27 @@ class _NextRoundState:
         return {name: dict(value) for name, value in self.plugin_price_overrides}
 
 
-def _load_builtin_providers(agents: AgentRegistry, procedures: ProcedureRegistry) -> None:
-    """通过与第三方相同的 replace_provider 路径装入内置默认智能体与 Procedures。"""
+def _load_builtin_providers(
+    agents: AgentRegistry,
+    procedures: ProcedureRegistry,
+    *,
+    ctx: Any | None = None,
+) -> BundledProcedureProvider:
+    """通过与第三方相同的 replace_provider 路径装入内置默认智能体与 Procedures。
+
+    返回带 ``ctx`` 的持久 ``BundledProcedureProvider``，供 executor 本地 invoker 调用；
+    不为 builtin 写 scheduler / procedure_id shortcut。
+    """
 
     from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
-    from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
 
+    provider = BundledProcedureProvider(ctx)
     agents.replace_provider(
         "builtin",
         [definition.model_dump(mode="json") for definition in bundled_agent_definitions()],
     )
-    # describe() 只产出定义 payload；invoke 仍走统一 provider invoker，不为 builtin 写 scheduler shortcut。
-    procedures.replace_provider("builtin", BundledProcedureProvider(None).describe())
+    procedures.replace_provider("builtin", provider.describe())
+    return provider
 
 
 class LRSServiceContainer:
@@ -142,6 +155,7 @@ class LRSServiceContainer:
         self._host_snapshot_loader = host_snapshot_loader
         self._physical_pinning = physical_pinning or PhysicalPinningAdapter()
         self._builtin_provider_loader = builtin_provider_loader
+        self._bundled_procedure_provider: BundledProcedureProvider | None = None
 
         self.agent_registry = AgentRegistry(root_agent=config.plugin.root_agent)
         self.procedure_registry = ProcedureRegistry()
@@ -225,7 +239,7 @@ class LRSServiceContainer:
                 "interrupted": int(interrupted),
             }
             self._load_initial_price_catalog()
-            self._builtin_provider_loader(self.agent_registry, self.procedure_registry)
+            self._install_builtin_providers()
             self._discovery = self._new_discovery(self._refresh_interval_seconds)
             await self._refresh_external_extensions()
             self._ensure_configured_root_available()
@@ -239,6 +253,32 @@ class LRSServiceContainer:
             await self._cleanup_start_failure()
             self._state = "failed"
             raise
+
+    def _install_builtin_providers(self) -> None:
+        """装入内置 agents/procedures，并保留带真实 ctx 的 durable procedure provider。"""
+
+        loader = self._builtin_provider_loader
+        try:
+            loaded = loader(self.agent_registry, self.procedure_registry, ctx=self._ctx)
+        except TypeError:
+            # 测试用两参数 loader 不接受 ctx。
+            loaded = loader(self.agent_registry, self.procedure_registry)
+        if isinstance(loaded, BundledProcedureProvider):
+            if loaded.ctx is None:
+                loaded.ctx = self._ctx
+            self._bundled_procedure_provider = loaded
+            return
+        # 自定义 loader 未返回 provider 时仍创建 durable 实例，供 executor 本地 invoker 使用。
+        provider = BundledProcedureProvider(self._ctx)
+        if "builtin" not in self.procedure_registry.provider_ids:
+            self.procedure_registry.replace_provider("builtin", provider.describe())
+        self._bundled_procedure_provider = provider
+
+    def _procedure_local_invokers(self) -> dict[str, Any]:
+        provider = self._bundled_procedure_provider
+        if provider is None:
+            return {}
+        return {"builtin.invoke_procedure": bundled_procedure_invoker(provider)}
 
     async def _cleanup_start_failure(self) -> None:
         """释放启动阶段已经创建的资源而不遮蔽原始异常。"""
@@ -295,10 +335,21 @@ class LRSServiceContainer:
         procedure_catalog = self.procedure_registry.snapshot(
             self._next_round_state.detached_procedure_overrides()
         )
-        procedures = ProcedureExecutor(procedure_catalog, ctx=self._ctx, summarizer=summarizer)
+        local_invokers = self._procedure_local_invokers()
+        procedures = ProcedureExecutor(
+            procedure_catalog,
+            ctx=self._ctx,
+            summarizer=summarizer,
+            local_invokers=local_invokers,
+        )
 
         def procedure_factory(catalog: Any) -> ProcedureExecutor:
-            return ProcedureExecutor(catalog, ctx=self._ctx, summarizer=summarizer)
+            return ProcedureExecutor(
+                catalog,
+                ctx=self._ctx,
+                summarizer=summarizer,
+                local_invokers=local_invokers,
+            )
 
         turn_worker = TurnWorker(
             gateway,

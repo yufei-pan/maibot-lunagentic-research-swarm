@@ -12,7 +12,13 @@ from .core import (
     is_core_procedure,
     split_procedure_requests,
 )
-from .executor import ProcedureExecutionResult, ProcedureExecutor, ProcedureResultItem
+from .executor import (
+    CompositeProcedureAPI,
+    ProcedureExecutionResult,
+    ProcedureExecutor,
+    ProcedureResultItem,
+    bundled_procedure_invoker,
+)
 from .registry import ProcedureCatalogEntry, ProcedureCatalogSnapshot, ProcedureRegistry
 
 __all__ = [
@@ -20,6 +26,7 @@ __all__ = [
     "CORE_COMPACT_ID",
     "CORE_PROCEDURE_IDS",
     "CORE_TERMINATE_ID",
+    "CompositeProcedureAPI",
     "CoreProcedureContext",
     "CoreProcedureDecision",
     "CoreProcedureExecutor",
@@ -29,6 +36,7 @@ __all__ = [
     "ProcedureExecutor",
     "ProcedureRegistry",
     "ProcedureResultItem",
+    "bundled_procedure_invoker",
     "execute_core_procedure",
     "is_core_procedure",
     "split_procedure_requests",

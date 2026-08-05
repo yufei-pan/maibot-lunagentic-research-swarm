@@ -12,7 +12,7 @@ import asyncio
 import hashlib
 import json
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from types import MappingProxyType
 from typing import Any
@@ -26,6 +26,42 @@ from lunagentic_research_swarm.procedures.core import (
 )
 from lunagentic_research_swarm.procedures.registry import ProcedureCatalogSnapshot
 from lunagentic_research_swarm.runtime.events import ProcedureBatchCompleted
+
+LocalProcedureInvoker = Callable[..., Awaitable[Any]]
+
+
+class CompositeProcedureAPI:
+    """统一 provider API：先查本地 invoker（按 api_name），再回退 Host ``ctx.api``。
+
+    本地 builtin 与第三方 Host API 共用同一 ``call(api_name, version=..., ...)`` 形状，
+    避免在 scheduler / executor 里按 procedure_id 特判。
+    """
+
+    def __init__(
+        self,
+        host_api: Any | None = None,
+        local_invokers: Mapping[str, LocalProcedureInvoker] | None = None,
+    ) -> None:
+        self._host = host_api
+        self._local = {str(name): invoker for name, invoker in dict(local_invokers or {}).items()}
+
+    @property
+    def local_api_names(self) -> frozenset[str]:
+        return frozenset(self._local)
+
+    async def call(self, name: str, *, version: str = "1", **kwargs: Any) -> Any:
+        invoker = self._local.get(str(name))
+        if invoker is not None:
+            return await invoker(version=version, **kwargs)
+        if self._host is None:
+            raise RuntimeError("Procedure executor 缺少 ctx.api，且无匹配的本地 invoker")
+        call = getattr(self._host, "call", None)
+        if not callable(call):
+            if callable(self._host):
+                call = self._host
+            else:
+                raise RuntimeError("ctx.api 必须提供 call()")
+        return await call(name, version=version, **kwargs)
 
 
 def _jsonable(value: Any) -> Any:
@@ -181,7 +217,8 @@ class ProcedureExecutor:
 
     ``catalog`` 可以是 ``ProcedureCatalogSnapshot``，也可以是提供 ``get`` 的
     catalog-like 对象；``api`` 可以是 ``ctx.api`` 或直接实现 ``call`` 的 fake。
-    构造器额外接受 ``ctx`` 以便 runtime 直接传入插件上下文。
+    构造器额外接受 ``ctx`` 以便 runtime 直接传入插件上下文；``local_invokers``
+    按 catalog ``api_name`` 路由到进程内 provider（如 builtin），再回退 Host API。
     """
 
     def __init__(
@@ -192,12 +229,15 @@ class ProcedureExecutor:
         ctx: Any | None = None,
         summarizer: Any | None = None,
         agent_id: str = "lrs.executor",
+        local_invokers: Mapping[str, LocalProcedureInvoker] | None = None,
     ) -> None:
         # 允许历史调用方使用 ProcedureExecutor(ctx.api, catalog)。
         if catalog is not None and hasattr(catalog, "call") and api is not None and hasattr(api, "get"):
             catalog, api = api, catalog
         if api is None and ctx is not None:
             api = getattr(ctx, "api", None)
+        if local_invokers:
+            api = CompositeProcedureAPI(host_api=api, local_invokers=local_invokers)
         self.catalog = catalog or ProcedureCatalogSnapshot(())
         self.api = api
         self.summarizer = summarizer
@@ -543,8 +583,32 @@ class ProcedureExecutor:
         )
 
 
+def bundled_procedure_invoker(provider: Any) -> LocalProcedureInvoker:
+    """把 ``BundledProcedureProvider.invoke`` 适配成 ``api.call`` 同形的本地 invoker。"""
+
+    async def _invoke(
+        *,
+        version: str = "1",
+        procedure_id: str,
+        request_id: str = "",
+        arguments: Mapping[str, Any] | None = None,
+        scoped_metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        del version, request_id, scoped_metadata, _kwargs
+        result = await provider.invoke(procedure_id, arguments or {})
+        if isinstance(result, BaseModel):
+            return result.model_dump(mode="json")
+        return result
+
+    return _invoke
+
+
 __all__ = [
+    "CompositeProcedureAPI",
+    "LocalProcedureInvoker",
     "ProcedureExecutionResult",
     "ProcedureExecutor",
     "ProcedureResultItem",
+    "bundled_procedure_invoker",
 ]

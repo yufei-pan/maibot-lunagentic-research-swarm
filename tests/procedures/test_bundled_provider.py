@@ -63,7 +63,9 @@ def test_registry_loads_builtin_procedure_provider() -> None:
 def test_builtin_loader_registers_procedures_without_scheduler_shortcut() -> None:
     agents = AgentRegistry(root_agent="builtin.quick_thinker")
     procedures = ProcedureRegistry()
-    _load_builtin_providers(agents, procedures)
+    provider = _load_builtin_providers(agents, procedures, ctx=object())
+    assert isinstance(provider, BundledProcedureProvider)
+    assert provider.ctx is not None
     snapshot = procedures.snapshot({})
     assert set(snapshot.ids) >= _EXPECTED_MEMORY_IDS
     for procedure_id in _EXPECTED_MEMORY_IDS:
