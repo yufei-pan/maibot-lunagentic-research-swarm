@@ -26,30 +26,62 @@ def _require_stream_id(kwargs: Mapping[str, Any]) -> tuple[str | None, str | Non
 
 
 def clip_command_output(text: str, max_chars: int, *, error_lines: Sequence[str] = ()) -> str:
-    """超限时做结构化截断，并保留错误条目摘要（不静默省略）。"""
+    """超限时做结构化截断，并保留错误条目摘要（不静默省略）。
+
+    始终保证 ``len(result) <= max(1000, max_chars)``。错误摘要带
+    ``共 N / 显示 K`` 计数；装不下的错误条目被省略时也会写明总数与显示数。
+    """
 
     limit = max(1000, int(max_chars))
     body = str(text or "")
     errors = [str(line) for line in error_lines if str(line).strip()]
-    if len(body) <= limit and not errors:
-        return body
-    if len(body) <= limit:
-        # 仍附加错误摘要（即使正文未超限也保证错误可见）
-        if not errors:
-            return body
-        suffix = "\n—— 错误摘要 ——\n" + "\n".join(f"- {line}" for line in errors)
-        if len(body) + len(suffix) <= limit:
-            return body + suffix
-        room = max(0, limit - len(suffix) - 20)
-        return body[:room] + "\n…(正文截断)\n" + suffix
+    total = len(errors)
 
-    header = f"……（输出已截断，原文约 {len(body)} 字，上限 {limit}）\n"
-    error_block = ""
-    if errors:
-        error_block = "\n—— 错误摘要（未省略）——\n" + "\n".join(f"- {line}" for line in errors)
-    reserved = len(header) + len(error_block) + 8
-    keep = max(0, limit - reserved)
-    return header + body[:keep] + "\n…" + error_block
+    def _error_footer(shown: int) -> str:
+        header = f"—— 错误摘要（共 {total} / 显示 {shown}）——"
+        if shown <= 0:
+            return "\n" + header
+        lines = "\n".join(f"- {errors[i]}" for i in range(shown))
+        return "\n" + header + "\n" + lines
+
+    def _truncate_body(room: int) -> str:
+        """在 ``room`` 字符预算内放入正文（必要时加截断头）。"""
+        if room <= 0:
+            return ""
+        if len(body) <= room:
+            return body
+        header = f"……（输出已截断，原文约 {len(body)} 字，上限 {limit}）\n"
+        if len(header) + 1 > room:
+            # 预算极紧：尽量保留原文前缀
+            return body[:room]
+        keep = max(0, room - len(header) - 1)
+        return header + body[:keep] + "…"
+
+    if total == 0:
+        if len(body) <= limit:
+            return body
+        return _truncate_body(limit)
+
+    # 优先为错误摘要预留空间：取最大可显示条数 K，再把剩余预算给正文。
+    shown = 0
+    footer = _error_footer(0)
+    for candidate in range(total, -1, -1):
+        trial = _error_footer(candidate)
+        if len(trial) <= limit:
+            shown = candidate
+            footer = trial
+            break
+    else:
+        # 理论上 K=0 的 footer 很短；若仍超限则硬截断 footer 本身。
+        return footer[:limit]
+
+    room = limit - len(footer)
+    prefix = _truncate_body(room) if room > 0 else ""
+    if not prefix:
+        # 无正文空间时去掉 footer 前导换行，避免浪费首字符。
+        return (footer[1:] if footer.startswith("\n") else footer)[:limit]
+    out = prefix + footer
+    return out if len(out) <= limit else out[:limit]
 
 
 def _fmt_rate(value: Any) -> str:
@@ -538,10 +570,32 @@ class SwarmCommandsMixin:
             if scheduler is not None and callable(getattr(scheduler, "stats", None)):
                 queue = dict((scheduler.stats().get("tasks") or {}).get(task_id) or {})
             deadline = None
-            coordinator = getattr(manager, "report_coordinators", {}).get(task_id) if hasattr(manager, "report_coordinators") else None
+            reports: int | None = None
+            coordinator = (
+                getattr(manager, "report_coordinators", {}).get(task_id)
+                if hasattr(manager, "report_coordinators")
+                else None
+            )
             if coordinator is not None:
                 deadline = getattr(coordinator, "deadline_at", None)
-            text = format_task_status(status, stats=stats, queue=queue, deadline=deadline)
+                coord_reports = getattr(coordinator, "reports", None)
+                if coord_reports is not None:
+                    reports = len(coord_reports)
+            if reports is None:
+                store = getattr(manager, "store", None)
+                if store is None and services is not None:
+                    store = getattr(services, "store", None)
+                if store is not None and callable(getattr(store, "load_summary_layer", None)):
+                    layer = await store.load_summary_layer(task_id)
+                    if layer is not None:
+                        reports = len(getattr(layer, "reports", ()) or [])
+                    else:
+                        reports = 0
+                else:
+                    reports = 0
+            text = format_task_status(
+                status, stats=stats, queue=queue, deadline=deadline, reports=reports
+            )
             return await self._swarm_send(text, stream_id)
         except PermissionError as exc:
             return await self._swarm_fail(str(exc), stream_id)

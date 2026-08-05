@@ -108,6 +108,17 @@ class _FakeFeedback:
         )
 
 
+class _FakeStore:
+    def __init__(self) -> None:
+        self.layers: dict[str, Any] = {
+            "lrs_a": SimpleNamespace(reports=[{}, {}, {}]),
+            "lrs_b": SimpleNamespace(reports=[]),
+        }
+
+    async def load_summary_layer(self, task_id: str) -> Any | None:
+        return self.layers.get(task_id)
+
+
 class _FakeManager:
     def __init__(self) -> None:
         self.tasks = [
@@ -130,6 +141,8 @@ class _FakeManager:
                 "created_at": "2026-08-04T11:00:00Z",
             },
         ]
+        self.store = _FakeStore()
+        self.report_coordinators: dict[str, Any] = {}
 
     async def status(self, task_id: str, *, stream_id: str | None = None) -> dict[str, Any]:
         del stream_id
@@ -371,6 +384,46 @@ async def test_swarm_status_overview_and_task(command_harness) -> None:
     text = command_harness.sent_text
     assert "lrs_a" in text
     assert "RUNNING" in text
+
+
+@pytest.mark.asyncio
+async def test_swarm_status_includes_report_count(command_harness) -> None:
+    await command_harness.invoke("/swarm status lrs_a", stream_id="s")
+    assert "报告数：3" in command_harness.sent_text
+    command_harness.send.texts.clear()
+    # Live coordinator reports take precedence over persisted layer.
+    command_harness.plugin._manager.report_coordinators["lrs_a"] = SimpleNamespace(
+        deadline_at="2026-08-04T13:00:00Z",
+        reports=[object(), object()],
+    )
+    await command_harness.invoke("/swarm status lrs_a", stream_id="s")
+    text = command_harness.sent_text
+    assert "报告数：2" in text
+    assert "deadline：2026-08-04T13:00:00Z" in text
+
+
+def test_clip_command_output_honors_limit_with_many_errors() -> None:
+    from lunagentic_research_swarm.commands import clip_command_output
+
+    body = "正文内容" * 20
+    errors = [f"错误条目-{i:03d}" for i in range(100)]
+    out = clip_command_output(body, 1000, error_lines=errors)
+    assert len(out) <= 1000
+    match = re.search(r"共\s*(\d+)\s*/\s*显示\s*(\d+)", out)
+    assert match is not None, out
+    total, shown = int(match.group(1)), int(match.group(2))
+    assert total == 100
+    assert 0 <= shown < total
+    assert out.count("错误条目-") == shown
+
+
+def test_clip_command_output_keeps_all_errors_when_budget_allows() -> None:
+    from lunagentic_research_swarm.commands import clip_command_output
+
+    out = clip_command_output("ok", 1000, error_lines=["a", "b", "c"])
+    assert len(out) <= 1000
+    assert "共 3 / 显示 3" in out
+    assert "- a" in out and "- b" in out and "- c" in out
 
 
 @pytest.mark.asyncio
