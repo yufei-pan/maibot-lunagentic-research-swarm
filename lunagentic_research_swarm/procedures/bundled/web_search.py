@@ -378,9 +378,11 @@ class _HttpSearchError(Exception):
 
 
 def web_search_procedure_definitions(service: WebSearchService) -> list[ProcedureDefinition]:
-    """构造 builtin.web_search；engine enum 为当前可用引擎快照。"""
+    """构造 builtin.web_search；无可用引擎时不进入目录。"""
 
     engines = list(service.available_engines)
+    if not engines:
+        return []
     payload = {
         "procedure_id": "builtin.web_search",
         "version": "1",

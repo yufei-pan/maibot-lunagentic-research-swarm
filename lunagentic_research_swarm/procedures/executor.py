@@ -192,6 +192,7 @@ def _structured_error(
     api_version: str = "1",
     request_id: str = "",
     duration_ms: int = 0,
+    agent_id: str = "",
     metadata: Mapping[str, Any] | None = None,
 ) -> ProcedureResult:
     result_metadata: dict[str, Any] = {
@@ -202,8 +203,12 @@ def _structured_error(
         "request_id": request_id,
         "duration_ms": duration_ms,
     }
+    if agent_id:
+        result_metadata["agent_id"] = agent_id
     if metadata:
         result_metadata.update(_sanitize_payload(dict(metadata)))
+        if agent_id:
+            result_metadata["agent_id"] = agent_id
     if "attempts" in result_metadata:
         result_metadata.setdefault("attempt", result_metadata["attempts"])
     return ProcedureResult(
@@ -212,6 +217,52 @@ def _structured_error(
         error={"code": code, "message": message},
         metadata=result_metadata,
     )
+
+
+def procedure_result_summary(item: ProcedureExecutionResult) -> dict[str, Any]:
+    """供 branch 上下文/审计使用的结构化摘要；已剥离敏感 raw 字段。"""
+
+    result = item.result
+    summary: dict[str, Any] = {
+        "procedure_id": item.procedure_id,
+        "request_id": item.request_id,
+        "success": bool(getattr(result, "success", False)),
+        "provider_plugin_id": item.provider_plugin_id,
+        "duration_ms": int(item.duration_ms),
+    }
+    data = getattr(result, "data", None)
+    error = getattr(result, "error", None)
+    if data is not None:
+        summary["data"] = _sanitize_payload(data)
+    if error is not None:
+        summary["error"] = _sanitize_payload(error)
+    metadata = getattr(result, "metadata", None)
+    if isinstance(metadata, Mapping) and metadata.get("agent_id"):
+        summary["agent_id"] = str(metadata["agent_id"])
+    return summary
+
+
+def fold_procedure_results_into_messages(
+    messages: Sequence[Mapping[str, Any]],
+    results: Sequence[ProcedureExecutionResult],
+) -> tuple[tuple[dict[str, Any], ...], list[dict[str, Any]]]:
+    """把普通 Procedure 结果按调用顺序写入可变 history，供子分支/总结继承。"""
+
+    folded = [dict(item) for item in messages if isinstance(item, Mapping)]
+    summaries: list[dict[str, Any]] = []
+    for item in results:
+        if str(item.procedure_id).startswith("core."):
+            continue
+        summary = procedure_result_summary(item)
+        summaries.append(summary)
+        folded.append(
+            {
+                "role": "user",
+                "content": "procedure_result:\n"
+                + json.dumps(summary, ensure_ascii=False, sort_keys=True, allow_nan=False, default=str),
+            }
+        )
+    return tuple(folded), summaries
 
 
 class ProcedureExecutor:
@@ -292,6 +343,19 @@ class ProcedureExecutor:
         branch_id = value("branch_id", "branch-unknown")
         turn_id = value("turn_id", value("call_id", "turn-unknown"))
         agent_id = value("agent_id", "lrs.executor")
+        allowed_raw = value("allowed_procedures")
+        allowed: frozenset[str] | None
+        if allowed_raw is None:
+            # 未由 prepare_procedure_effect 注入时保持兼容：不额外限制 catalog。
+            allowed = None
+        elif allowed_raw == "*" or allowed_raw == ["*"] or allowed_raw == ("*",):
+            allowed = None
+        elif isinstance(allowed_raw, (str, bytes, bytearray)):
+            allowed = frozenset({str(allowed_raw)})
+        elif isinstance(allowed_raw, Sequence):
+            allowed = frozenset(str(item) for item in allowed_raw)
+        else:
+            allowed = frozenset()
         return {
             "task_id": str(task_id or "task-unknown"),
             "round_id": str(round_id or "round-unknown"),
@@ -301,6 +365,7 @@ class ProcedureExecutor:
             "call_id": str(value("call_id", "") or ""),
             "event_id": str(value("event_id", "") or ""),
             "generation": int(value("generation", getattr(effect, "generation", 0)) or 0),
+            "allowed_procedures": allowed,
         }
 
     @classmethod
@@ -383,6 +448,7 @@ class ProcedureExecutor:
         request_id: str,
         duration_ms: int,
         attempts: int,
+        agent_id: str = "",
     ) -> ProcedureResult:
         try:
             result = ProcedureResult.model_validate(raw, strict=True)
@@ -396,6 +462,7 @@ class ProcedureExecutor:
                 api_version=str(ProcedureExecutor._entry_value(entry, "api_version", "1")),
                 request_id=request_id,
                 duration_ms=duration_ms,
+                agent_id=agent_id,
                 metadata={"attempts": attempts},
             )
         metadata = dict(_sanitize_payload(result.metadata))
@@ -406,6 +473,8 @@ class ProcedureExecutor:
         metadata["api_version"] = str(ProcedureExecutor._entry_value(entry, "api_version", "1"))
         metadata["procedure_id"] = procedure_id
         metadata["request_id"] = request_id
+        if agent_id:
+            metadata["agent_id"] = agent_id
         sanitized_data = _sanitize_payload(result.data)
         sanitized_error = _sanitize_payload(result.error)
         metadata["duration_ms"] = duration_ms
@@ -426,6 +495,17 @@ class ProcedureExecutor:
     async def _invoke_one(self, request: Any, context: Mapping[str, Any], index: int) -> ProcedureExecutionResult:
         procedure_id = str(_request_value(request, "procedure_id", "") or "")
         request_id = self._stable_request_id(context, request, index)
+        agent_id = str(context.get("agent_id") or "")
+        allowed = context.get("allowed_procedures")
+        if isinstance(allowed, frozenset) and procedure_id not in allowed:
+            result = _structured_error(
+                "procedure_not_allowed",
+                "当前 agent 的 allowed_procedures 不允许调用该 Procedure",
+                procedure_id=procedure_id,
+                request_id=request_id,
+                agent_id=agent_id,
+            )
+            return ProcedureExecutionResult(procedure_id, request_id, result)
         entry = self._entry(procedure_id)
         if entry is None:
             result = _structured_error(
@@ -433,6 +513,7 @@ class ProcedureExecutor:
                 "Procedure 不在当前 round catalog 中",
                 procedure_id=procedure_id,
                 request_id=request_id,
+                agent_id=agent_id,
             )
             return ProcedureExecutionResult(procedure_id, request_id, result)
 
@@ -463,6 +544,7 @@ class ProcedureExecutor:
                 api_name=api_name,
                 api_version=api_version,
                 request_id=request_id,
+                agent_id=agent_id,
             )
             return ProcedureExecutionResult(procedure_id, request_id, result, provider_id, api_name, api_version)
 
@@ -488,6 +570,7 @@ class ProcedureExecutor:
                     api_version=api_version,
                     request_id=request_id,
                     duration_ms=duration_ms,
+                    agent_id=agent_id,
                     metadata={"attempts": attempts},
                 )
                 return ProcedureExecutionResult(
@@ -507,6 +590,7 @@ class ProcedureExecutor:
                     api_version=api_version,
                     request_id=request_id,
                     duration_ms=duration_ms,
+                    agent_id=agent_id,
                     metadata={"attempts": attempts, "retryable": retryable},
                 )
                 return ProcedureExecutionResult(
@@ -521,6 +605,7 @@ class ProcedureExecutor:
                 request_id=request_id,
                 duration_ms=duration_ms,
                 attempts=attempts,
+                agent_id=agent_id,
             )
             retryable = bool(result.error and result.error.get("retryable") is True)
             has_business_result = result.data is not None
@@ -624,6 +709,8 @@ class ProcedureExecutor:
             await asyncio.gather(*(self._invoke_one(request, context, index) for index, request in enumerate(ordinary)))
         )
         parent_messages = tuple(dict(item) for item in payload.get("messages", ()) if isinstance(item, Mapping))
+        # 普通结果先进入可变 history，再 compact，使子分支继承 procedure 输出。
+        parent_messages, _summaries = fold_procedure_results_into_messages(parent_messages, results)
         if controls.compact and not controls.terminate:
             compact_result = await self._execute_compact(context=context, payload=payload, messages=parent_messages)
             results.append(compact_result)
@@ -686,10 +773,27 @@ class ProcedureExecutor:
             context=CoreProcedureContext(formalized_task=formalized, branch_history=history),
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
+        agent_id = str(context.get("agent_id") or "")
+        metadata = dict(_sanitize_payload(getattr(result, "metadata", {}) or {}))
+        metadata["agent_id"] = agent_id or "lrs.executor"
+        metadata["procedure_id"] = CORE_COMPACT_ID
+        metadata["request_id"] = request_id
+        metadata["duration_ms"] = duration_ms
+        metadata["attempts"] = 1
+        metadata["attempt"] = 1
+        normalized = ProcedureResult.model_validate(
+            {
+                "success": bool(getattr(result, "success", False)),
+                "data": _sanitize_payload(getattr(result, "data", None)),
+                "error": _sanitize_payload(getattr(result, "error", None)),
+                "metadata": metadata,
+            },
+            strict=True,
+        )
         return ProcedureExecutionResult(
             CORE_COMPACT_ID,
             request_id,
-            result,
+            normalized,
             "core",
             "",
             "1",
@@ -748,4 +852,6 @@ __all__ = [
     "ProcedureExecutor",
     "ProcedureResultItem",
     "bundled_procedure_invoker",
+    "fold_procedure_results_into_messages",
+    "procedure_result_summary",
 ]

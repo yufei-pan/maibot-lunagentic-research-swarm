@@ -121,6 +121,8 @@ class ProcedureRegistry:
         if len(set(ids)) != len(ids):
             raise ValueError("Procedure provider 批次包含重复 ID")
         for procedure_id in ids:
+            if procedure_id.startswith("core."):
+                raise ValueError(f"procedure_id {procedure_id} 不得使用保留的 core 命名空间")
             if procedure_id.partition(".")[0] != authorized_namespace:
                 raise ValueError(
                     f"procedure_id {procedure_id} 不属于 provider {provider_id} 获授权的命名空间 {authorized_namespace}"

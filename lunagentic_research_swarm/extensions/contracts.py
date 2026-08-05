@@ -110,7 +110,10 @@ class ProcedureDefinition(_StrictContract):
     @field_validator("procedure_id")
     @classmethod
     def _validate_procedure_id(cls, value: str) -> str:
-        return validate_extension_id(value, field_name="procedure_id")
+        value = validate_extension_id(value, field_name="procedure_id")
+        if value.startswith("core."):
+            raise ValueError("procedure_id 不得使用保留的 core 命名空间")
+        return value
 
     @field_validator("arguments_schema", "result_schema", mode="before")
     @classmethod

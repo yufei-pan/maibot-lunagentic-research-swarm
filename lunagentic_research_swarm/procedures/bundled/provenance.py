@@ -95,11 +95,7 @@ def normalize_url(url: str) -> str:
         netloc = f"{host}:{port}"
     else:
         netloc = host
-    if parts.username is not None:
-        userinfo = parts.username
-        if parts.password is not None:
-            userinfo = f"{userinfo}:{parts.password}"
-        netloc = f"{userinfo}@{netloc}"
+    # 丢弃 userinfo（user:password@），避免凭证进入 provenance / agent 上下文。
     path = _remove_dot_segments(parts.path or "")
     # 保留原始 query 字节顺序与值；丢弃 fragment
     return urlunsplit((scheme, netloc, path, parts.query, ""))

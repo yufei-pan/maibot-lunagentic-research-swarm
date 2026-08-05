@@ -640,19 +640,34 @@ class ResearchManager:
         self._sync_branch_messages_from_event(event)
 
     def _sync_branch_messages_from_event(self, event: Any) -> None:
-        """Apply compacted/rewritten parent messages after procedure completion."""
+        """Apply compacted/rewritten parent messages and procedure summaries after batch complete."""
 
         messages = getattr(event, "parent_messages", None)
         branch_id = getattr(event, "branch_id", None)
         task_id = getattr(event, "task_id", None)
-        if not messages or not branch_id or not task_id:
+        if not branch_id or not task_id:
             return
+        from lunagentic_research_swarm.procedures.executor import procedure_result_summary
+
+        results = getattr(event, "results", ()) or ()
+        summaries = [
+            procedure_result_summary(item)
+            for item in results
+            if not str(getattr(item, "procedure_id", "")).startswith("core.")
+        ]
         branch = self._branches.get(task_id, {}).get(branch_id)
         if branch is not None:
-            branch["messages"] = [dict(item) for item in messages]
+            if messages:
+                branch["messages"] = [dict(item) for item in messages]
+            if summaries:
+                branch["procedure_results"] = [dict(item) for item in summaries]
         coordinator = self.report_coordinators.get(task_id)
         if coordinator is not None and branch_id in coordinator.branches:
-            coordinator.branches[branch_id].messages[:] = [dict(item) for item in messages]
+            runtime = coordinator.branches[branch_id]
+            if messages:
+                runtime.messages[:] = [dict(item) for item in messages]
+            if summaries:
+                runtime.procedure_results[:] = [dict(item) for item in summaries]
 
     async def prepare_agent_effect(self, effect: PerformAgentCall) -> PerformAgentCall:
         """Fill a scheduled agent effect and reserve research input credits."""
@@ -799,6 +814,19 @@ class ResearchManager:
         payload["procedure_catalog_fingerprint"] = str(
             getattr(snapshot.procedure_catalog, "fingerprint", "")
         )
+        branch = self._branches.get(effect.task_id, {}).get(branch_id) if branch_id else None
+        agent_id = str(
+            payload.get("agent_id")
+            or (branch or {}).get("agent_id")
+            or getattr(snapshot, "root_agent", "")
+            or ""
+        )
+        if agent_id:
+            payload["agent_id"] = agent_id
+            payload["allowed_procedures"] = snapshot.agent_catalog.resolve_allowed_procedures(
+                agent_id,
+                snapshot.procedure_catalog,
+            )
         formalized = controller.state.formalized_task
         if formalized is not None:
             payload["formalized_task"] = formalized.text
