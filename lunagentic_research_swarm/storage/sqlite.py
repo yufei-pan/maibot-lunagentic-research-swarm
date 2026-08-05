@@ -178,18 +178,46 @@ class SQLiteStateStore:
     async def list_due_outbox(self, now: float, *, limit: int = 100) -> tuple[dict[str, Any], ...]:
         return await self._call(self._list_due_outbox_sync, float(now), int(limit))
 
-    async def complete_outbox_append(self, outbox_id: str, trigger: Mapping[str, Any], *, delivered_at: float) -> None:
+    async def claim_due_outbox(
+        self, now: float, *, lease_seconds: float = 60.0, limit: int = 100
+    ) -> tuple[dict[str, Any], ...]:
+        """Atomically claim due rows for one delivery worker.
+
+        The claim is serialized by ``BEGIN IMMEDIATE`` so two processes cannot
+        select the same pending row.  Expired in-flight rows are eligible for
+        reclaim; the returned ``_lease_until`` marker is used by completion
+        mutations to reject stale workers after a reclaim.
+        """
+        return await self._call(
+            self._claim_due_outbox_sync,
+            float(now),
+            max(0.001, float(lease_seconds)),
+            max(0, int(limit)),
+        )
+
+    async def complete_outbox_append(
+        self, outbox_id: str, trigger: Mapping[str, Any], *, delivered_at: float,
+        lease_until: float | None = None,
+    ) -> None:
         await self.transact([StoreCommand("complete_outbox_append", {
             "outbox_id": outbox_id, "delivered_at": delivered_at, "trigger": dict(trigger),
+            "lease_until": lease_until,
         })])
 
-    async def mark_outbox_delivered(self, outbox_id: str, *, delivered_at: float) -> None:
-        await self.transact([StoreCommand("mark_outbox_delivered", {"outbox_id": outbox_id, "delivered_at": delivered_at})])
+    async def mark_outbox_delivered(
+        self, outbox_id: str, *, delivered_at: float, lease_until: float | None = None,
+    ) -> None:
+        await self.transact([StoreCommand("mark_outbox_delivered", {
+            "outbox_id": outbox_id, "delivered_at": delivered_at, "lease_until": lease_until,
+        })])
 
-    async def mark_outbox_failed(self, outbox_id: str, *, attempt_count: int, next_attempt_at: float, error: str) -> None:
+    async def mark_outbox_failed(
+        self, outbox_id: str, *, attempt_count: int, next_attempt_at: float, error: str,
+        lease_until: float | None = None,
+    ) -> None:
         await self.transact([StoreCommand("mark_outbox_failed", {
             "outbox_id": outbox_id, "attempt_count": attempt_count,
-            "next_attempt_at": next_attempt_at, "last_error": error,
+            "next_attempt_at": next_attempt_at, "last_error": error, "lease_until": lease_until,
         })])
 
     def _open_sync(self) -> None:
@@ -585,26 +613,44 @@ class SQLiteStateStore:
 
     @staticmethod
     def _mark_outbox_delivered(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        where = "outbox_id = ?"
+        params: list[Any] = [values["delivered_at"], values["outbox_id"]]
+        if values.get("lease_until") is not None:
+            where += " AND UPPER(status) = 'IN_FLIGHT' AND next_attempt_at = ?"
+            params.append(values["lease_until"])
         cursor = connection.execute(
-            "UPDATE maisaka_outbox SET status = 'delivered', delivered_at = ?, last_error = NULL WHERE outbox_id = ?",
-            (values["delivered_at"], values["outbox_id"]),
+            f"UPDATE maisaka_outbox SET status = 'delivered', delivered_at = ?, last_error = NULL WHERE {where}",
+            params,
         )
         _require_single_target(cursor, target_kind="Outbox", target_id=values["outbox_id"])
 
     @staticmethod
     def _mark_outbox_failed(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        where = "outbox_id = ?"
+        params: list[Any] = [
+            values["attempt_count"], values["next_attempt_at"], values["last_error"], values["outbox_id"]
+        ]
+        if values.get("lease_until") is not None:
+            where += " AND UPPER(status) = 'IN_FLIGHT' AND next_attempt_at = ?"
+            params.append(values["lease_until"])
         cursor = connection.execute(
-            "UPDATE maisaka_outbox SET status = 'pending', attempt_count = ?, next_attempt_at = ?, last_error = ? WHERE outbox_id = ?",
-            (values["attempt_count"], values["next_attempt_at"], values["last_error"], values["outbox_id"]),
+            "UPDATE maisaka_outbox SET status = 'pending', attempt_count = ?, next_attempt_at = ?, last_error = ? "
+            f"WHERE {where}",
+            params,
         )
         _require_single_target(cursor, target_kind="Outbox", target_id=values["outbox_id"])
 
     @staticmethod
     def _complete_outbox_append(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
         outbox_id = values["outbox_id"]
+        where = "outbox_id = ?"
+        params: list[Any] = [values["delivered_at"], outbox_id]
+        if values.get("lease_until") is not None:
+            where += " AND UPPER(status) = 'IN_FLIGHT' AND next_attempt_at = ?"
+            params.append(values["lease_until"])
         cursor = connection.execute(
-            "UPDATE maisaka_outbox SET status = 'delivered', delivered_at = ?, last_error = NULL WHERE outbox_id = ?",
-            (values["delivered_at"], outbox_id),
+            f"UPDATE maisaka_outbox SET status = 'delivered', delivered_at = ?, last_error = NULL WHERE {where}",
+            params,
         )
         _require_single_target(cursor, target_kind="Outbox", target_id=outbox_id)
         trigger = values["trigger"]
@@ -911,3 +957,47 @@ class SQLiteStateStore:
             (now, limit),
         ).fetchall()
         return tuple(dict(row) for row in rows)
+
+    def _claim_due_outbox_sync(self, now: float, lease_seconds: float, limit: int) -> tuple[dict[str, Any], ...]:
+        connection = self._require_connection()
+        if limit <= 0:
+            return ()
+        lease_until = now + lease_seconds
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                """SELECT o.outbox_id FROM maisaka_outbox AS o
+                   WHERE o.next_attempt_at <= ?
+                     AND (UPPER(o.status) = 'PENDING'
+                          OR (UPPER(o.status) = 'IN_FLIGHT' AND o.next_attempt_at <= ?))
+                   ORDER BY o.next_attempt_at, o.created_at, o.outbox_id LIMIT ?""",
+                (now, now, limit),
+            ).fetchall()
+            outbox_ids = tuple(str(row[0]) for row in rows)
+            if not outbox_ids:
+                connection.commit()
+                return ()
+            placeholders = ",".join("?" for _ in outbox_ids)
+            connection.execute(
+                f"UPDATE maisaka_outbox SET status = 'IN_FLIGHT', next_attempt_at = ? "
+                f"WHERE outbox_id IN ({placeholders}) AND (UPPER(status) = 'PENDING' "
+                "OR (UPPER(status) = 'IN_FLIGHT' AND next_attempt_at <= ?))",
+                (lease_until, *outbox_ids, now),
+            )
+            claimed = connection.execute(
+                f"""SELECT o.*, t.stream_id FROM maisaka_outbox AS o
+                    JOIN tasks AS t ON t.task_id = o.task_id
+                    WHERE o.outbox_id IN ({placeholders}) AND UPPER(o.status) = 'IN_FLIGHT'
+                    ORDER BY o.next_attempt_at, o.created_at, o.outbox_id""",
+                outbox_ids,
+            ).fetchall()
+            connection.commit()
+            result = []
+            for row in claimed:
+                item = dict(row)
+                item["_lease_until"] = lease_until
+                result.append(item)
+            return tuple(result)
+        except BaseException:
+            connection.rollback()
+            raise

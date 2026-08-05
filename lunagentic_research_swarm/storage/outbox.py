@@ -25,11 +25,13 @@ class MaisakaOutbox:
         *,
         poll_interval_seconds: float = 2.0,
         poll_interval: float | None = None,
+        lease_seconds: float = 60.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.store = store
         self.maisaka = maisaka
         self.poll_interval_seconds = max(0.1, float(poll_interval_seconds if poll_interval is None else poll_interval))
+        self.lease_seconds = max(0.001, float(lease_seconds))
         self.clock = clock
         self._wake_event = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
@@ -60,7 +62,17 @@ class MaisakaOutbox:
         """Attempt currently due rows and return the number attempted."""
 
         async with self._lock:
-            rows = await self.store.list_due_outbox(float(self.clock()))
+            now = float(self.clock())
+            claim = getattr(self.store, "claim_due_outbox", None)
+            if callable(claim):
+                try:
+                    rows = await claim(now, lease_seconds=self.lease_seconds, limit=100)
+                except (AttributeError, TypeError):
+                    # Lightweight fake stores used by plugin tests may expose
+                    # only list_due_outbox and therefore cannot claim leases.
+                    rows = await self.store.list_due_outbox(now)
+            else:
+                rows = await self.store.list_due_outbox(now)
             attempted = 0
             for row in rows:
                 attempted += 1
@@ -97,12 +109,15 @@ class MaisakaOutbox:
             await self._append(stream_id, payload, row)
             trigger = self._trigger_row(row, payload)
             await self.store.complete_outbox_append(
-                str(row["outbox_id"]), trigger, delivered_at=float(self.clock())
+                str(row["outbox_id"]), trigger, delivered_at=float(self.clock()),
+                **self._lease_kwargs(row),
             )
             return
         if kind in {"trigger", "trigger_report_review"}:
             await self._trigger(stream_id, payload, row)
-            await self.store.mark_outbox_delivered(str(row["outbox_id"]), delivered_at=float(self.clock()))
+            await self.store.mark_outbox_delivered(
+                str(row["outbox_id"]), delivered_at=float(self.clock()), **self._lease_kwargs(row)
+            )
             return
         raise ValueError(f"unknown Maisaka outbox delivery kind: {kind}")
 
@@ -126,6 +141,13 @@ class MaisakaOutbox:
         metadata = payload.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
+        else:
+            metadata = dict(metadata)
+        metadata["outbox_id"] = str(row["outbox_id"])
+        if row.get("report_id") is not None:
+            metadata["report_id"] = str(row["report_id"])
+        if row.get("idempotency_key") is not None:
+            metadata["idempotency_key"] = str(row["idempotency_key"])
         intent = str(payload.get("intent") or "review_lrs_report")
         reason = str(payload.get("reason") or "")
         capability = getattr(getattr(self.maisaka, "proactive", None), "trigger", None)
@@ -178,7 +200,13 @@ class MaisakaOutbox:
             str(row["outbox_id"]), attempt_count=attempt,
             next_attempt_at=float(self.clock()) + delay,
             error=f"{type(exc).__name__}: {exc}"[:1000],
+            **self._lease_kwargs(row),
         )
+
+    @staticmethod
+    def _lease_kwargs(row: Mapping[str, Any]) -> dict[str, float]:
+        lease_until = row.get("_lease_until")
+        return {"lease_until": float(lease_until)} if lease_until is not None else {}
 
 
 __all__ = ["MaisakaOutbox"]
