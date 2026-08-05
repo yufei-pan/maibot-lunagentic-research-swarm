@@ -5,12 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 from lunagentic_research_swarm.runtime.reducer import (
+    ArmDeadline,
+    ArmPauseExpiry,
+    DeliverOutbox,
     NotifyToolWaiter,
     OpenReportEpoch,
     PerformAgentCall,
     PerformBranchSummary,
     PerformFormalization,
     PerformProcedureBatch,
+    ReleaseRawContext,
 )
 
 
@@ -60,8 +64,21 @@ class RuntimeEffectRunner:
         if isinstance(effect, OpenReportEpoch):
             await manager.handle_runtime_effect(effect)
             return None
-        if isinstance(effect, NotifyToolWaiter) and effect.payload.get("action") == "materialize_child":
-            await manager.materialize_child_effect(effect)
+        if isinstance(effect, ArmDeadline):
+            await manager.arm_deadline_effect(effect)
+            return None
+        if isinstance(effect, ArmPauseExpiry):
+            await manager.arm_pause_expiry_effect(effect)
+            return None
+        if isinstance(effect, ReleaseRawContext):
+            await manager.release_raw_context_effect(effect)
+            return None
+        if isinstance(effect, DeliverOutbox):
+            await manager.deliver_outbox_effect(effect)
+            return None
+        if isinstance(effect, NotifyToolWaiter):
+            await manager.notify_tool_waiter_effect(effect)
+            return None
         return None
 
     __call__ = run

@@ -17,7 +17,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lunagentic_research_swarm.llm.gateway import resolve_generation_selector
+from lunagentic_research_swarm.llm.pricing import TokenUsage, charge
 from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
+from lunagentic_research_swarm.llm.tokens import estimate_prompt_tokens
 from lunagentic_research_swarm.models import (
     BranchLifecycle,
     BranchRuntime,
@@ -31,7 +33,7 @@ from lunagentic_research_swarm.models import (
 )
 from lunagentic_research_swarm.runtime.context import RuntimeHeader, StablePromptBuilder, release_raw_context
 from lunagentic_research_swarm.runtime.controller import TaskController
-from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage
+from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage, reserve_input
 from lunagentic_research_swarm.runtime.epochs import ReportCoordinator, ReportRecord
 from lunagentic_research_swarm.runtime.events import (
     AllInflightSettled,
@@ -50,11 +52,15 @@ from lunagentic_research_swarm.runtime.events import (
     StopRequested,
 )
 from lunagentic_research_swarm.runtime.reducer import (
+    ArmDeadline,
+    ArmPauseExpiry,
+    DeliverOutbox,
     NotifyToolWaiter,
     OpenReportEpoch,
     PerformAgentCall,
     PerformBranchSummary,
     PerformFormalization,
+    ReleaseRawContext,
     RuntimeState,
 )
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
@@ -95,6 +101,7 @@ class ResearchManager:
         feedback_service: Any | None = None,
         statistics: Any | None = None,
         summarizer_selector: str = "task:mid_memory",
+        outbox: Any | None = None,
     ) -> None:
         self.ctx, self.store, self.summarizer, self.scheduler = ctx, store, summarizer, scheduler
         self._snapshot_provider = snapshot_provider
@@ -108,6 +115,10 @@ class ResearchManager:
         self._branches: dict[str, dict[str, dict[str, Any]]] = {}
         self._jobs: dict[str, set[asyncio.Task[Any]]] = {}
         self._pause_jobs: dict[str, asyncio.Task[Any]] = {}
+        self._deadline_jobs: dict[str, asyncio.Task[Any]] = {}
+        self._grace_jobs: dict[str, asyncio.Task[Any]] = {}
+        self._tool_notifications: dict[str, list[dict[str, Any]]] = {}
+        self._tool_waiter_events: dict[str, asyncio.Event] = {}
         # Effects and worker adapters register one coordinator per task.  The
         # coordinator owns ephemeral report/branch state; TaskController stays
         # the sole authority for durable RuntimeState transitions.
@@ -121,6 +132,7 @@ class ResearchManager:
         self._feedback_service = feedback_service
         self.statistics = statistics
         self._summarizer_selector = str(summarizer_selector or "task:mid_memory")
+        self.outbox = outbox
         self._shutting_down = False
 
     async def start(
@@ -269,6 +281,7 @@ class ResearchManager:
                 StoreCommand("insert_vector_job", {"job_id": f"vec_{uuid.uuid4().hex}", "source_kind": "formalized_task", "source_id": task_id, "generation": 0, "status": "PENDING", "created_at": now}),
                 StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": controller.state.active_round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": 0, "created_at": now}),
             )
+            deadline_at = self._coordinator_deadline_at(task_id, fallback=now + float(time_budget_seconds))
             accepted = await controller.apply(
                 FormalizationSucceeded(
                     _event_id(), task_id, controller.state.active_round_id or "", controller.state.generation,
@@ -280,6 +293,16 @@ class ResearchManager:
                         task_id, controller.state.active_round_id, controller.state.generation,
                         payload={"root": True, "branch_id": branch_id, "formalized_text": formalized.text, "credit_balance": credits},
                     ),
+                    ArmDeadline(
+                        task_id,
+                        controller.state.active_round_id,
+                        controller.state.generation,
+                        priority="barrier",
+                        payload={
+                            "due_at": deadline_at,
+                            "kind": "report_deadline",
+                        },
+                    ),
                 ),
                 state_changes={"active_leaves": {branch_id: credits}},
             )
@@ -287,6 +310,12 @@ class ResearchManager:
                 self._branches[task_id].pop(branch_id, None)
                 self.report_coordinators.pop(task_id, None)
                 return
+            self._arm_deadline_timer(
+                task_id,
+                due_at=deadline_at,
+                round_id=str(controller.state.active_round_id or ""),
+                generation=controller.state.generation,
+            )
         except Exception as exc:
             if prepared_branch_id is not None:
                 self._branches.get(task_id, {}).pop(prepared_branch_id, None)
@@ -349,10 +378,14 @@ class ResearchManager:
                 _event_id(), task_id, controller.state.active_round_id or "", controller.state.generation
             ),
         )
-        self._pause_jobs[task_id] = asyncio.create_task(self._expiry_wait(task_id))
+        # Prefer ArmPauseExpiry (expires_at from PauseRequested). Fallback only when
+        # that effect was not armed (e.g. expires_at omitted).
+        if task_id not in self._pause_jobs or self._pause_jobs[task_id].done():
+            self._pause_jobs[task_id] = asyncio.create_task(self._expiry_wait(task_id))
 
-    async def _expiry_wait(self, task_id: str) -> None:
-        await asyncio.sleep(self._pause_timeout_seconds)
+    async def _expiry_wait(self, task_id: str, *, due_at: float | None = None) -> None:
+        target = float(due_at) if due_at is not None else (_now() + self._pause_timeout_seconds)
+        await self._sleep_until(target, clock=_now)
         await self.expire_pause(task_id)
 
     async def expire_pause(self, task_id: str) -> None:
@@ -376,8 +409,15 @@ class ResearchManager:
             StopRequested(_event_id(), task_id, state.active_round_id or "", state.generation, reason=reason),
         )
         self.scheduler.cancel_generation(task_id, state.generation)
+        self._cancel_timer_jobs(task_id)
         self._branches[task_id].clear()
         return self._status(controller)
+
+    def _cancel_timer_jobs(self, task_id: str) -> None:
+        for bucket in (self._deadline_jobs, self._grace_jobs, self._pause_jobs):
+            job = bucket.pop(task_id, None)
+            if job is not None and not job.done():
+                job.cancel()
 
     async def add_context(self, task_id: str, context: str, *, stream_id: str | None = None) -> dict[str, Any]:
         await self._assert_stream_owner(task_id, stream_id)
@@ -438,7 +478,13 @@ class ResearchManager:
             )
             self.scheduler.resume_task(task_id)
             return {**self._status(controller), "effective_time_budget_seconds": effective_time}
-        if not branches and state.status in {TaskStatus.STOPPED, TaskStatus.EXPIRED, TaskStatus.COMPLETED, TaskStatus.FAILED}:
+        if not branches and state.status in {
+            TaskStatus.STOPPED,
+            TaskStatus.EXPIRED,
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.COMPLETED_WITH_ERRORS,
+        }:
             if state.formalized_task is None:
                 return {"success": False, "error": {"code": "task_not_formalized", "message": "任务尚未形式化"}}
             restarted = await self._restart_round(task_id, float(credit_adjustment), effective_time)
@@ -521,6 +567,7 @@ class ResearchManager:
             grace_period_seconds=self._grace_period_seconds, catalog_fingerprint=snapshot.agent_catalog.fingerprint,
         )
         try:
+            deadline_at = self._coordinator_deadline_at(task_id, fallback=now + float(time_budget_seconds))
             accepted = await controller.apply(
                 event,
                 extra_commands=(
@@ -528,6 +575,16 @@ class ResearchManager:
                 ),
                 effects=(
                     PerformAgentCall(task_id, round_id, generation, payload={"root": True, "branch_id": branch_id, "formalized_text": state.formalized_task.text, "summary_layer": summary_context}),
+                    ArmDeadline(
+                        task_id,
+                        round_id,
+                        generation,
+                        priority="barrier",
+                        payload={
+                            "due_at": deadline_at,
+                            "kind": "report_deadline",
+                        },
+                    ),
                 ),
                 state_changes={"active_leaves": {branch_id: credits}, "raw_context_released": False},
             )
@@ -550,7 +607,18 @@ class ResearchManager:
             )
             return False
         self._round_numbers[task_id] = number
+        self._arm_deadline_timer(
+            task_id,
+            due_at=deadline_at,
+            round_id=round_id,
+            generation=generation,
+        )
         return True
+
+    def _coordinator_deadline_at(self, task_id: str, *, fallback: float) -> float:
+        coordinator = self.report_coordinators.get(task_id)
+        due = getattr(coordinator, "deadline_at", None) if coordinator is not None else None
+        return float(due) if due is not None else float(fallback)
 
     async def handle_runtime_event(self, event: Any) -> None:
         if isinstance(event, ReportDeadlineReached):
@@ -569,9 +637,25 @@ class ResearchManager:
         # next procedure/materialization phase after its transaction commits.
         await self._submit(controller, event)
         self._sync_branch_credits(event.task_id, controller)
+        self._sync_branch_messages_from_event(event)
+
+    def _sync_branch_messages_from_event(self, event: Any) -> None:
+        """Apply compacted/rewritten parent messages after procedure completion."""
+
+        messages = getattr(event, "parent_messages", None)
+        branch_id = getattr(event, "branch_id", None)
+        task_id = getattr(event, "task_id", None)
+        if not messages or not branch_id or not task_id:
+            return
+        branch = self._branches.get(task_id, {}).get(branch_id)
+        if branch is not None:
+            branch["messages"] = [dict(item) for item in messages]
+        coordinator = self.report_coordinators.get(task_id)
+        if coordinator is not None and branch_id in coordinator.branches:
+            coordinator.branches[branch_id].messages[:] = [dict(item) for item in messages]
 
     async def prepare_agent_effect(self, effect: PerformAgentCall) -> PerformAgentCall:
-        """Fill a scheduled agent effect from its task's frozen round snapshot."""
+        """Fill a scheduled agent effect and reserve research input credits."""
 
         controller = self._controllers.get(effect.task_id)
         if controller is None or effect.round_id != controller.state.active_round_id or effect.generation != controller.state.generation:
@@ -594,16 +678,52 @@ class ResearchManager:
                 if item is not None and self._agent_is_live(item.definition.agent_id, snapshot)
             )
         )
+        messages = tuple(dict(item) for item in branch.get("messages", ()))
+        protocol = str(getattr(definition, "protocol", "json_envelope"))
+        call_id = str(effect.payload.get("call_id") or new_call_id())
+        balance_before = float(branch.get("credits", 0.0))
+        estimated_charge, prompt_tokens, cache_hit, cache_miss, resolved = self._estimate_agent_reservation(
+            snapshot=snapshot,
+            selector=selector,
+            messages=messages,
+            protocol=protocol,
+        )
+        credits_after_reservation = balance_before - estimated_charge
+        usage_id = f"usage_{call_id}"
+        ledger_id = f"ledger_{call_id}"
+        reservation = reserve_input(
+            estimated_charge,
+            task_id=effect.task_id,
+            round_id=str(effect.round_id or ""),
+            branch_id=branch_id,
+            call_id=call_id,
+            usage_id=usage_id,
+            ledger_id=ledger_id,
+            role="agent",
+            selector=selector,
+            estimated_model_name=resolved.model_name if resolved is not None else None,
+            price_source=resolved.source if resolved is not None else "host_config",
+            price_fingerprint=str(getattr(getattr(snapshot, "price_catalog", None), "fingerprint", "") or ""),
+            prompt_tokens=prompt_tokens,
+            cache_hit_tokens=cache_hit,
+            cache_miss_tokens=cache_miss,
+            balance_after=credits_after_reservation,
+            metadata={"event_type": "AgentCallReserved", "agent_id": agent_id},
+            created_at=_now(),
+        )
+        await self.store.transact(reservation.commands)
+        branch["credits"] = credits_after_reservation
         payload = dict(effect.payload)
         payload.update(
             {
                 "branch_id": branch_id,
                 "agent_id": agent_id,
-                "call_id": str(payload.get("call_id") or new_call_id()),
+                "call_id": call_id,
                 "selector": selector,
-                "protocol": str(getattr(definition, "protocol", "json_envelope")),
-                "messages": tuple(dict(item) for item in branch.get("messages", ())),
-                "credits_after_reservation": float(branch.get("credits", 0.0)),
+                "protocol": protocol,
+                "messages": messages,
+                "estimated_charge": estimated_charge,
+                "credits_after_reservation": credits_after_reservation,
                 "branch_depth": int(branch.get("depth", 0)),
                 "live_agent_ids": live_ids,
                 "max_delegations_per_turn": int(self._runtime_limits.get("max_delegations_per_turn", 8)),
@@ -613,6 +733,50 @@ class ResearchManager:
             }
         )
         return replace(effect, payload=payload)
+
+    def _estimate_agent_reservation(
+        self,
+        *,
+        snapshot: Any,
+        selector: str,
+        messages: tuple[dict[str, Any], ...],
+        protocol: str,
+    ) -> tuple[float, int, int, int, Any]:
+        """Estimate input-only research credits before an agent LLM call."""
+
+        tools = None
+        if protocol == "native_tools":
+            try:
+                from lunagentic_research_swarm.llm.protocol import SWARM_TURN_TOOLS
+
+                tools = SWARM_TURN_TOOLS
+            except Exception:
+                tools = None
+        token_est = estimate_prompt_tokens(messages, tools)
+        catalog = getattr(snapshot, "price_catalog", None)
+        resolved = None
+        estimated_charge = 0.0
+        if catalog is not None:
+            try:
+                resolved = catalog.estimate_model_for_selector(selector)
+                usage = TokenUsage(
+                    token_est.prompt_tokens,
+                    0,
+                    token_est.cache_hit_tokens,
+                    token_est.cache_miss_tokens,
+                    source="estimated",
+                )
+                estimated_charge = float(charge(resolved.profile, usage))
+            except Exception:
+                estimated_charge = 0.0
+                resolved = None
+        return (
+            estimated_charge,
+            int(token_est.prompt_tokens),
+            int(token_est.cache_hit_tokens),
+            int(token_est.cache_miss_tokens),
+            resolved,
+        )
 
     async def prepare_procedure_effect(self, effect: Any) -> Any:
         """Attach the procedure catalog frozen for this task round."""
@@ -635,6 +799,9 @@ class ResearchManager:
         payload["procedure_catalog_fingerprint"] = str(
             getattr(snapshot.procedure_catalog, "fingerprint", "")
         )
+        formalized = controller.state.formalized_task
+        if formalized is not None:
+            payload["formalized_task"] = formalized.text
         return replace(effect, payload=payload)
 
     def _agent_is_live(self, agent_id: str, snapshot: Any) -> bool:
@@ -718,7 +885,7 @@ class ResearchManager:
                 parent_branch_id=str(payload.get("parent_branch_id") or "") or None,
             )
         reason = str(payload.get("reason", "no_further_work"))
-        checkpoint = reason in {"checkpoint", "compact"}
+        checkpoint = reason == "checkpoint"
         await coordinator.on_branch_safe_point(
             branch_id,
             checkpoint=checkpoint,
@@ -798,7 +965,217 @@ class ResearchManager:
         current = getattr(coordinator, "current_epoch", None)
         if current is not None and getattr(current, "epoch", None) == epoch:
             return
-        await coordinator.open_epoch(epoch=epoch)
+        opened = await coordinator.open_epoch(epoch=epoch)
+        grace_due = getattr(opened, "grace_deadline_at", None)
+        if grace_due is not None:
+            self._arm_grace_timer(
+                effect.task_id,
+                due_at=float(grace_due),
+                round_id=str(effect.round_id or ""),
+                generation=effect.generation,
+                epoch=int(getattr(opened, "epoch", epoch)),
+            )
+
+    async def arm_deadline_effect(self, effect: ArmDeadline) -> None:
+        """Arm wall-clock report deadline or grace from a committed effect."""
+
+        kind = str(effect.payload.get("kind") or "report_deadline")
+        due_at = effect.payload.get("due_at")
+        if due_at is None:
+            coordinator = self.report_coordinators.get(effect.task_id)
+            if coordinator is None:
+                return
+            if kind == "grace":
+                current = getattr(coordinator, "current_epoch", None)
+                due_at = getattr(current, "grace_deadline_at", None)
+            else:
+                due_at = getattr(coordinator, "deadline_at", None)
+        if due_at is None:
+            return
+        if kind == "grace":
+            self._arm_grace_timer(
+                effect.task_id,
+                due_at=float(due_at),
+                round_id=str(effect.round_id or ""),
+                generation=effect.generation,
+                epoch=effect.payload.get("epoch"),
+            )
+            return
+        self._arm_deadline_timer(
+            effect.task_id,
+            due_at=float(due_at),
+            round_id=str(effect.round_id or ""),
+            generation=effect.generation,
+        )
+
+    async def arm_pause_expiry_effect(self, effect: ArmPauseExpiry) -> None:
+        """Arm pause expiry at the durable ``expires_at`` / ``due_at``."""
+
+        due_at = effect.payload.get("due_at")
+        if due_at is None:
+            due_at = _now() + self._pause_timeout_seconds
+        previous = self._pause_jobs.pop(effect.task_id, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._pause_jobs[effect.task_id] = asyncio.create_task(
+            self._expiry_wait(effect.task_id, due_at=float(due_at))
+        )
+
+    async def release_raw_context_effect(self, effect: ReleaseRawContext) -> None:
+        """Release ephemeral raw branch messages after a terminal transition."""
+
+        coordinator = self.report_coordinators.get(effect.task_id)
+        if coordinator is not None:
+            for branch in list(coordinator.branches.values()):
+                release_raw_context(branch)
+        branches = self._branches.get(effect.task_id)
+        if branches is not None:
+            for branch in branches.values():
+                messages = branch.get("messages")
+                if isinstance(messages, list):
+                    messages.clear()
+
+    async def deliver_outbox_effect(self, effect: DeliverOutbox) -> None:
+        """Wake the Maisaka outbox poller after a durable report delivery intent."""
+
+        del effect
+        outbox = self.outbox
+        if outbox is None:
+            return
+        wake = getattr(outbox, "wake", None)
+        if callable(wake):
+            wake()
+
+    async def notify_tool_waiter_effect(self, effect: NotifyToolWaiter) -> None:
+        """Deliver tool-waiter notifications, including error payloads."""
+
+        if effect.payload.get("action") == "materialize_child":
+            await self.materialize_child_effect(effect)
+            return
+        payload = dict(effect.payload)
+        self._tool_notifications.setdefault(effect.task_id, []).append(payload)
+        waiter = self._tool_waiter_events.get(effect.task_id)
+        if waiter is not None:
+            waiter.set()
+
+    def register_tool_waiter(self, task_id: str) -> asyncio.Event:
+        """Register an in-process waiter for non-materialize NotifyToolWaiter effects."""
+
+        event = asyncio.Event()
+        self._tool_waiter_events[task_id] = event
+        return event
+
+    def _arm_deadline_timer(
+        self,
+        task_id: str,
+        *,
+        due_at: float,
+        round_id: str,
+        generation: int,
+    ) -> None:
+        previous = self._deadline_jobs.pop(task_id, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._deadline_jobs[task_id] = asyncio.create_task(
+            self._deadline_wait(task_id, due_at=due_at, round_id=round_id, generation=generation)
+        )
+
+    def _arm_grace_timer(
+        self,
+        task_id: str,
+        *,
+        due_at: float,
+        round_id: str,
+        generation: int,
+        epoch: Any,
+    ) -> None:
+        previous = self._grace_jobs.pop(task_id, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._grace_jobs[task_id] = asyncio.create_task(
+            self._grace_wait(
+                task_id,
+                due_at=due_at,
+                round_id=round_id,
+                generation=generation,
+                epoch=None if epoch is None else int(epoch),
+            )
+        )
+
+    async def _deadline_wait(
+        self,
+        task_id: str,
+        *,
+        due_at: float,
+        round_id: str,
+        generation: int,
+    ) -> None:
+        clock = self._task_clock(task_id)
+        await self._sleep_until(due_at, clock=clock)
+        controller = self._controllers.get(task_id)
+        if controller is None:
+            return
+        if controller.state.generation != generation or controller.state.active_round_id != round_id:
+            return
+        if controller.state.status is not TaskStatus.RUNNING:
+            return
+        await self.handle_runtime_event(
+            ReportDeadlineReached(
+                _event_id(),
+                task_id,
+                round_id,
+                generation,
+                epoch=controller.state.report_epoch + 1,
+            )
+        )
+
+    async def _grace_wait(
+        self,
+        task_id: str,
+        *,
+        due_at: float,
+        round_id: str,
+        generation: int,
+        epoch: int | None,
+    ) -> None:
+        clock = self._task_clock(task_id)
+        await self._sleep_until(due_at, clock=clock)
+        controller = self._controllers.get(task_id)
+        if controller is None:
+            return
+        if controller.state.generation != generation or controller.state.active_round_id != round_id:
+            return
+        if controller.state.status is not TaskStatus.REPORTING:
+            return
+        await self.handle_runtime_event(
+            GraceExpired(
+                _event_id(),
+                task_id,
+                round_id,
+                generation,
+                epoch=epoch if epoch is not None else controller.state.report_epoch,
+            )
+        )
+
+    def _task_clock(self, task_id: str) -> Any:
+        coordinator = self.report_coordinators.get(task_id)
+        clock = getattr(coordinator, "clock", None)
+        return clock if callable(clock) else _now
+
+    @staticmethod
+    async def _sleep_until(due_at: float, *, clock: Any) -> None:
+        """Sleep until ``clock()`` reaches ``due_at``, re-checking in short slices.
+
+        Production uses wall-clock ``time.time``. Integration harnesses may swap
+        in a fake clock; short sleeps keep the wait cancellable without requiring
+        tests to inject deadline events for proving arming exists.
+        """
+
+        while True:
+            remaining = float(due_at) - float(clock())
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 0.05))
 
     async def _on_report_synthesis_complete(self, task_id: str, record: ReportRecord) -> None:
         """Return a committed coordinator report to the sole state controller."""
@@ -988,17 +1365,23 @@ class ResearchManager:
         for bucket in self._jobs.values():
             tasks.update(task for task in bucket if not task.done())
         tasks.update(task for task in self._pause_jobs.values() if not task.done())
+        tasks.update(task for task in self._deadline_jobs.values() if not task.done())
+        tasks.update(task for task in self._grace_jobs.values() if not task.done())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._jobs.clear()
         self._pause_jobs.clear()
+        self._deadline_jobs.clear()
+        self._grace_jobs.clear()
         self._branches.clear()
         self.report_coordinators.clear()
         self._round_snapshots.clear()
         self._prompt_builders.clear()
         self._bot_profiles.clear()
+        self._tool_notifications.clear()
+        self._tool_waiter_events.clear()
 
     async def status(self, task_id: str, *, stream_id: str | None = None) -> dict[str, Any]:
         await self._assert_stream_owner(task_id, stream_id)

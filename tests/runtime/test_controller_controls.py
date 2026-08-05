@@ -248,7 +248,9 @@ async def test_continue_without_leaves_starts_new_generation_from_summary_layer_
     assert result["status"] == "RUNNING"
     assert result["round_number"] == 2
     assert result["generation"] == first["generation"] + 2
-    root_effect = scheduler.enqueued[-1]
+    from lunagentic_research_swarm.runtime.reducer import PerformAgentCall
+
+    root_effect = next(effect for effect in reversed(scheduler.enqueued) if isinstance(effect, PerformAgentCall))
     serialized = repr(dict(root_effect.payload))
     assert "跨 round 资料" in serialized
     assert "debug" not in serialized

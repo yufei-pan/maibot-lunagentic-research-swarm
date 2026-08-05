@@ -499,6 +499,7 @@ class LRSServiceContainer:
             feedback_service=self.feedback,
             statistics=self.statistics,
             summarizer_selector=summarizer_selector,
+            outbox=self.outbox,
         )
         runner.bind_manager(manager)
         self._effect_runner = runner

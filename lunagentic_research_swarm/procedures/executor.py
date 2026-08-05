@@ -21,6 +21,8 @@ from pydantic import BaseModel, ValidationError
 
 from lunagentic_research_swarm.extensions.contracts import ProcedureInvocation, ProcedureResult
 from lunagentic_research_swarm.procedures.core import (
+    CORE_COMPACT_ID,
+    CoreProcedureContext,
     execute_core_procedure,
     split_procedure_requests,
 )
@@ -612,14 +614,27 @@ class ProcedureExecutor:
         effect: Any,
         requests: Sequence[Any] | None = None,
     ) -> ProcedureBatchCompleted:
-        """并发调用普通 Procedure，并按输入顺序生成 ``ProcedureBatchCompleted``。"""
+        """并发调用普通 Procedure，执行 core.compact，并按输入顺序生成完成事件。"""
 
         context = self._context(effect)
+        payload = dict(self._effect_payload(effect))
         all_requests = self._requests(effect, requests)
         ordinary, controls = split_procedure_requests(all_requests)
-        results = tuple(
+        results = list(
             await asyncio.gather(*(self._invoke_one(request, context, index) for index, request in enumerate(ordinary)))
         )
+        parent_messages = tuple(dict(item) for item in payload.get("messages", ()) if isinstance(item, Mapping))
+        if controls.compact and not controls.terminate:
+            compact_result = await self._execute_compact(context=context, payload=payload, messages=parent_messages)
+            results.append(compact_result)
+            data = getattr(compact_result.result, "data", None)
+            if (
+                bool(getattr(compact_result.result, "success", False))
+                and isinstance(data, Mapping)
+                and data.get("compacted")
+            ):
+                summary = str(data.get("summary") or "")
+                parent_messages = self._rewrite_compacted_messages(parent_messages, summary)
         result_id = "proc_result_" + _fingerprint([item.as_dict() for item in results])[:56]
         event_id = (
             context["event_id"]
@@ -641,9 +656,64 @@ class ProcedureExecutor:
             branch_id=context["branch_id"],
             call_id=context["call_id"],
             result_id=result_id,
-            results=results,
+            results=tuple(results),
             controls=controls,
+            parent_messages=parent_messages,
         )
+
+    async def _execute_compact(
+        self,
+        *,
+        context: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        messages: Sequence[Mapping[str, Any]],
+    ) -> ProcedureExecutionResult:
+        request_id = "core_compact_" + _fingerprint(
+            {
+                "task_id": context["task_id"],
+                "round_id": context["round_id"],
+                "call_id": context["call_id"],
+                "branch_id": context["branch_id"],
+            }
+        )[:48]
+        started = time.perf_counter()
+        formalized = payload.get("formalized_task")
+        history = tuple(dict(item) for item in messages)
+        result = await execute_core_procedure(
+            CORE_COMPACT_ID,
+            {},
+            summarizer=self.summarizer,
+            context=CoreProcedureContext(formalized_task=formalized, branch_history=history),
+        )
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        return ProcedureExecutionResult(
+            CORE_COMPACT_ID,
+            request_id,
+            result,
+            "core",
+            "",
+            "1",
+            1,
+            duration_ms,
+        )
+
+    @staticmethod
+    def _rewrite_compacted_messages(
+        messages: Sequence[Mapping[str, Any]],
+        summary: str,
+    ) -> tuple[dict[str, Any], ...]:
+        """Keep stable system/formalized prefix; replace mutable history with compact summary."""
+
+        prefix: list[dict[str, Any]] = []
+        index = 0
+        if index < len(messages) and str(messages[index].get("role", "")) == "system":
+            prefix.append(dict(messages[index]))
+            index += 1
+        if index < len(messages) and str(messages[index].get("role", "")) == "user":
+            prefix.append(dict(messages[index]))
+            index += 1
+        prefix.append({"role": "assistant", "content": f"分支压缩摘要：{summary}"})
+        return tuple(prefix)
 
 
 def bundled_procedure_invoker(provider: Any) -> LocalProcedureInvoker:

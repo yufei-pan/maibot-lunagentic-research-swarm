@@ -43,6 +43,7 @@ class _Manager:
         self.effects: list[object] = []
         self.summaries: list[object] = []
         self.children: list[object] = []
+        self.notifications: list[object] = []
 
     async def prepare_agent_effect(self, effect):
         return effect
@@ -58,6 +59,12 @@ class _Manager:
 
     async def materialize_child_effect(self, effect):
         self.children.append(effect)
+
+    async def notify_tool_waiter_effect(self, effect):
+        if effect.payload.get("action") == "materialize_child":
+            await self.materialize_child_effect(effect)
+            return
+        self.notifications.append(effect)
 
 
 @pytest.mark.asyncio
@@ -98,14 +105,27 @@ async def test_runner_requires_manager_before_stateful_effect() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_materialization_notification_is_ignored() -> None:
+async def test_non_materialization_notification_is_delivered() -> None:
+    class _Manager:
+        def __init__(self) -> None:
+            self.notifications: list[object] = []
+            self.children: list[object] = []
+
+        async def notify_tool_waiter_effect(self, effect):
+            self.notifications.append(effect)
+
+        async def materialize_child_effect(self, effect):
+            self.children.append(effect)
+
     manager = _Manager()
     runner = RuntimeEffectRunner(_TurnWorker())
     runner.bind_manager(manager)
 
-    result = await runner.run(NotifyToolWaiter("task", "round", 0, payload={"action": "wake_tool"}))
+    effect = NotifyToolWaiter("task", "round", 0, payload={"action": "wake_tool", "error_code": "x"})
+    result = await runner.run(effect)
 
     assert result is None
+    assert manager.notifications == [effect]
     assert manager.children == []
 
 

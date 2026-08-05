@@ -1225,13 +1225,13 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
 
         controls = event.controls
         terminate = bool(getattr(controls, "terminate", False))
-        compact = bool(getattr(controls, "compact", False))
         checkpoint = bool(getattr(controls, "checkpoint", False))
         held = tuple(event.delegations)
+        # core.compact is executed by the procedure worker and rewrites
+        # parent_messages before this event is reduced. It must not be treated
+        # as a checkpoint hold.
         if terminate:
             reason = "terminate"
-        elif compact:
-            reason = "compact"
         elif credits_after < 0:
             reason = "negative_credit"
         elif checkpoint:
@@ -1264,7 +1264,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                     payload={
                         "branch_id": event.branch_id,
                         "reason": reason,
-                        "held_delegations": held if reason in {"compact", "checkpoint"} else (),
+                        "held_delegations": held if reason == "checkpoint" else (),
                     },
                 ),
             ),

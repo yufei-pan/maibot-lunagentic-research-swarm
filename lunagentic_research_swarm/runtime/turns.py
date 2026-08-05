@@ -370,12 +370,13 @@ class TurnWorker:
         if not isinstance(completed, ProcedureBatchCompleted):
             raise TypeError("Procedure executor 必须返回 ProcedureBatchCompleted")
         payload = effect.payload
+        parent_messages = completed.parent_messages or tuple(payload.get("messages", ()))
         return replace(
             completed,
             report=str(payload.get("report", "")),
             delegations=tuple(payload.get("delegations", ())),
             credits_after=float(payload.get("credits_after", 0.0)),
-            parent_messages=tuple(payload.get("messages", ())),
+            parent_messages=parent_messages,
             parent_depth=int(payload.get("branch_depth", 0)),
             live_agent_ids=payload.get("live_agent_ids"),
             max_delegations_per_turn=int(payload.get("max_delegations_per_turn", 8)),

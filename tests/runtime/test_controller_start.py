@@ -172,6 +172,15 @@ class FakePriceCatalog:
     def low_budget_warning(self, selector: str, credits: float):
         return "预算偏低" if credits < 25 else None
 
+    def estimate_model_for_selector(self, selector: str):
+        from lunagentic_research_swarm.llm.pricing import PriceProfile, ResolvedPrice
+
+        return ResolvedPrice(
+            model_name=str(selector).removeprefix("model:") or "fake",
+            profile=PriceProfile(price_in=1.0, price_out=1.0),
+            source="host_config",
+        )
+
 
 class FakeCatalog:
     fingerprint = "catalog-fingerprint"
@@ -396,17 +405,23 @@ async def test_start_rejects_invalid_inputs_before_persistence(harness, kwargs) 
 
 @pytest.mark.asyncio
 async def test_manager_prepares_root_agent_effect_from_frozen_round_snapshot(harness) -> None:
-    manager, _, _, scheduler, *_ = harness
+    from lunagentic_research_swarm.runtime.reducer import PerformAgentCall
+
+    manager, store, _, scheduler, *_ = harness
     result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
     await manager.wait_idle(result["task_id"])
 
-    prepared = await manager.prepare_agent_effect(scheduler.enqueued[-1])
+    agent_effect = next(effect for effect in reversed(scheduler.enqueued) if isinstance(effect, PerformAgentCall))
+    prepared = await manager.prepare_agent_effect(agent_effect)
 
     assert prepared.payload["selector"] == "model:root"
     assert prepared.payload["protocol"] == "json_envelope"
     assert prepared.payload["agent_id"] == "root"
     assert prepared.payload["messages"][1]["content"] == "形式化后的调查任务"
     assert prepared.payload["live_agent_ids"] == ("child", "root")
+    assert "estimated_charge" in prepared.payload
+    assert any(command.kind == "insert_llm_usage" for command in store.commands)
+    assert any(command.kind == "insert_credit_ledger" for command in store.commands)
 
 
 @pytest.mark.asyncio
