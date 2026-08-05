@@ -103,15 +103,17 @@ class _NextRoundState:
 
 
 def _load_builtin_providers(agents: AgentRegistry, procedures: ProcedureRegistry) -> None:
-    """通过与第三方相同的 replace_provider 路径装入内置默认智能体。"""
+    """通过与第三方相同的 replace_provider 路径装入内置默认智能体与 Procedures。"""
 
     from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
+    from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
 
-    del procedures
     agents.replace_provider(
         "builtin",
         [definition.model_dump(mode="json") for definition in bundled_agent_definitions()],
     )
+    # describe() 只产出定义 payload；invoke 仍走统一 provider invoker，不为 builtin 写 scheduler shortcut。
+    procedures.replace_provider("builtin", BundledProcedureProvider(None).describe())
 
 
 class LRSServiceContainer:

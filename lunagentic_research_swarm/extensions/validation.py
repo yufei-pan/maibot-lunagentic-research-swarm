@@ -55,6 +55,12 @@ class FrozenDict(dict[str, Any]):
     setdefault = _immutable
     update = _immutable
 
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
     def __copy__(self) -> "FrozenDict":
         return self
 
@@ -131,6 +137,32 @@ def validate_agent_batch(provider_id: str, definitions: Sequence[Any]) -> list[A
         if agent_id.partition(".")[0] != authorized_namespace:
             raise ValueError(
                 f"agent_id {agent_id} 不属于 provider {provider_id} 获授权的命名空间 {authorized_namespace}"
+            )
+    return checked
+
+
+def validate_procedure_batch(provider_id: str, definitions: Sequence[Any]) -> list[Any]:
+    """对一个 provider 的 Procedure 批次做与 registry 相同的严格校验；整批通过或整批失败。"""
+
+    from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition
+
+    authorized_namespace = authorized_provider_namespace(provider_id)
+    raw_definitions: list[Mapping[str, Any]] = []
+    for item in definitions:
+        if isinstance(item, ProcedureDefinition):
+            raw_definitions.append(item.model_dump(mode="python"))
+        elif isinstance(item, Mapping):
+            raw_definitions.append(item)
+        else:
+            raise TypeError("Procedure provider 批次只能包含 ProcedureDefinition 或 Mapping")
+    checked = [ProcedureDefinition.model_validate(item) for item in raw_definitions]
+    ids = [item.procedure_id for item in checked]
+    if len(set(ids)) != len(ids):
+        raise ValueError("Procedure provider 批次包含重复 ID")
+    for procedure_id in ids:
+        if procedure_id.partition(".")[0] != authorized_namespace:
+            raise ValueError(
+                f"procedure_id {procedure_id} 不属于 provider {provider_id} 获授权的命名空间 {authorized_namespace}"
             )
     return checked
 
