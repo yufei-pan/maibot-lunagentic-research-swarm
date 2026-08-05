@@ -369,9 +369,18 @@ class ReportCoordinator:
             StoreCommand("insert_outbox", {
                 "outbox_id": _new_id("out"), "task_id": self.task_id, "round_id": self.round_id,
                 "report_id": report_id,
-                "delivery_kind": frozen_kind.value,
-                "idempotency_key": f"{self.round_id}:{report_epoch.epoch}",
-                "payload_json": json.dumps({"text": text}, ensure_ascii=False), "status": "PENDING",
+                "delivery_kind": "append_report",
+                "idempotency_key": f"lrs:{self.task_id}:{self.round_id}:{report_id}:append",
+                "payload_json": json.dumps(
+                    {
+                        "text": text,
+                        "kind": frozen_kind.value,
+                        "round_number": report_epoch.epoch,
+                        "running_branch_count": running,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ), "status": "PENDING",
                 "next_attempt_at": created_at, "created_at": created_at,
             }),
         )

@@ -25,6 +25,7 @@ from lunagentic_research_swarm.llm.physical_pinning import PhysicalPinningAdapte
 from lunagentic_research_swarm.llm.pricing import PriceCatalog
 from lunagentic_research_swarm.procedures.registry import ProcedureCatalogSnapshot, ProcedureRegistry
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
+from lunagentic_research_swarm.storage.outbox import MaisakaOutbox
 
 StoreFactory = Callable[[Path], Any]
 DiscoveryFactory = Callable[..., Any]
@@ -112,6 +113,8 @@ class LRSServiceContainer:
     ) -> None:
         self._ctx = ctx
         self._store = store_factory(Path(ctx.paths.data_dir) / "lrs-state.sqlite3")
+        self.outbox: MaisakaOutbox | None = None
+        self._outbox_poll_seconds = float(config.reporting.outbox_poll_seconds)
         self._discovery_factory = discovery_factory
         self._host_snapshot_loader = host_snapshot_loader
         self._physical_pinning = physical_pinning or PhysicalPinningAdapter()
@@ -179,6 +182,20 @@ class LRSServiceContainer:
             self._ctx.paths.runtime_dir.mkdir(parents=True, exist_ok=True)
             await self._store.open()
             self._status["sqlite"] = {"status": "healthy"}
+            maisaka = getattr(self._ctx, "maisaka", None)
+            if maisaka is not None:
+                self.outbox = MaisakaOutbox(
+                    self._store,
+                    maisaka,
+                    poll_interval_seconds=self._outbox_poll_seconds,
+                )
+                await self.outbox.start()
+                self._status["maisaka_outbox"] = {
+                    "status": "healthy",
+                    "delivery": "at_least_once_stable_idempotency",
+                }
+            else:
+                self._status["maisaka_outbox"] = {"status": "degraded", "code": "maisaka_unavailable"}
             interrupted = await self._store.mark_active_rounds_interrupted(time.time())
             self._status["legacy_rounds"] = {
                 "status": "healthy",
@@ -535,6 +552,7 @@ class LRSServiceContainer:
         root_agent, root_selector = self._root_health()
         return {
             "sqlite": dict(self._status["sqlite"]),
+            "maisaka_outbox": dict(self._status.get("maisaka_outbox", {"status": "unknown"})),
             "legacy_rounds": dict(self._status["legacy_rounds"]),
             "initial_price_snapshot": dict(self._status["initial_price_snapshot"]),
             "physical_pinning": dict(self._status["physical_pinning"]),
@@ -557,6 +575,12 @@ class LRSServiceContainer:
                     await self._discovery.close()
                 except BaseException as exc:
                     discovery_error = exc
+            if self.outbox is not None:
+                try:
+                    await self.outbox.close()
+                except BaseException as exc:
+                    if discovery_error is None:
+                        discovery_error = exc
             try:
                 await self._store.close()
             except BaseException as store_error:

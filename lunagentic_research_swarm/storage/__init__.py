@@ -1,5 +1,6 @@
 """LRS 的 SQLite 权威存储接口。"""
 
+from lunagentic_research_swarm.storage.outbox import MaisakaOutbox
 from lunagentic_research_swarm.storage.sqlite import (
     MissingStoreTargetError,
     SQLiteStateStore,
@@ -16,4 +17,5 @@ __all__ = [
     "StoredTask",
     "StoreCommand",
     "SummaryLayer",
+    "MaisakaOutbox",
 ]

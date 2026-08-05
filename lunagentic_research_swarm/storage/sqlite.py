@@ -118,6 +118,9 @@ class SQLiteStateStore:
                     "insert_feedback_event": self._insert_feedback_event,
                     "insert_feedback_reminder": self._insert_feedback_reminder,
                     "insert_outbox": self._insert_outbox,
+                    "complete_outbox_append": self._complete_outbox_append,
+                    "mark_outbox_delivered": self._mark_outbox_delivered,
+                    "mark_outbox_failed": self._mark_outbox_failed,
                     "insert_vector_job": self._insert_vector_job,
                     "update_task_formalization": self._update_task_formalization,
                     "set_task_current_round": self._set_task_current_round,
@@ -171,6 +174,23 @@ class SQLiteStateStore:
 
     async def pragma_settings(self) -> dict[str, int | str]:
         return await self._call(self._pragma_settings_sync)
+
+    async def list_due_outbox(self, now: float, *, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        return await self._call(self._list_due_outbox_sync, float(now), int(limit))
+
+    async def complete_outbox_append(self, outbox_id: str, trigger: Mapping[str, Any], *, delivered_at: float) -> None:
+        await self.transact([StoreCommand("complete_outbox_append", {
+            "outbox_id": outbox_id, "delivered_at": delivered_at, "trigger": dict(trigger),
+        })])
+
+    async def mark_outbox_delivered(self, outbox_id: str, *, delivered_at: float) -> None:
+        await self.transact([StoreCommand("mark_outbox_delivered", {"outbox_id": outbox_id, "delivered_at": delivered_at})])
+
+    async def mark_outbox_failed(self, outbox_id: str, *, attempt_count: int, next_attempt_at: float, error: str) -> None:
+        await self.transact([StoreCommand("mark_outbox_failed", {
+            "outbox_id": outbox_id, "attempt_count": attempt_count,
+            "next_attempt_at": next_attempt_at, "last_error": error,
+        })])
 
     def _open_sync(self) -> None:
         if self._connection is not None:
@@ -564,6 +584,44 @@ class SQLiteStateStore:
         )
 
     @staticmethod
+    def _mark_outbox_delivered(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        cursor = connection.execute(
+            "UPDATE maisaka_outbox SET status = 'delivered', delivered_at = ?, last_error = NULL WHERE outbox_id = ?",
+            (values["delivered_at"], values["outbox_id"]),
+        )
+        _require_single_target(cursor, target_kind="Outbox", target_id=values["outbox_id"])
+
+    @staticmethod
+    def _mark_outbox_failed(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        cursor = connection.execute(
+            "UPDATE maisaka_outbox SET status = 'pending', attempt_count = ?, next_attempt_at = ?, last_error = ? WHERE outbox_id = ?",
+            (values["attempt_count"], values["next_attempt_at"], values["last_error"], values["outbox_id"]),
+        )
+        _require_single_target(cursor, target_kind="Outbox", target_id=values["outbox_id"])
+
+    @staticmethod
+    def _complete_outbox_append(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        outbox_id = values["outbox_id"]
+        cursor = connection.execute(
+            "UPDATE maisaka_outbox SET status = 'delivered', delivered_at = ?, last_error = NULL WHERE outbox_id = ?",
+            (values["delivered_at"], outbox_id),
+        )
+        _require_single_target(cursor, target_kind="Outbox", target_id=outbox_id)
+        trigger = values["trigger"]
+        connection.execute(
+            """INSERT OR IGNORE INTO maisaka_outbox(
+                outbox_id, task_id, round_id, report_id, delivery_kind,
+                idempotency_key, payload_json, status, attempt_count,
+                next_attempt_at, last_error, created_at, delivered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, NULL)""",
+            (
+                trigger["outbox_id"], trigger["task_id"], trigger["round_id"], trigger.get("report_id"),
+                trigger["delivery_kind"], trigger["idempotency_key"], trigger["payload_json"],
+                trigger["next_attempt_at"], trigger["created_at"],
+            ),
+        )
+
+    @staticmethod
     def _insert_vector_job(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
         created_at = values["created_at"]
         connection.execute(
@@ -842,3 +900,14 @@ class SQLiteStateStore:
             "journal_mode": str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower(),
             "synchronous": int(connection.execute("PRAGMA synchronous").fetchone()[0]),
         }
+
+    def _list_due_outbox_sync(self, now: float, limit: int) -> tuple[dict[str, Any], ...]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            """SELECT o.*, t.stream_id FROM maisaka_outbox AS o
+               JOIN tasks AS t ON t.task_id = o.task_id
+               WHERE UPPER(o.status) != 'DELIVERED' AND o.next_attempt_at <= ?
+               ORDER BY o.next_attempt_at, o.created_at, o.outbox_id LIMIT ?""",
+            (now, limit),
+        ).fetchall()
+        return tuple(dict(row) for row in rows)
