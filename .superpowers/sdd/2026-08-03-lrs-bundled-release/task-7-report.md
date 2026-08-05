@@ -92,3 +92,5 @@ PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
 timeout 180s env PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest -q
 # 569 passed in 1.84s
 ```
+
+- Regression: `test_manager_injects_feedback_service_into_controller` covers manager→controller `feedback_service` injection (Review-2 Issue 1 residual).

@@ -234,6 +234,30 @@ def harness():
 
 
 @pytest.mark.asyncio
+async def test_manager_injects_feedback_service_into_controller(harness) -> None:
+    """Regression: ResearchManager must forward feedback_service into TaskController."""
+    _manager, store, summarizer, scheduler, *_ = harness
+    feedback = object()
+    manager = ResearchManager(
+        ctx=_manager.ctx,
+        store=store,
+        summarizer=summarizer,
+        scheduler=scheduler,
+        snapshot_provider=_manager._snapshot_provider,
+        recent_message_limit=12,
+        pause_timeout_seconds=1200,
+        grace_period_seconds=60,
+        feedback_service=feedback,
+    )
+
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    controller = manager._controllers[result["task_id"]]
+    assert controller.feedback is feedback
+    summarizer.gate.set()
+    await manager.wait_idle(result["task_id"])
+
+
+@pytest.mark.asyncio
 async def test_start_returns_after_durable_create_without_waiting_for_formalizer(harness) -> None:
     manager, store, summarizer, *_ = harness
     summarizer.block()
