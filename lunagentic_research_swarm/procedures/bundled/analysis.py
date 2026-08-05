@@ -106,6 +106,20 @@ class _DivisionByZero(Exception):
     pass
 
 
+def _coerce_finite_float(value: Any) -> float | None:
+    """将 int/float 转为有限 float；bool、非数值、溢出或非有限返回 None。"""
+
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
 def _check_number(value: float | int) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _UnsafeExpression("仅允许数值常量")
@@ -199,10 +213,8 @@ def statistics(operation: str, values: Sequence[Any], n: int | None = None) -> P
         return _failure("invalid_arguments", "values 不能为空")
     numbers: list[float] = []
     for item in values:
-        if isinstance(item, bool) or not isinstance(item, int | float):
-            return _failure("invalid_arguments", "values 必须全部为有限数值")
-        number = float(item)
-        if not math.isfinite(number):
+        number = _coerce_finite_float(item)
+        if number is None:
             return _failure("invalid_arguments", "values 必须全部为有限数值")
         numbers.append(number)
 
@@ -278,10 +290,8 @@ def _lookup_dimension(unit: str) -> tuple[str, dict[str, float]] | None:
 def convert_units(value: float | int, from_unit: str, to_unit: str) -> ProcedureResult:
     """显式因子/偏移表换算；未知单位与跨维度拒绝。"""
 
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return _failure("invalid_arguments", "value 必须为有限数值")
-    number = float(value)
-    if not math.isfinite(number):
+    number = _coerce_finite_float(value)
+    if number is None:
         return _failure("invalid_arguments", "value 必须为有限数值")
     if not isinstance(from_unit, str) or not isinstance(to_unit, str):
         return _failure("invalid_arguments", "from_unit/to_unit 必须为字符串")

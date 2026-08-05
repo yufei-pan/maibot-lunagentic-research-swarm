@@ -100,3 +100,17 @@ PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
   tests/procedures/test_provenance.py -v
 ```
 Result: **34 passed**.
+
+## Review-3 Important Fix Notes
+
+**Finding addressed:**
+
+1. **Oversized integer float coercion** — `_coerce_finite_float` catches `OverflowError` from `float(10**400)`-class inputs in `statistics()` and `convert_units()`, returning `invalid_arguments`. Provider invoke path covered by `test_provider_rejects_oversized_integer_analysis_inputs`.
+
+**Evidence:**
+```bash
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
+  tests/procedures/test_analysis.py \
+  tests/procedures/test_provenance.py -v
+```
+Result: **37 passed**.

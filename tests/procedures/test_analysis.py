@@ -157,6 +157,19 @@ def test_convert_units_rejects_non_finite_result() -> None:
     assert temp.error.code == "invalid_arguments"
 
 
+def test_statistics_rejects_oversized_integer_input() -> None:
+    # 超大整数可被 isinstance(..., int) 接受，但 float() 会 OverflowError
+    result = statistics("mean", [10**400])
+    assert not result.success
+    assert result.error.code == "invalid_arguments"
+
+
+def test_convert_units_rejects_oversized_integer_input() -> None:
+    result = convert_units(10**400, "m", "km")
+    assert not result.success
+    assert result.error.code == "invalid_arguments"
+
+
 @pytest.mark.asyncio
 async def test_provider_exposes_analysis_procedures() -> None:
     provider = BundledProcedureProvider(SimpleNamespace())
@@ -180,3 +193,24 @@ async def test_provider_exposes_analysis_procedures() -> None:
     )
     assert units.success
     assert units.data["value"] == 1000.0
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_oversized_integer_analysis_inputs() -> None:
+    # provider 路径须返回结构化 invalid_arguments，而非抛出 OverflowError
+    provider = BundledProcedureProvider(SimpleNamespace())
+    huge = 10**400
+
+    stats = await provider.invoke(
+        "builtin.statistics",
+        {"operation": "mean", "values": [huge]},
+    )
+    assert not stats.success
+    assert stats.error.code == "invalid_arguments"
+
+    units = await provider.invoke(
+        "builtin.convert_units",
+        {"value": huge, "from_unit": "m", "to_unit": "km"},
+    )
+    assert not units.success
+    assert units.error.code == "invalid_arguments"
