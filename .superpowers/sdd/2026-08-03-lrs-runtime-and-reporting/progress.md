@@ -22,3 +22,7 @@ Task 6: fix round 4/6 (1 addressed, 0 open — paused-vs-runnable queue telemetr
 Task 6: fix round 5/6 (1 addressed, 0 open — blocked barrier priority accounting; commits 5858b40..febd453)
 Task 6: fix round 6/6 (1 addressed, 0 open — cross-task priority handoff accounting; commits febd453..2a6ff4e)
 Task 6: complete (commits c03bf0a..2a6ff4e, review clean; full suite 358 passed)
+Task 7: fix round 1/3 (3 addressed, 0 open — terminal-final race, frozen coverage, stable grace clone; commits a21ad91..e0d3acb)
+Task 7: fix round 2/3 (3 addressed, 0 open — final epoch after in-flight synthesis, default runtime bridge, stale epoch guards; commits e0d3acb..458aa95)
+Task 7: fix round 3/3 (1 addressed, 0 open — failed final synthesis error completion and bounded metadata; commits 458aa95..b045676)
+Task 7: complete (commits 2a6ff4e..b045676, review clean; full suite 378 passed)
