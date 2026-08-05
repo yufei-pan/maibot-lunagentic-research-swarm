@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import replace
@@ -30,6 +31,7 @@ from lunagentic_research_swarm.models import (
 )
 from lunagentic_research_swarm.runtime.context import RuntimeHeader, StablePromptBuilder, release_raw_context
 from lunagentic_research_swarm.runtime.controller import TaskController
+from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage
 from lunagentic_research_swarm.runtime.epochs import ReportCoordinator, ReportRecord
 from lunagentic_research_swarm.runtime.events import (
     AllInflightSettled,
@@ -47,7 +49,6 @@ from lunagentic_research_swarm.runtime.events import (
     ReportDeadlineReached,
     StopRequested,
 )
-from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage
 from lunagentic_research_swarm.runtime.reducer import (
     NotifyToolWaiter,
     OpenReportEpoch,
@@ -57,6 +58,8 @@ from lunagentic_research_swarm.runtime.reducer import (
     RuntimeState,
 )
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
+
+_LOG = logging.getLogger(__name__)
 
 
 def _event_id() -> str:
@@ -119,7 +122,7 @@ class ResearchManager:
         self.statistics = statistics
         self._summarizer_selector = str(summarizer_selector or "task:mid_memory")
         self._shutting_down = False
-   
+
     async def start(
         self,
         *,
@@ -193,18 +196,25 @@ class ResearchManager:
             result = await self.summarizer.formalize_task(FormalizationRequest(raw_context=raw_context, chat_messages=readable))
             if not result.success or not result.text.strip():
                 raise RuntimeError(getattr(getattr(result, "error", None), "message", "formalization_failed"))
-            meter_commands = meter_summarizer_usage(
-                role="formalizer",
-                task_id=task_id,
-                round_id=controller.state.active_round_id or "",
-                selector=self._summarizer_selector,
-                catalog=getattr(snapshot, "price_catalog", None),
-                model_name=str(getattr(result, "model_name", "") or ""),
-                usage=getattr(result, "usage", None),
-                created_at=_now(),
-            )
-            if meter_commands:
-                await self.store.transact(meter_commands)
+            try:
+                meter_commands = meter_summarizer_usage(
+                    role="formalizer",
+                    task_id=task_id,
+                    round_id=controller.state.active_round_id or "",
+                    selector=self._summarizer_selector,
+                    catalog=getattr(snapshot, "price_catalog", None),
+                    model_name=str(getattr(result, "model_name", "") or ""),
+                    usage=getattr(result, "usage", None),
+                    created_at=_now(),
+                )
+                if meter_commands:
+                    await self.store.transact(meter_commands)
+            except Exception:
+                _LOG.warning(
+                    "形式化计量失败（已跳过）task_id=%s",
+                    task_id,
+                    exc_info=True,
+                )
             formalized = FormalizedTask.create(result.text)
             branch_id, now = new_branch_id(), _now()
             root_entry = snapshot.agent_catalog.get(snapshot.root_agent)

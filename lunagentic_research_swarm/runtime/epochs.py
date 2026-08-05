@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -28,6 +29,8 @@ from lunagentic_research_swarm.reporting import (
 from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage
 from lunagentic_research_swarm.statistics import StatisticsService, compute_task_stats
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
+
+_LOG = logging.getLogger(__name__)
 
 
 def _new_id(prefix: str) -> str:
@@ -152,7 +155,7 @@ class ReportCoordinator:
         self._held: dict[str, tuple[Mapping[str, Any], ...]] = {}
         self._seen: dict[str, set[str]] = {branch_id: set() for branch_id in self.branches}
         self._synthesis_tasks: set[asyncio.Task[None]] = set()
-   
+
     def active_branch_ids(self) -> set[str]:
         return {
             branch_id for branch_id, branch in self.branches.items()
@@ -355,48 +358,23 @@ class ReportCoordinator:
                     body = "最终报告总结器不可用；以下为已提交终结 coverage。"
         created_at = float(self.clock())
         report_id = _new_id("rpt")
-        # 同 transaction snapshot：写报告前从账本重算，stats_json 与事后重算一致。
-        ledger_stats = await self._ledger_stats_snapshot()
-        text = render_report(
-            kind=frozen_kind, body=body, task_id=self.task_id, round_id=self.round_id, epoch=report_epoch.epoch,
-            running_branch_count=running,
-            queued_branch_count=len(self._held),
-            unavailable_count=coverage.unavailable_count,
-            elapsed_seconds=created_at - self.started_at, next_interval_seconds=self.time_budget_seconds,
-            credit_balance=sum(
-                branch.credits
-                for branch in self.branches.values()
-                if branch.lifecycle is not BranchLifecycle.FINALIZED
-            ),
-            credit_pool=self.credit_pool, pending_work=tuple(self._held), stats=ledger_stats,
+        credit_balance = sum(
+            branch.credits
+            for branch in self.branches.values()
+            if branch.lifecycle is not BranchLifecycle.FINALIZED
         )
-        commands = (
-            StoreCommand("insert_report", {
-                "report_id": report_id, "task_id": self.task_id, "round_id": self.round_id,
-                "epoch": report_epoch.epoch, "kind": frozen_kind.value, "text": text, "status": status,
-                "running_branch_count": running,
-                "stats_json": json.dumps(ledger_stats, ensure_ascii=False, sort_keys=True),
-                "created_at": created_at,
-            }),
-            StoreCommand("insert_outbox", {
-                "outbox_id": _new_id("out"), "task_id": self.task_id, "round_id": self.round_id,
-                "report_id": report_id,
-                "delivery_kind": "append_report",
-                "idempotency_key": f"lrs:{self.task_id}:{self.round_id}:{report_id}:append",
-                "payload_json": json.dumps(
-                    {
-                        "text": text,
-                        "kind": frozen_kind.value,
-                        "round_number": report_epoch.epoch,
-                        "running_branch_count": running,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ), "status": "PENDING",
-                "next_attempt_at": created_at, "created_at": created_at,
-            }),
+        # 同 transaction snapshot：在写入报告的同一 BEGIN IMMEDIATE 内重算 stats。
+        _ledger_stats, text = await self._persist_report_same_tx(
+            report_id=report_id,
+            frozen_kind=frozen_kind,
+            body=body,
+            status=status,
+            report_epoch=report_epoch,
+            running=running,
+            coverage=coverage,
+            created_at=created_at,
+            credit_balance=credit_balance,
         )
-        await self.store.transact(commands)
         record = ReportRecord(
             report_id, report_epoch.epoch, frozen_kind, text, status, created_at, coverage,
             error_code, error_message,
@@ -479,30 +457,131 @@ class ReportCoordinator:
         branch_id: str | None,
         result: SummaryResult,
     ) -> None:
+        """尽力写入总结器 telemetry；失败只记日志，绝不中断报告/摘要路径。"""
+
         usage = getattr(result, "usage", None)
         if usage is None:
             return
-        commands = meter_summarizer_usage(
-            role=role,
-            task_id=self.task_id,
-            round_id=self.round_id,
-            branch_id=branch_id,
-            selector=self.summarizer_selector,
-            catalog=self.price_catalog,
-            model_name=str(getattr(result, "model_name", "") or ""),
-            usage=usage,
-            created_at=float(self.clock()),
-        )
-        if commands:
-            await self.store.transact(commands)
+        try:
+            commands = meter_summarizer_usage(
+                role=role,
+                task_id=self.task_id,
+                round_id=self.round_id,
+                branch_id=branch_id,
+                selector=self.summarizer_selector,
+                catalog=self.price_catalog,
+                model_name=str(getattr(result, "model_name", "") or ""),
+                usage=usage,
+                created_at=float(self.clock()),
+            )
+            if commands:
+                await self.store.transact(commands)
+        except Exception:
+            _LOG.warning(
+                "总结器计量失败（已跳过）role=%s task_id=%s branch_id=%s",
+                role,
+                self.task_id,
+                branch_id,
+                exc_info=True,
+            )
 
-    async def _ledger_stats_snapshot(self) -> dict[str, Any]:
+    async def _persist_report_same_tx(
+        self,
+        *,
+        report_id: str,
+        frozen_kind: ReportKind,
+        body: str,
+        status: str,
+        report_epoch: ReportEpoch,
+        running: int,
+        coverage: CoverageSet,
+        created_at: float,
+        credit_balance: float,
+    ) -> tuple[dict[str, Any], str]:
+        """在同一 store transaction 内重算 stats 并写入 report/outbox。"""
+
+        def _build_text(ledger_stats: dict[str, Any]) -> str:
+            return render_report(
+                kind=frozen_kind,
+                body=body,
+                task_id=self.task_id,
+                round_id=self.round_id,
+                epoch=report_epoch.epoch,
+                running_branch_count=running,
+                queued_branch_count=len(self._held),
+                unavailable_count=coverage.unavailable_count,
+                elapsed_seconds=created_at - self.started_at,
+                next_interval_seconds=self.time_budget_seconds,
+                credit_balance=credit_balance,
+                credit_pool=self.credit_pool,
+                pending_work=tuple(self._held),
+                stats=ledger_stats,
+            )
+
+        def _commands(ledger_stats: dict[str, Any], text: str) -> tuple[StoreCommand, ...]:
+            return (
+                StoreCommand(
+                    "insert_report",
+                    {
+                        "report_id": report_id,
+                        "task_id": self.task_id,
+                        "round_id": self.round_id,
+                        "epoch": report_epoch.epoch,
+                        "kind": frozen_kind.value,
+                        "text": text,
+                        "status": status,
+                        "running_branch_count": running,
+                        "stats_json": json.dumps(ledger_stats, ensure_ascii=False, sort_keys=True),
+                        "created_at": created_at,
+                    },
+                ),
+                StoreCommand(
+                    "insert_outbox",
+                    {
+                        "outbox_id": _new_id("out"),
+                        "task_id": self.task_id,
+                        "round_id": self.round_id,
+                        "report_id": report_id,
+                        "delivery_kind": "append_report",
+                        "idempotency_key": f"lrs:{self.task_id}:{self.round_id}:{report_id}:append",
+                        "payload_json": json.dumps(
+                            {
+                                "text": text,
+                                "kind": frozen_kind.value,
+                                "round_number": report_epoch.epoch,
+                                "running_branch_count": running,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        "status": "PENDING",
+                        "next_attempt_at": created_at,
+                        "created_at": created_at,
+                    },
+                ),
+            )
+
+        def _commit(connection: Any) -> tuple[dict[str, Any], str]:
+            ledger_stats = compute_task_stats(connection, self.task_id)
+            text = _build_text(ledger_stats)
+            apply = getattr(self.store, "apply_commands", None)
+            if not callable(apply):
+                raise RuntimeError("store 缺少 apply_commands，无法同事务写入报告")
+            apply(connection, _commands(ledger_stats, text))
+            return ledger_stats, text
+
+        run_transaction = getattr(self.store, "run_transaction", None)
+        if callable(run_transaction):
+            return await run_transaction(_commit)
+
+        # 测试假 store：无 SQLite 连接时退化为独立 snapshot + transact。
         if self.statistics is not None:
-            return await self.statistics.task(self.task_id)
-        run_locked = getattr(self.store, "run_locked", None)
-        if callable(run_locked):
-            return await run_locked(lambda connection: compute_task_stats(connection, self.task_id))
-        return {"task_id": self.task_id}
+            ledger_stats = await self.statistics.task(self.task_id)
+        else:
+            ledger_stats = {"task_id": self.task_id}
+        text = _build_text(ledger_stats)
+        await self.store.transact(_commands(ledger_stats, text))
+        return ledger_stats, text
 
     async def _broadcast(self, summary: CoverageSummary) -> None:
         for branch_id in self.active_branch_ids():

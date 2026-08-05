@@ -275,6 +275,45 @@ async def test_start_returns_after_durable_create_without_waiting_for_formalizer
 
 
 @pytest.mark.asyncio
+async def test_formalize_survives_metering_failure_when_catalog_missing(harness) -> None:
+    """计量失败不得中止形式化；raising meter 必须被降级跳过。"""
+
+    manager, store, summarizer, *_ = harness
+
+    from lunagentic_research_swarm.llm.pricing import TokenUsage
+    import lunagentic_research_swarm.runtime.manager as manager_mod
+
+    async def formalize_with_usage(request):
+        summarizer.requests.append(request)
+        await summarizer.gate.wait()
+        return SummaryResult(
+            True,
+            "形式化后的调查任务",
+            "fake-model",
+            TokenUsage(10, 1, 0, 10, source="actual"),
+            None,
+        )
+
+    summarizer.formalize_task = formalize_with_usage  # type: ignore[method-assign]
+    previous = manager_mod.meter_summarizer_usage
+
+    def boom(**_kwargs):
+        raise ValueError("有 usage 时必须提供 catalog 或 actual_charge")
+
+    manager_mod.meter_summarizer_usage = boom  # type: ignore[assignment]
+    try:
+        result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120, effort_level=1.0)
+        await manager.wait_idle(result["task_id"])
+    finally:
+        manager_mod.meter_summarizer_usage = previous  # type: ignore[assignment]
+
+    stored = await store.load_task(result["task_id"])
+    assert stored.formalized_task is not None
+    assert stored.formalized_task.text == "形式化后的调查任务"
+    assert stored.current_round.status.value == "RUNNING"
+
+
+@pytest.mark.asyncio
 async def test_formalizer_failure_marks_task_failed_without_using_raw_objective(harness) -> None:
     manager, store, summarizer, *_ = harness
     summarizer.fail("provider error")

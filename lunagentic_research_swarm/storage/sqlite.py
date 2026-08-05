@@ -174,6 +174,33 @@ class SQLiteStateStore:
     async def transact(self, commands: Sequence[StoreCommand]) -> None:
         await self._call(self._transact_sync, tuple(commands))
 
+    def apply_commands(self, connection: sqlite3.Connection, commands: Sequence[StoreCommand]) -> None:
+        """在已开启的 transaction 内应用 ``StoreCommand``（供同锁快照写入）。"""
+
+        for command in commands:
+            if not isinstance(command, StoreCommand):
+                raise TypeError("存储 transaction 只接受 StoreCommand")
+            handler = self._command_handlers.get(command.kind)
+            if handler is None:
+                raise ValueError(f"未知存储命令：{command.kind}")
+            handler(connection, command.values)
+
+    async def run_transaction(self, function: Callable[[sqlite3.Connection], Any]) -> Any:
+        """``BEGIN IMMEDIATE`` → 回调 → ``COMMIT``，与 ``transact`` 共用同一串行锁。"""
+
+        def _runner() -> Any:
+            connection = self._require_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                result = function(connection)
+                connection.commit()
+                return result
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._call(_runner)
+
     async def load_task(self, task_id: str) -> StoredTask | None:
         return await self._call(self._load_task_sync, task_id)
 
@@ -313,13 +340,7 @@ class SQLiteStateStore:
         connection = self._require_connection()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            for command in commands:
-                if not isinstance(command, StoreCommand):
-                    raise TypeError("存储 transaction 只接受 StoreCommand")
-                handler = self._command_handlers.get(command.kind)
-                if handler is None:
-                    raise ValueError(f"未知存储命令：{command.kind}")
-                handler(connection, command.values)
+            self.apply_commands(connection, commands)
             connection.commit()
         except BaseException:
             connection.rollback()

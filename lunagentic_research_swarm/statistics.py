@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from lunagentic_research_swarm.runtime.credits import is_summarizer_role
@@ -38,10 +38,57 @@ def _external_cost(value: Any) -> float:
     return 0.0
 
 
-def _is_billable_usage_row(status: str) -> bool:
-    """跳过 ``reserved`` 预扣行；每个逻辑调用只计 reconciled / unreconciled。"""
+def _is_reserved_status(status: str) -> bool:
+    return str(status or "") == "reserved"
 
-    return str(status or "") != "reserved"
+
+def _usage_rows_for_stats(usage_rows: Sequence[Any]) -> list[Any]:
+    """每个 call_id 优先取非 reserved；仅当无核销行时保留 orphan reserved。"""
+
+    by_call: dict[str, list[Any]] = defaultdict(list)
+    for row in usage_rows:
+        by_call[str(row["call_id"] or "")].append(row)
+    selected: list[Any] = []
+    for rows in by_call.values():
+        non_reserved = [row for row in rows if not _is_reserved_status(str(row["reconciliation_status"] or ""))]
+        selected.extend(non_reserved if non_reserved else rows)
+    return selected
+
+
+def _credits_from_ledger(connection: sqlite3.Connection, task_id: str) -> tuple[float, float, float] | None:
+    """从 ``credit_ledger`` 汇总研究积分；无行时返回 None（回退到 usage）。
+
+    - ``estimated``：各 call 的 ``input_reservation`` 绝对值之和
+    - ``actual``：已核销 call 的净支出 ``-sum(amounts)``
+    - ``unreconciled``：仅有 reservation、尚无 reconciliation 的 call（含 crash orphan）
+    """
+
+    rows = connection.execute(
+        """
+        SELECT call_id, entry_kind, amount
+        FROM credit_ledger WHERE task_id = ?
+        """,
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    by_call: dict[str, list[Any]] = defaultdict(list)
+    for row in rows:
+        by_call[str(row["call_id"] or "")].append(row)
+    estimated = actual = unreconciled = 0.0
+    for entries in by_call.values():
+        reservation = sum(
+            -float(entry["amount"] or 0.0)
+            for entry in entries
+            if str(entry["entry_kind"] or "") == "input_reservation"
+        )
+        has_recon = any(str(entry["entry_kind"] or "") == "input_reconciliation" for entry in entries)
+        estimated += reservation
+        if has_recon:
+            actual += -sum(float(entry["amount"] or 0.0) for entry in entries)
+        else:
+            unreconciled += reservation
+    return estimated, actual, unreconciled
 
 
 def compute_task_stats(connection: sqlite3.Connection, task_id: str) -> dict[str, Any]:
@@ -61,10 +108,8 @@ def compute_task_stats(connection: sqlite3.Connection, task_id: str) -> dict[str
     prompt = completion = hit = miss = 0
     estimated = actual = unreconciled = cost_equivalent = 0.0
     duration_ms = 0
-    for row in usage_rows:
+    for row in _usage_rows_for_stats(usage_rows):
         status = str(row["reconciliation_status"] or "")
-        if not _is_billable_usage_row(status):
-            continue
         role = str(row["role"] or "")
         prompt += int(row["prompt_tokens"] or 0)
         completion += int(row["completion_tokens"] or 0)
@@ -79,10 +124,14 @@ def compute_task_stats(connection: sqlite3.Connection, task_id: str) -> dict[str
         else:
             agent_calls += 1
             estimated += est
-            if status == "estimated_unreconciled":
+            if status == "estimated_unreconciled" or _is_reserved_status(status):
                 unreconciled += est
             elif act is not None:
                 actual += float(act)
+
+    ledger_credits = _credits_from_ledger(connection, task_id)
+    if ledger_credits is not None:
+        estimated, actual, unreconciled = ledger_credits
 
     procedure_rows = connection.execute(
         """
@@ -230,16 +279,15 @@ class StatisticsService:
                 "cost_equivalent_credits": 0.0,
             }
         )
-        for row in connection.execute(
+        usage_rows = connection.execute(
             """
-            SELECT role, actual_model_name, estimated_model_name, prompt_tokens, completion_tokens,
+            SELECT role, call_id, actual_model_name, estimated_model_name, prompt_tokens, completion_tokens,
                    cache_hit_tokens, cache_miss_tokens, actual_charge, estimated_charge,
                    reconciliation_status
             FROM llm_usage
             """
-        ):
-            if not _is_billable_usage_row(str(row["reconciliation_status"] or "")):
-                continue
+        ).fetchall()
+        for row in _usage_rows_for_stats(usage_rows):
             name = str(row["actual_model_name"] or row["estimated_model_name"] or "unknown")
             bucket = models[name]
             bucket["calls"] += 1
