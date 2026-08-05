@@ -96,3 +96,29 @@ Result: **31 passed**.
 
 - Startup reconcile of orphan Lance tables vs `vector_generations` still deferred.
 - `vector_documents` rows for retired/purged generations not yet GC'd.
+
+---
+
+## Review-2 Fixes (post `41fd4c1`)
+
+**Status:** DONE — addressed Important (+ cheap Medium) findings from `task-5-review-2.md`.
+
+### Fixes
+
+1. **Startup stranded building** — `VectorIndex.start()` calls `_fail_stranded_building()` (fail row + drop orphan Lance table). `LRSServiceContainer.start()` also calls `ensure_ready()`. Crash mid-rebuild can no longer leave search stuck on `vector_index_rebuilding`.
+2. **Mismatch-only auto-rebuild** — `_enqueue_unlocked` only schedules auto-rebuild for `EmbeddingGenerationMismatch` from `_detect_mismatch` / append schema checks. `VectorIndexUnavailable` (transient `open_table` IO) fails the job and leaves the active generation alone. Invalid probe embeddings also do not rebuild.
+3. **Whitelist** — `INDEXABLE_CONTENT_STATUSES = {"SUCCEEDED"}` only. `FAILED`/`DEGRADED` apology report bodies are excluded; formalized tasks + feedback lessons unchanged.
+4. **Auto-rebuild lock** — probe/write stay under `_lock`; full rebuild re-acquires after release. `_rebuilding` is set before release so concurrent enqueue fails fast with `vector_index_rebuilding` instead of queueing invisibly for the whole corpus re-embed. Rebuild itself still serializes on `_lock` (documented safe bound).
+5. **Medium** — empty-index enqueue returns `VectorOpResult.fail` (no raise); successful auto-rebuild completes the job / returns `indexed`; Lance upsert uses `merge_insert`; `_prepare` reuses `_fail_stranded_building` (drops orphan tables); `ensure_ready` tries `force=False` before force rebuild.
+
+### Verification
+
+```bash
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
+  tests/storage/test_vectors.py \
+  tests/storage/test_vector_rebuild.py \
+  tests/test_dependencies.py \
+  tests/storage/test_privacy.py -v
+```
+
+Result: **36 passed**.

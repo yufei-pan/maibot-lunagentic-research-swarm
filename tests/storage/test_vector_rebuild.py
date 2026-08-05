@@ -129,15 +129,32 @@ async def test_mismatch_job_marked_and_authoritative_sqlite_untouched(vector_har
     vector_harness.embedder.return_vectors([[1.0, 2.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]])
     result = await vector_harness.index_new_source("summary-keep-sqlite")
-    assert not result.success
-    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
+    # auto-rebuild 自愈后 enqueue 成功；权威 SQLite 层始终未被动过
+    assert result.success
 
     layer = await vector_harness.store.load_summary_layer("task_for_summary-keep-sqlite")
     assert layer is not None
     assert any(item["summary_id"] == "summary-keep-sqlite" for item in layer.summaries)
 
-    jobs = await vector_harness.index.list_jobs(status="failed")
-    assert any(job["error_code"] == EMBEDDING_GENERATION_MISMATCH for job in jobs)
+    done = await vector_harness.index.list_jobs(status="done")
+    assert any(job["source_id"] == "summary-keep-sqlite" for job in done)
+
+
+@pytest.mark.asyncio
+async def test_mismatch_without_auto_rebuild_fails_job(tmp_path) -> None:
+    harness = await VectorHarness.create(tmp_path, auto_rebuild=False)
+    try:
+        await harness.build_with_vectors([[1.0, 2.0, 3.0]])
+        harness.embedder.return_vectors([[1.0, 2.0]])
+        result = await harness.index_new_source("summary-no-auto")
+        assert not result.success
+        assert result.error.code == EMBEDDING_GENERATION_MISMATCH
+        jobs = await harness.index.list_jobs(status="failed")
+        assert any(job["error_code"] == EMBEDDING_GENERATION_MISMATCH for job in jobs)
+        status = await harness.status()
+        assert status.dimension == 3
+    finally:
+        await harness.close()
 
 
 @pytest.mark.asyncio
@@ -184,9 +201,81 @@ async def test_ensure_ready_rebuilds_stranded_candidate(vector_harness) -> None:
         )
 
     await vector_harness.store.run_locked(_strand)
+    # force=False 探测一次即可清 stranded（指纹未变）
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
     result = await vector_harness.index.ensure_ready()
     assert result.success
+    assert result.code == "already_current"
     status = await vector_harness.status()
     assert not status.candidate_active
     assert not status.rebuilding
+    assert status.active_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_fails_stale_building_and_drops_orphan_table(vector_harness) -> None:
+    await vector_harness.build_with_vectors([[1.0, 2.0, 3.0]])
+
+    def _strand(connection) -> None:
+        _insert_generation(
+            connection,
+            generation=60,
+            selector="task:embedding",
+            actual_model_name=None,
+            model_fingerprint="pending",
+            dimension=None,
+            table_name=_table_name_for(60),
+            schema_version=1,
+            status="building",
+            created_at=time.time(),
+        )
+
+    await vector_harness.store.run_locked(_strand)
+
+    def _create_orphan() -> None:
+        assert vector_harness.index._db is not None
+        name = _table_name_for(60)
+        existing = list(vector_harness.index._db.list_tables().tables)
+        if name not in existing:
+            vector_harness.index._db.create_table(
+                name,
+                [
+                    {
+                        "id": "orphan",
+                        "source_kind": "formalized_task",
+                        "source_id": "x",
+                        "task_id": "",
+                        "text": "orphan",
+                        "feedback_disposition": "",
+                        "vector": [0.0, 0.0, 0.0],
+                    }
+                ],
+            )
+
+    import asyncio
+
+    await asyncio.to_thread(_create_orphan)
+    vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
+    result = await vector_harness.rebuild(force=True)
+    assert result.success
+
+    def _tables() -> list[str]:
+        assert vector_harness.index._db is not None
+        return list(vector_harness.index._db.list_tables().tables)
+
+    tables = await asyncio.to_thread(_tables)
+    assert _table_name_for(60) not in tables
+
+    def _gens(connection):
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT generation, status FROM vector_generations ORDER BY generation"
+            ).fetchall()
+        ]
+
+    gens = await vector_harness.store.run_locked(_gens)
+    by_gen = {row["generation"]: row["status"] for row in gens}
+    assert by_gen[60] == "failed"
+    assert 1 in by_gen
+    assert by_gen[1] == "retired"

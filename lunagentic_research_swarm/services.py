@@ -232,6 +232,8 @@ class LRSServiceContainer:
                     Path(self._ctx.paths.data_dir) / "vectors" / "lancedb",
                 )
                 await self.vector_index.start()
+                # ensure_ready：清启动前残留 / 推进未初始化有源索引（与 start 内 stranded reconcile 互补）
+                await self.vector_index.ensure_ready()
                 vector_status = await self.vector_index.status()
                 self._status["vector_index"] = {
                     "status": "healthy",

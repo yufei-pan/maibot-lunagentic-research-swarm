@@ -26,8 +26,9 @@ from lunagentic_research_swarm.models import ReportKind, SummaryKind
 
 VECTOR_SCHEMA_VERSION = 1
 
-# 与 runtime/epochs.py 写入的 summaries/reports.status 对齐（非 READY）
-INDEXABLE_CONTENT_STATUSES = frozenset({"SUCCEEDED", "FAILED", "DEGRADED"})
+# 仅索引有可用正文的内容态。runtime/epochs.py 对 summaries/reports：
+# SUCCEEDED 才带真实文本；FAILED/DEGRADED 是道歉占位（text NULL 或固定话术），不当历史案例。
+INDEXABLE_CONTENT_STATUSES = frozenset({"SUCCEEDED"})
 INDEXABLE_SUMMARY_KINDS = frozenset({SummaryKind.CHECKPOINT.value, SummaryKind.BRANCH_FINAL.value})
 INDEXABLE_REPORT_KINDS = frozenset({ReportKind.INTERMEDIATE.value, ReportKind.FINAL.value})
 
@@ -276,11 +277,15 @@ class VectorIndex:
 
         self._db = await asyncio.to_thread(_connect)
         self._started = True
+        # 进程崩溃若停在 building，会让 search 永久返回 vector_index_rebuilding。
+        # 启动时清掉上一代残留 candidate 及其孤儿 Lance table。
+        await self._fail_stranded_building()
         await self._maybe_cleanup_retired()
 
     async def close(self) -> None:
         self._db = None
         self._started = False
+        self._rebuilding = False
 
     async def status(self) -> VectorIndexStatus:
         rows = await self._store.run_locked(_load_generation_rows)
@@ -323,8 +328,32 @@ class VectorIndex:
         return await self._store.run_locked(_list)
 
     async def enqueue(self, *, source_kind: str, source_id: str) -> VectorOpResult:
+        # 探测/写入在锁内；全量 auto-rebuild 在锁外再入，避免整个 corpus re-embed
+        # 占住 enqueue 临界区。重建期间 `_rebuilding` 已置位，并发 enqueue 快速失败，
+        # search 返回 vector_index_rebuilding；重建本身仍串行占用 `_lock`（安全边界）。
         async with self._lock:
-            return await self._enqueue_unlocked(source_kind=source_kind, source_id=source_id)
+            result, pending = await self._enqueue_unlocked(source_kind=source_kind, source_id=source_id)
+            if pending is not None:
+                self._rebuilding = True
+
+        if pending is None:
+            return result
+
+        selector, job_id, pending_kind, pending_id = pending
+        async with self._lock:
+            try:
+                await self._run_full_rebuild(selector=selector)
+            except (EmbeddingGenerationMismatch, VectorRebuildFailed):
+                pass
+            finally:
+                status_after = await self.status()
+                self._rebuilding = bool(status_after.candidate_active)
+
+            if await self._source_in_active_generation(pending_kind, pending_id):
+                generation = int((await self.status()).active_generation or 0)
+                await self._complete_job(job_id, generation=generation)
+                return VectorOpResult.ok(code="indexed", data={"rebuilt": True})
+            return result
 
     async def rebuild(self, *, force: bool = False) -> VectorOpResult:
         async with self._lock:
@@ -403,6 +432,10 @@ class VectorIndex:
         async with self._lock:
             status = await self.status()
             if status.candidate_active or self._rebuilding:
+                # 指纹仍匹配时 force=False 即可清 stranded，避免无谓全量重嵌
+                soft = await self._rebuild_unlocked(force=False)
+                if soft.success and not (await self.status()).candidate_active:
+                    return soft
                 return await self._rebuild_unlocked(force=True)
             if status.active_generation is None:
                 sources = await self._list_indexable_sources()
@@ -411,7 +444,11 @@ class VectorIndex:
                 return await self._rebuild_unlocked(force=True)
             return await self._rebuild_unlocked(force=False)
 
-    async def _enqueue_unlocked(self, *, source_kind: str, source_id: str) -> VectorOpResult:
+    async def _enqueue_unlocked(
+        self, *, source_kind: str, source_id: str
+    ) -> tuple[VectorOpResult, tuple[ModelSelector, str, str, str] | None]:
+        """返回 (结果, 待 auto-rebuild 上下文)。仅 fingerprint/维度/schema mismatch 才请求重建。"""
+
         now = time.time()
         job_id = f"vec_{uuid.uuid4().hex}"
         await self._insert_job(
@@ -425,42 +462,48 @@ class VectorIndex:
         source = await self._resolve_source(source_kind, source_id)
         if source is None:
             await self._fail_job(job_id, "source_not_found", "索引源不存在或不在白名单")
-            return VectorOpResult.fail(LRSError("source_not_found", "索引源不存在或不在白名单"))
+            return VectorOpResult.fail(LRSError("source_not_found", "索引源不存在或不在白名单")), None
 
         try:
             selector = self._require_task_selector()
         except LRSError as exc:
             await self._fail_job(job_id, exc.code, exc.message)
-            return VectorOpResult.fail(exc)
+            return VectorOpResult.fail(exc), None
 
         status = await self.status()
+        if status.rebuilding:
+            await self._fail_job(job_id, VECTOR_INDEX_REBUILDING, "向量索引正在重建")
+            return (
+                VectorOpResult.fail(LRSError(VECTOR_INDEX_REBUILDING, "向量索引正在重建")),
+                None,
+            )
+
         if status.active_generation is None:
-            # 空库：第一条白名单源触发 generation
+            # 空库：第一条白名单源触发 generation（失败返回结果，不 raise）
             try:
                 rebuild = await self._rebuild_unlocked(force=True)
             except EmbeddingGenerationMismatch as exc:
                 await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-                raise
+                return VectorOpResult.fail(exc), None
             except VectorRebuildFailed as exc:
                 await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-                return VectorOpResult.fail(exc)
+                return VectorOpResult.fail(exc), None
             if not rebuild.success:
                 await self._fail_job(
                     job_id,
                     rebuild.error.code if rebuild.error else "rebuild_failed",
                     rebuild.error.message if rebuild.error else "重建失败",
                 )
-                return rebuild
+                return rebuild, None
             await self._complete_job(job_id, generation=int((await self.status()).active_generation or 0))
-            return VectorOpResult.ok(code="indexed")
+            return VectorOpResult.ok(code="indexed"), None
 
         try:
             vectors, actual_model = await self._embed_texts([source.text], selector=selector)
         except EmbeddingGenerationMismatch as exc:
+            # 单次 embedding 响应非法 ≠ generation fingerprint 变更；不触发全量重建
             await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-            if self._config.auto_rebuild:
-                await self._auto_rebuild_after_mismatch(selector)
-            return VectorOpResult.fail(exc)
+            return VectorOpResult.fail(exc), None
 
         vector = vectors[0]
         fingerprint = compute_model_fingerprint(
@@ -475,9 +518,11 @@ class VectorIndex:
         )
         if mismatch is not None:
             await self._fail_job(job_id, mismatch.code, mismatch.message, metadata=mismatch.metadata)
-            if self._config.auto_rebuild:
-                await self._auto_rebuild_after_mismatch(selector)
-            return VectorOpResult.fail(mismatch)
+            # 仅真正的 fingerprint/维度/schema mismatch 才 auto-rebuild；
+            # VectorIndexUnavailable（瞬态 IO）只失败 job，不动 active generation。
+            if self._config.auto_rebuild and isinstance(mismatch, EmbeddingGenerationMismatch):
+                return VectorOpResult.fail(mismatch), (selector, job_id, source_kind, source_id)
+            return VectorOpResult.fail(mismatch), None
 
         try:
             await self._append_to_active(
@@ -491,30 +536,14 @@ class VectorIndex:
             )
         except EmbeddingGenerationMismatch as exc:
             await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-            if self._config.auto_rebuild:
-                await self._auto_rebuild_after_mismatch(selector)
-            return VectorOpResult.fail(exc)
+            pending = (selector, job_id, source_kind, source_id) if self._config.auto_rebuild else None
+            return VectorOpResult.fail(exc), pending
         except VectorIndexUnavailable as exc:
             await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-            if self._config.auto_rebuild:
-                await self._auto_rebuild_after_mismatch(selector)
-            return VectorOpResult.fail(exc)
+            return VectorOpResult.fail(exc), None
 
         await self._complete_job(job_id, generation=int(status.active_generation))
-        return VectorOpResult.ok(code="indexed")
-
-    async def _auto_rebuild_after_mismatch(self, selector: ModelSelector) -> None:
-        """mismatch 后进程内全量重建；失败保留旧 active + failed candidate。"""
-
-        self._rebuilding = True
-        try:
-            await self._run_full_rebuild(selector=selector)
-        except (EmbeddingGenerationMismatch, VectorRebuildFailed):
-            # 调用方已拿到原始 mismatch；重建失败细节留在 failed candidate
-            pass
-        finally:
-            status_after = await self.status()
-            self._rebuilding = bool(status_after.candidate_active)
+        return VectorOpResult.ok(code="indexed"), None
 
     async def _rebuild_unlocked(self, *, force: bool) -> VectorOpResult:
         try:
@@ -529,6 +558,7 @@ class VectorIndex:
             if not sources:
                 if status.candidate_active:
                     await self._fail_stranded_building()
+                    self._rebuilding = False
                 return VectorOpResult.ok(code="already_current")
             try:
                 probe_vectors, probe_model = await self._embed_texts([sources[0].text], selector=selector)
@@ -546,6 +576,7 @@ class VectorIndex:
                 # fingerprint 仍匹配时清掉 stranded building，避免索引永久不可用
                 if status.candidate_active:
                     await self._fail_stranded_building()
+                    self._rebuilding = False
                 return VectorOpResult.ok(code="already_current")
 
         self._rebuilding = True
@@ -569,7 +600,6 @@ class VectorIndex:
         table_names = await self._store.run_locked(_fail)
         for table_name in table_names:
             await self._drop_lance_table(table_name)
-        self._rebuilding = False
 
     async def _drop_lance_table(self, table_name: str) -> None:
         def _drop() -> None:
@@ -588,14 +618,15 @@ class VectorIndex:
         if not sources:
             # 空库不分配 generation，避免幽灵 failed candidate
             await self._fail_stranded_building()
+            self._rebuilding = False
             return VectorOpResult.ok(code="empty")
+
+        # 复用 helper：失败旧 building 行并丢弃孤儿 Lance table（勿用裸 UPDATE）
+        await self._fail_stranded_building()
 
         now = time.time()
 
         def _prepare(connection: Any) -> tuple[int, str]:
-            connection.execute(
-                "UPDATE vector_generations SET status = 'failed' WHERE status = 'building'"
-            )
             generation = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(generation), 0) + 1 FROM vector_generations"
@@ -861,9 +892,13 @@ class VectorIndex:
                     "禁止截断或 padding 向量以适配旧 table",
                     {"table_dimension": dimension, "vector_dimension": len(vector)},
                 )
-            row_id = str(row["id"]).replace("'", "''")
-            table.delete(f"id = '{row_id}'")
-            table.add([row])
+            # merge_insert 原子 upsert，避免 delete-then-add 在 add 失败时丢行
+            (
+                table.merge_insert("id")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute([row])
+            )
 
         try:
             await asyncio.to_thread(_upsert)
@@ -893,6 +928,25 @@ class VectorIndex:
             )
 
         await self._store.run_locked(_doc)
+
+    async def _source_in_active_generation(self, source_kind: str, source_id: str) -> bool:
+        status = await self.status()
+        if status.active_generation is None:
+            return False
+        generation = int(status.active_generation)
+
+        def _check(connection: Any) -> bool:
+            row = connection.execute(
+                """
+                SELECT 1 FROM vector_documents
+                WHERE source_kind = ? AND source_id = ? AND generation = ?
+                LIMIT 1
+                """,
+                (source_kind, source_id, generation),
+            ).fetchone()
+            return row is not None
+
+        return await self._store.run_locked(_check)
 
     async def _list_indexable_sources(self) -> list[IndexableSource]:
         return await self._store.run_locked(_load_indexable_sources)

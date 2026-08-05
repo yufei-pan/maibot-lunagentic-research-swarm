@@ -287,14 +287,17 @@ async def test_dimension_change_starts_new_generation_without_padding(vector_har
     vector_harness.embedder.return_vectors([[1.0, 2.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     result = await vector_harness.index_new_source("summary-2")
-    assert not result.success
-    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
+    # auto-rebuild 成功后源已在新 generation → enqueue 报告成功
+    assert result.success
+    assert result.code == "indexed"
     status = await vector_harness.status()
     assert not status.rebuilding
     assert not status.candidate_active
     assert status.dimension == 2
     assert old.dimension == 3
     assert old.active_generation in status.retired_generations
+    jobs = await vector_harness.index.list_jobs(status="done")
+    assert any(job["source_id"] == "summary-2" for job in jobs)
 
 
 @pytest.mark.asyncio
@@ -317,8 +320,7 @@ async def test_selector_change_triggers_mismatch_rebuild(vector_harness) -> None
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
     result = await vector_harness.index_new_source("summary-selector")
-    assert not result.success
-    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
+    assert result.success
     status = await vector_harness.status()
     assert not status.rebuilding
     assert status.selector == "task:other-embedding"
@@ -331,8 +333,7 @@ async def test_actual_model_change_triggers_mismatch(vector_harness) -> None:
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
     result = await vector_harness.index_new_source("summary-model")
-    assert not result.success
-    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
+    assert result.success
     status = await vector_harness.status()
     assert status.actual_model_name == "fake-embed-v2"
     assert not status.rebuilding
@@ -345,8 +346,7 @@ async def test_schema_version_bump_forces_rebuild(vector_harness) -> None:
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
     result = await vector_harness.index_new_source("summary-schema")
-    assert not result.success
-    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
+    assert result.success
     status = await vector_harness.status()
     assert status.schema_version == VECTOR_SCHEMA_VERSION + 1
     assert not status.rebuilding
@@ -452,23 +452,143 @@ async def test_task_selector_uses_task_name_not_model_pin(vector_harness) -> Non
 
 @pytest.mark.asyncio
 async def test_runtime_statuses_make_summaries_and_reports_indexable(vector_harness) -> None:
+    assert INDEXABLE_CONTENT_STATUSES == frozenset({"SUCCEEDED"})
     assert "READY" not in INDEXABLE_CONTENT_STATUSES
     await vector_harness.seed_summary("s-ok", text="检查点摘要", status="SUCCEEDED")
-    await vector_harness.seed_summary("s-deg", kind="BRANCH_FINAL", text="分支终态", status="DEGRADED")
+    await vector_harness.seed_summary("s-branch", kind="BRANCH_FINAL", text="分支终态", status="SUCCEEDED")
+    await vector_harness.seed_summary("s-fail", kind="CHECKPOINT", text="失败摘要不应入库", status="FAILED")
     await vector_harness.seed_report("r-final", kind="FINAL", text="终报", status="SUCCEEDED")
-    await vector_harness.seed_report("r-mid", kind="INTERMEDIATE", text="中报", status="FAILED")
+    await vector_harness.seed_report(
+        "r-deg",
+        kind="INTERMEDIATE",
+        text="当前尚无可用分支摘要；调查仍在进行。",
+        status="DEGRADED",
+    )
+    await vector_harness.seed_report(
+        "r-fail",
+        kind="FINAL",
+        text="报告总结器不可用；以下为已提交 coverage。",
+        status="FAILED",
+    )
     await vector_harness.seed_feedback_lesson("fb-1", lesson="只索引 lesson")
 
     sources = await vector_harness.store.run_locked(_load_indexable_sources)
     kinds = {(s.source_kind, s.source_id) for s in sources}
     assert ("checkpoint_summary", "s-ok") in kinds
-    assert ("branch_final_summary", "s-deg") in kinds
+    assert ("branch_final_summary", "s-branch") in kinds
+    assert ("checkpoint_summary", "s-fail") not in kinds
     assert ("final_report", "r-final") in kinds
-    assert ("intermediate_report", "r-mid") in kinds
+    assert ("intermediate_report", "r-deg") not in kinds
+    assert ("final_report", "r-fail") not in kinds
     assert ("feedback_lesson", "fb-1") in kinds
     lesson = next(s for s in sources if s.source_id == "fb-1")
     assert lesson.text == "只索引 lesson"
     assert "不应入库" not in lesson.text
+    apology_texts = {s.text for s in sources}
+    assert "当前尚无可用分支摘要；调查仍在进行。" not in apology_texts
+    assert "报告总结器不可用；以下为已提交 coverage。" not in apology_texts
+    assert "失败摘要不应入库" not in apology_texts
+
+
+@pytest.mark.asyncio
+async def test_transient_index_unavailable_does_not_auto_rebuild(vector_harness) -> None:
+    await vector_harness.build_with_vectors([[1.0, 2.0, 3.0]])
+    old = await vector_harness.status()
+    await vector_harness.seed_summary("sum-io", text="瞬态 IO 源")
+    calls_before = len(vector_harness.embedder.calls)
+
+    original_detect = vector_harness.index._detect_mismatch
+
+    def _io_fail(*args, **kwargs):
+        from lunagentic_research_swarm.storage.vectors import VectorIndexUnavailable
+
+        return VectorIndexUnavailable("simulated open_table IO", {"table_name": old.table_name})
+
+    vector_harness.index._detect_mismatch = _io_fail  # type: ignore[method-assign]
+    vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
+    try:
+        result = await vector_harness.index.enqueue(
+            source_kind="checkpoint_summary",
+            source_id="sum-io",
+        )
+    finally:
+        vector_harness.index._detect_mismatch = original_detect  # type: ignore[method-assign]
+
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == "vector_index_unavailable"
+    status = await vector_harness.status()
+    assert status.active_generation == old.active_generation
+    assert status.dimension == old.dimension
+    # 仅探测 embedding，无全量 rebuild
+    assert len(vector_harness.embedder.calls) == calls_before + 1
+
+
+@pytest.mark.asyncio
+async def test_start_reconciles_stranded_building(tmp_path) -> None:
+    import time
+
+    from lunagentic_research_swarm.storage.vectors import _insert_generation, _table_name_for
+
+    harness = await VectorHarness.create(tmp_path)
+    try:
+        await harness.build_with_vectors([[1.0, 2.0, 3.0]])
+        old = await harness.status()
+
+        def _strand(connection) -> None:
+            _insert_generation(
+                connection,
+                generation=55,
+                selector=str(old.selector),
+                actual_model_name=None,
+                model_fingerprint="pending",
+                dimension=None,
+                table_name=_table_name_for(55),
+                schema_version=1,
+                status="building",
+                created_at=time.time(),
+            )
+
+        await harness.store.run_locked(_strand)
+        lance_dir = harness.tmp_path / "vectors" / "lancedb"
+        await harness.index.close()
+
+        restarted = VectorIndex(
+            harness.store,
+            harness.embedder,
+            EmbeddingSection(
+                selector="task:embedding",
+                batch_size=8,
+                max_concurrent=2,
+                auto_rebuild=True,
+                retired_generation_retention_seconds=86400,
+            ),
+            lance_dir,
+        )
+        await restarted.start()
+        try:
+            status = await restarted.status()
+            assert not status.candidate_active
+            assert not status.rebuilding
+            assert status.active_generation == old.active_generation
+            search = await restarted.search("正式任务种子")
+            assert search.success
+        finally:
+            await restarted.close()
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_index_enqueue_mismatch_returns_result_not_raise(vector_harness) -> None:
+    await vector_harness.seed_formalized("first", "首条正式任务")
+    vector_harness.embedder.return_vectors([[1.0, 2.0], [1.0, 2.0, 3.0]])
+    result = await vector_harness.index.enqueue(source_kind="formalized_task", source_id="first")
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
+    jobs = await vector_harness.index.list_jobs(status="failed")
+    assert any(job["source_id"] == "first" for job in jobs)
 
 
 @pytest.mark.asyncio
