@@ -13,6 +13,7 @@ from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition, 
 
 Handler = Callable[[Any, Mapping[str, Any]], Awaitable[ProcedureResult]]
 
+_MAX_EXPRESSION_LENGTH = 2000
 _MAX_AST_NODES = 128
 _MAX_ABS_NUMBER = 1e100
 _MAX_ABS_EXPONENT = 100
@@ -108,7 +109,10 @@ class _DivisionByZero(Exception):
 def _check_number(value: float | int) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _UnsafeExpression("仅允许数值常量")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise _UnsafeExpression("数值绝对值超过上限") from exc
     if not math.isfinite(number):
         raise _UnsafeExpression("数值必须有限")
     if abs(number) > _MAX_ABS_NUMBER:
@@ -122,7 +126,10 @@ def _eval_node(node: ast.AST) -> float:
     if isinstance(node, ast.Constant):
         return _check_number(node.value)
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
-        return float(_UNARY_OPS[type(node.op)](_eval_node(node.operand)))
+        try:
+            return float(_UNARY_OPS[type(node.op)](_eval_node(node.operand)))
+        except OverflowError as exc:
+            raise _UnsafeExpression("运算结果绝对值超过上限") from exc
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
         left = _eval_node(node.left)
         right = _eval_node(node.right)
@@ -135,13 +142,19 @@ def _eval_node(node: ast.AST) -> float:
             result = _BIN_OPS[type(node.op)](left, right)
         except ZeroDivisionError as exc:
             raise _DivisionByZero("除数不能为 0") from exc
+        except OverflowError as exc:
+            raise _UnsafeExpression("运算结果绝对值超过上限") from exc
         if not isinstance(result, int | float) or isinstance(result, bool):
             raise _UnsafeExpression("运算结果必须为数值")
-        if not math.isfinite(float(result)):
+        try:
+            number = float(result)
+        except OverflowError as exc:
+            raise _UnsafeExpression("运算结果绝对值超过上限") from exc
+        if not math.isfinite(number):
             raise _UnsafeExpression("运算结果必须有限")
-        if abs(float(result)) > _MAX_ABS_NUMBER:
+        if abs(number) > _MAX_ABS_NUMBER:
             raise _UnsafeExpression("运算结果绝对值超过上限")
-        return float(result)
+        return number
     raise _UnsafeExpression("表达式包含不允许的语法")
 
 
@@ -150,9 +163,14 @@ def calculate(expression: str) -> ProcedureResult:
 
     if not isinstance(expression, str) or not expression.strip():
         return _failure("invalid_arguments", "expression 必须为非空字符串")
+    if len(expression) > _MAX_EXPRESSION_LENGTH:
+        return _failure("unsafe_expression", "表达式长度超过上限")
     try:
         tree = ast.parse(expression, mode="eval")
     except SyntaxError:
+        return _failure("unsafe_expression", "表达式无法解析")
+    except (RecursionError, MemoryError, ValueError):
+        # 超深/超大表达式在解析阶段耗尽资源 → 与语法拒绝同为 unsafe_expression
         return _failure("unsafe_expression", "表达式无法解析")
     nodes = list(ast.walk(tree))
     if len(nodes) > _MAX_AST_NODES:
@@ -163,6 +181,8 @@ def calculate(expression: str) -> ProcedureResult:
         return _failure("division_by_zero", str(exc))
     except _UnsafeExpression as exc:
         return _failure("unsafe_expression", str(exc))
+    except (OverflowError, FloatingPointError, ValueError) as exc:
+        return _failure("unsafe_expression", str(exc) or "数值超出可表示范围")
     return _success({"expression": expression, "value": value})
 
 

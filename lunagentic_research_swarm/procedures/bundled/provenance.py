@@ -85,6 +85,9 @@ def normalize_url(url: str) -> str:
         host = parts.hostname.encode("idna").decode("ascii").lower()
     except (UnicodeError, ValueError) as exc:
         raise ValueError("host 未通过 IDNA 校验") from exc
+    # urlsplit 对 IPv6 返回无方括号 hostname；重建 netloc 时必须加回括号
+    if ":" in host:
+        host = f"[{host}]"
     port = parts.port
     if port is not None and _DEFAULT_PORTS.get(scheme) == port:
         netloc = host
@@ -204,12 +207,16 @@ def organize_provenance(
 
     claim_sources: dict[str, list[str]] = {}
     unbacked: list[str] = []
+    seen_claim_ids: set[str] = set()
     for raw in claims:
         if not isinstance(raw, Mapping):
             return _failure("invalid_arguments", "claims 元素必须为对象")
         claim_id = raw.get("claim_id")
         if not isinstance(claim_id, str) or not claim_id:
             return _failure("invalid_arguments", "claim_id 必须为非空字符串")
+        if claim_id in seen_claim_ids:
+            return _failure("invalid_arguments", f"重复的 claim_id：{claim_id}")
+        seen_claim_ids.add(claim_id)
         source_ids_raw = raw.get("source_ids", [])
         if source_ids_raw is None:
             source_ids_raw = []

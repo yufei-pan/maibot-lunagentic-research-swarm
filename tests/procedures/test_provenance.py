@@ -30,6 +30,12 @@ def test_url_normalizer_rejects_invalid_idna() -> None:
         normalize_url("https://.\u200b.com/path")
 
 
+def test_url_normalizer_preserves_ipv6_brackets() -> None:
+    assert normalize_url("https://[::1]:443/a") == "https://[::1]/a"
+    assert normalize_url("http://[2001:db8::1]:8080/x") == "http://[2001:db8::1]:8080/x"
+    assert normalize_url("https://[::1]/path") == "https://[::1]/path"
+
+
 def test_normalize_urls_dedupes_and_merges_source_ids() -> None:
     result = normalize_urls(
         [
@@ -105,6 +111,27 @@ def test_organize_provenance_maps_claims_without_rewriting_snippets() -> None:
     assert by_id["s1"]["timestamp"] == "2026-01-01T00:00:00Z"
     assert by_id["s1"]["snippet"] == "原始摘要，勿改写"
     assert by_id["s1"]["url"] == "https://example.com/a?b=2&b=1"
+
+
+def test_organize_provenance_rejects_duplicate_claim_ids() -> None:
+    result = organize_provenance(
+        claims=[
+            {"claim_id": "c1", "text": "无依据", "source_ids": []},
+            {"claim_id": "c1", "text": "有依据", "source_ids": ["s1"]},
+        ],
+        sources=[
+            {
+                "source_id": "s1",
+                "url": "https://example.com/",
+                "source_type": "web",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "snippet": "s",
+            }
+        ],
+    )
+    assert not result.success
+    assert result.error.code == "invalid_arguments"
+    assert "claim_id" in result.error.message
 
 
 @pytest.mark.asyncio

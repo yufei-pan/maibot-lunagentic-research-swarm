@@ -38,8 +38,32 @@ def test_calculator_rejects_oversized_ast() -> None:
     assert result.error.code == "unsafe_expression"
 
 
+def test_calculator_rejects_expression_longer_than_2000() -> None:
+    # 在 ast.parse 之前按 schema maxLength 拒绝，避免同步解析阻塞
+    expression = "1+" * 1001  # 2002 chars
+    assert len(expression) > 2000
+    result = calculate(expression)
+    assert not result.success
+    assert result.error.code == "unsafe_expression"
+    assert "长度" in result.error.message
+
+
 def test_calculator_rejects_huge_literal() -> None:
     result = calculate("1e101")
+    assert not result.success
+    assert result.error.code == "unsafe_expression"
+
+
+def test_calculator_rejects_arithmetic_overflow() -> None:
+    # 指数在允许范围，但运算溢出 float → 结构化 unsafe_expression，不抛出
+    result = calculate("1e100 ** 100")
+    assert not result.success
+    assert result.error.code == "unsafe_expression"
+
+
+def test_calculator_rejects_oversized_integer_literal() -> None:
+    # 超大整数字面量在 float() 转换时 OverflowError → unsafe_expression
+    result = calculate("1" + "0" * 400)
     assert not result.success
     assert result.error.code == "unsafe_expression"
 
