@@ -634,25 +634,25 @@ async def test_real_descriptor_validation_failure_degrades_and_clean_scan_recove
 
 @pytest.mark.asyncio
 async def test_health_is_explicit_for_root_summarizer_and_physical_pinning(plugin_module, tmp_path: Path) -> None:
-    unavailable, _, _, _, _ = build_container(
+    partial, _, _, _, _ = build_container(
         plugin_module,
-        tmp_path / "unavailable",
+        tmp_path / "partial",
         snapshot_loader=lambda: {
             "models": [{"name": "m", "price_in": 1, "price_out": 2}],
             "model_task_config": {"utils": {"model_list": ["m"]}},
         },
         pinning_available=False,
     )
-    await unavailable.start()
-    health = unavailable.health()
+    await partial.start()
+    health = partial.health()
+    # 内置九个默认智能体经 registry 装入后，默认 root 应变为可用。
     assert health["root_agent"] == {
-        "status": "degraded",
-        "code": "root_agent_unavailable",
+        "status": "healthy",
         "agent_id": "builtin.quick_thinker",
     }
     assert health["root_selector"] == {
-        "status": "degraded",
-        "code": "root_agent_unavailable",
+        "status": "healthy",
+        "selector": "task:utils",
     }
     assert health["summarizer_selector"] == {
         "status": "degraded",
@@ -663,7 +663,7 @@ async def test_health_is_explicit_for_root_summarizer_and_physical_pinning(plugi
         "status": "degraded",
         "code": "physical_pinning_unsupported",
     }
-    await unavailable.close()
+    await partial.close()
 
     def root_provider(agents: Any, procedures: Any) -> None:
         agents.replace_provider("provider.agents", [agent_payload("agents.root")])

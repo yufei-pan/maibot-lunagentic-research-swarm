@@ -102,10 +102,16 @@ class _NextRoundState:
         return {name: dict(value) for name, value in self.plugin_price_overrides}
 
 
-def _empty_builtin_provider_loader(agents: AgentRegistry, procedures: ProcedureRegistry) -> None:
-    """本阶段只保留内置 provider 接线点，不注册任何默认定义。"""
+def _load_builtin_providers(agents: AgentRegistry, procedures: ProcedureRegistry) -> None:
+    """通过与第三方相同的 replace_provider 路径装入内置默认智能体。"""
 
-    del agents, procedures
+    from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
+
+    del procedures
+    agents.replace_provider(
+        "builtin",
+        [definition.model_dump(mode="json") for definition in bundled_agent_definitions()],
+    )
 
 
 class LRSServiceContainer:
@@ -120,7 +126,7 @@ class LRSServiceContainer:
         discovery_factory: DiscoveryFactory = ExtensionDiscovery,
         host_snapshot_loader: Callable[[], dict[str, Any] | None] | None = None,
         physical_pinning: Any | None = None,
-        builtin_provider_loader: BuiltinProviderLoader = _empty_builtin_provider_loader,
+        builtin_provider_loader: BuiltinProviderLoader = _load_builtin_providers,
     ) -> None:
         self._ctx = ctx
         self._config = config.model_copy(deep=True)

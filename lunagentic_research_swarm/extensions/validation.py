@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel
@@ -106,6 +106,33 @@ def validate_model_selector(value: str) -> str:
     if separator != ":" or prefix not in {"task", "model"} or not suffix or suffix != suffix.strip():
         raise ValueError("模型选择器必须使用 task:<名称> 或 model:<名称>")
     return value
+
+
+def validate_agent_batch(provider_id: str, definitions: Sequence[Any]) -> list[Any]:
+    """对一个 provider 的 agent 批次做与 registry 相同的严格校验；整批通过或整批失败。"""
+
+    # 延迟导入以避免与 contracts 的循环依赖。
+    from lunagentic_research_swarm.extensions.contracts import AgentDefinition
+
+    authorized_namespace = authorized_provider_namespace(provider_id)
+    raw_definitions: list[Mapping[str, Any]] = []
+    for item in definitions:
+        if isinstance(item, AgentDefinition):
+            raw_definitions.append(item.model_dump(mode="python"))
+        elif isinstance(item, Mapping):
+            raw_definitions.append(item)
+        else:
+            raise TypeError("agent provider 批次只能包含 AgentDefinition 或 Mapping")
+    checked = [AgentDefinition.model_validate(item) for item in raw_definitions]
+    ids = [item.agent_id for item in checked]
+    if len(set(ids)) != len(ids):
+        raise ValueError("agent provider 批次包含重复 ID")
+    for agent_id in ids:
+        if agent_id.partition(".")[0] != authorized_namespace:
+            raise ValueError(
+                f"agent_id {agent_id} 不属于 provider {provider_id} 获授权的命名空间 {authorized_namespace}"
+            )
+    return checked
 
 
 def _fingerprint_value(value: Any) -> Any:
