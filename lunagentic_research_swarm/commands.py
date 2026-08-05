@@ -63,12 +63,10 @@ def clip_command_output(text: str, max_chars: int, *, error_lines: Sequence[str]
         return _truncate_body(limit)
 
     # 优先为错误摘要预留空间：取最大可显示条数 K，再把剩余预算给正文。
-    shown = 0
     footer = _error_footer(0)
     for candidate in range(total, -1, -1):
         trial = _error_footer(candidate)
         if len(trial) <= limit:
-            shown = candidate
             footer = trial
             break
     else:

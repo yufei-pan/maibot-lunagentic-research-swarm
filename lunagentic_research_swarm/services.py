@@ -19,7 +19,6 @@ from lunagentic_research_swarm.agents.registry import (
     RootAgentUnavailableError,
 )
 from lunagentic_research_swarm.config import AgentOverride, LRSConfig, ProcedureOverride
-from lunagentic_research_swarm.errors import LRSError
 from lunagentic_research_swarm.extensions.contracts import ExtensionRefreshDelta
 from lunagentic_research_swarm.extensions.discovery import ExtensionDiscovery
 from lunagentic_research_swarm.feedback import FeedbackService
@@ -851,6 +850,18 @@ class LRSServiceContainer:
             return {"status": "degraded", "code": "extension_descriptor_invalid"}
         return dict(self._status["extension_discovery"])
 
+    def _recommended_fetch_health(self) -> dict[str, Any]:
+        """推荐的 fetch-url provider 健康度；缺失时为 recommended_missing，不阻断加载。"""
+
+        procedure_id = "fetch_url.fetch"
+        provider_id = "com.0-hz.fetch-url"
+        if self.procedure_registry.is_live(procedure_id):
+            return {"status": "healthy", "detail": procedure_id}
+        provider_health = self.procedure_registry.health.get(provider_id)
+        if provider_health is not None and provider_health.status == "invalid":
+            return {"status": "degraded", "code": "fetch_provider_invalid", "detail": procedure_id}
+        return {"status": "recommended_missing", "code": "fetch_url_missing", "detail": procedure_id}
+
     def health(self) -> dict[str, Any]:
         self._ensure_running()
         root_agent, root_selector = self._root_health()
@@ -863,6 +874,7 @@ class LRSServiceContainer:
             "physical_pinning": dict(self._status["physical_pinning"]),
             "extension_discovery": self._extension_discovery_health(),
             "extension_providers": self._extension_provider_health(),
+            "recommended_fetch": self._recommended_fetch_health(),
             "root_agent": root_agent,
             "root_selector": root_selector,
             "summarizer_selector": self._summarizer_health(),

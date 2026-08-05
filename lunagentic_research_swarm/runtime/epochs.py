@@ -13,7 +13,7 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from lunagentic_research_swarm.llm.summarizer import BranchFinalizationRequest, SummaryResult, TaskFinalizationRequest
@@ -418,7 +418,8 @@ class ReportCoordinator:
     async def _summarize_branch(
         self, branch_id: str, *, checkpoint: bool, history: Sequence[Mapping[str, Any]]
     ) -> str | None:
-        branch = self.branches[branch_id]
+        if branch_id not in self.branches:
+            raise KeyError(branch_id)
         kind = SummaryKind.CHECKPOINT if checkpoint else SummaryKind.BRANCH_FINAL
         summary_id = _new_id("sum")
         result = await self.summarizer.finalize_branch(

@@ -465,7 +465,6 @@ class FairScheduler:
         self._active[active_id] = _ActiveEffect(entry, task, self._clock(), token)
 
     async def _run_entry(self, entry: _QueuedEffect, token: GenerationToken) -> None:
-        active_item = next((item for item in self._active.values() if item.entry is entry), None)
         resource = self._resource_kind(entry.effect.kind)
         task_id = str(entry.effect.task_id)
         try:

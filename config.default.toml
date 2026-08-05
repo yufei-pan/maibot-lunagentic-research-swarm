@@ -1,3 +1,6 @@
+# 麦麦深度调查组（Lunagentic Research Swarm）默认配置模板。
+# 复制为 config.toml 后按需修改。不要把含密钥的 live config 提交到版本库。
+
 [plugin]
 config_version = "1.0.0"
 enabled = true
@@ -53,9 +56,21 @@ store_raw_procedure_payloads = false
 [extensions]
 refresh_interval_seconds = 60
 
+# ---------------------------------------------------------------------------
+# Note / 注意：插件价格覆盖
+# 只要在下方为某物理模型写了条目，就会忽略 Host 中该模型的全部价格字段；
+# 未写字段按 0（免费）计。Host 价格优先，仅在需要完整覆盖时使用插件 override。
+# 模型配置价格数值 1.0 = 100 credits；界面货币标签（¥/$/€ 等）一律忽略。
+# ---------------------------------------------------------------------------
 [pricing]
 
 [pricing.models]
+# 示例（默认注释掉；取消注释后生效）：
+# [pricing.models."example-model"]
+# price_in = 0.0
+# cache = false
+# cache_price_in = 0.0
+# price_out = 0.0
 
 [reporting]
 max_report_chars = 60000
@@ -84,6 +99,48 @@ tavily_api_key = ""
 you_base_url = ""
 you_api_key = ""
 
+# 九个默认智能体可覆写示例（取消注释后生效；留空字段继承内置定义）
 [agents]
+# [agents."builtin.quick_thinker"]
+# enabled = true
+# selector = "task:utils"
+# protocol = "json_envelope"
+# auto_compact_tokens = 258000
+#
+# [agents."builtin.deep_thinker"]
+# enabled = true
+# selector = "task:planner"
+#
+# [agents."builtin.debater"]
+# enabled = true
+# selector = "task:replyer"
+#
+# [agents."builtin.researcher"]
+# enabled = true
+# selector = "task:utils"
+#
+# [agents."builtin.memory_researcher"]
+# enabled = true
+# selector = "task:utils"
+#
+# [agents."builtin.knowledge_reporter"]
+# enabled = true
+# selector = "task:replyer"
+#
+# [agents."builtin.past_case_researcher"]
+# enabled = true
+# selector = "task:utils"
+#
+# [agents."builtin.evidence_verifier"]
+# enabled = true
+# selector = "task:planner"
+#
+# [agents."builtin.quantitative_analyst"]
+# enabled = true
+# selector = "task:planner"
+# protocol = "native_tools"
 
 [procedures]
+# [procedures."builtin.web_search"]
+# enabled = true
+# timeout_seconds = 30.0

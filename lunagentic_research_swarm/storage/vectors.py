@@ -9,11 +9,12 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from lunagentic_research_swarm.config import EmbeddingSection
 from lunagentic_research_swarm.errors import (
@@ -27,6 +28,8 @@ from lunagentic_research_swarm.llm.gateway import ModelSelector
 from lunagentic_research_swarm.models import ReportKind, SummaryKind
 
 VECTOR_SCHEMA_VERSION = 1
+
+_T = TypeVar("_T")
 
 # 仅索引有可用正文的内容态。runtime/epochs.py 对 summaries/reports：
 # SUCCEEDED 才带真实文本；FAILED/DEGRADED 是道歉占位（text NULL 或固定话术），不当历史案例。
@@ -259,6 +262,17 @@ class VectorIndex:
         self._rebuild_task: asyncio.Task[None] | None = None
         self._last_rebuild_error: LRSError | None = None
         self._lock = asyncio.Lock()
+        # LanceDB 对并发 native 访问不稳定；所有 lance 调用串行化到单 worker，
+        # 避免默认 asyncio.to_thread 线程池与其它测试/任务交错触发 segfault。
+        self._lance_executor: ThreadPoolExecutor | None = None
+
+    async def _run_lance(self, function: Callable[[], _T]) -> _T:
+        """在专用单线程池中执行 Lance 原生调用。"""
+
+        loop = asyncio.get_running_loop()
+        if self._lance_executor is None:
+            self._lance_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lrs-lance")
+        return await loop.run_in_executor(self._lance_executor, function)
 
     def set_selector(self, selector: str) -> None:
         """测试/热更新：切换 embedding selector。"""
@@ -283,7 +297,7 @@ class VectorIndex:
 
             return lancedb.connect(str(self._lance_dir))
 
-        self._db = await asyncio.to_thread(_connect)
+        self._db = await self._run_lance(_connect)
         self._started = True
         # 进程崩溃若停在 building，会让 search 永久返回 vector_index_rebuilding。
         # 启动时清掉上一代残留 candidate 及其孤儿 Lance table。
@@ -303,6 +317,11 @@ class VectorIndex:
         self._started = False
         self._rebuilding = False
         self._last_rebuild_error = None
+        executor = self._lance_executor
+        self._lance_executor = None
+        if executor is not None:
+            # 必须等在途 lance 调用结束；cancel_futures 会在 native 层中途打断并可能 segfault。
+            executor.shutdown(wait=True)
 
     async def status(self) -> VectorIndexStatus:
         rows = await self._store.run_locked(_load_generation_rows)
@@ -450,7 +469,7 @@ class VectorIndex:
             return hits
 
         try:
-            hits = await asyncio.to_thread(_search)
+            hits = await self._run_lance(_search)
         except Exception as exc:
             return VectorOpResult.fail(VectorIndexUnavailable(f"LanceDB 检索失败：{exc}", {"table_name": table_name}))
         return VectorOpResult.ok(data={"hits": hits})
@@ -747,7 +766,7 @@ class VectorIndex:
                 self._db.drop_table(table_name)
 
         try:
-            await asyncio.to_thread(_drop)
+            await self._run_lance(_drop)
         except Exception:
             pass
 
@@ -841,7 +860,7 @@ class VectorIndex:
                         {"rows": table.count_rows(), "expected": len(prepared_rows)},
                     )
 
-            await asyncio.to_thread(_write_table)
+            await self._run_lance(_write_table)
 
             activated_at = time.time()
 
@@ -1030,7 +1049,7 @@ class VectorIndex:
             (table.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute([row]))
 
         try:
-            await asyncio.to_thread(_upsert)
+            await self._run_lance(_upsert)
         except EmbeddingGenerationMismatch:
             raise
         except Exception as exc:
@@ -1188,7 +1207,7 @@ class VectorIndex:
                     self._db.drop_table(name)
 
             try:
-                await asyncio.to_thread(_drop)
+                await self._run_lance(_drop)
             except Exception:
                 continue
 
