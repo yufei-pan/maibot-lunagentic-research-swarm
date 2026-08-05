@@ -59,7 +59,12 @@ class MaisakaOutbox:
         self._wake_event.set()
 
     async def deliver_once(self) -> int:
-        """Attempt currently due rows and return the number attempted."""
+        """Attempt currently due rows and return the number attempted.
+
+        Claim is serialized under ``_lock``; Maisaka network I/O runs *outside*
+        the lock so a slow/hung RPC cannot stall further claims or wake handling.
+        Completion/failure mutations carry the claim lease token.
+        """
 
         async with self._lock:
             now = float(self.clock())
@@ -73,14 +78,14 @@ class MaisakaOutbox:
                     rows = await self.store.list_due_outbox(now)
             else:
                 rows = await self.store.list_due_outbox(now)
-            attempted = 0
-            for row in rows:
-                attempted += 1
-                try:
-                    await self._deliver_row(row)
-                except Exception as exc:
-                    await self._record_failure(row, exc)
-            return attempted
+        attempted = 0
+        for row in rows:
+            attempted += 1
+            try:
+                await self._deliver_row(row)
+            except Exception as exc:
+                await self._record_failure(row, exc)
+        return attempted
 
     async def _run(self) -> None:
         while not self._closed:
@@ -114,12 +119,37 @@ class MaisakaOutbox:
             )
             return
         if kind in {"trigger", "trigger_report_review"}:
+            # Feedback already submitted → never nudge Maisaka to call submit again.
+            idem = str(row.get("idempotency_key") or "")
+            if idem.startswith("lrs:feedback-reminder:") and await self._feedback_already_submitted(
+                str(row["round_id"])
+            ):
+                await self.store.mark_outbox_delivered(
+                    str(row["outbox_id"]), delivered_at=float(self.clock()), **self._lease_kwargs(row)
+                )
+                return
             await self._trigger(stream_id, payload, row)
             await self.store.mark_outbox_delivered(
                 str(row["outbox_id"]), delivered_at=float(self.clock()), **self._lease_kwargs(row)
             )
             return
         raise ValueError(f"unknown Maisaka outbox delivery kind: {kind}")
+
+    async def _feedback_already_submitted(self, round_id: str) -> bool:
+        """True when ``feedback_events`` already has a row for this round."""
+
+        run_locked = getattr(self.store, "run_locked", None)
+        if not callable(run_locked):
+            return False
+
+        def _check(connection: Any) -> bool:
+            row = connection.execute(
+                "SELECT 1 FROM feedback_events WHERE round_id = ? LIMIT 1",
+                (round_id,),
+            ).fetchone()
+            return row is not None
+
+        return bool(await run_locked(_check))
 
     async def _append(self, stream_id: str, payload: Mapping[str, Any], row: Mapping[str, Any]) -> None:
         text = str(payload.get("text", ""))

@@ -324,6 +324,18 @@ class FeedbackService:
                     """,
                     (_REMINDER_CANCELLED, round_id, _REMINDER_PENDING),
                 )
+                # 已 process_due 插入的提醒 outbox 仍可能 PENDING；一并取消。
+                # 已 claim 的 IN_FLIGHT 由 deliver 侧再查 feedback_events 跳过投递。
+                connection.execute(
+                    """
+                    UPDATE maisaka_outbox
+                    SET status = 'cancelled', last_error = 'feedback_already_submitted'
+                    WHERE round_id = ?
+                      AND idempotency_key = ?
+                      AND UPPER(status) = 'PENDING'
+                    """,
+                    (round_id, f"lrs:feedback-reminder:{round_id}"),
+                )
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")

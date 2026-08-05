@@ -437,7 +437,7 @@ class VectorIndex:
 
         query_vector = vectors[0]
         fingerprint = compute_model_fingerprint(selector.raw, actual_model, len(query_vector), self._schema_version)
-        mismatch = self._detect_mismatch(
+        mismatch = await self._detect_mismatch(
             status,
             selector_raw=selector.raw,
             actual_model=actual_model,
@@ -672,7 +672,7 @@ class VectorIndex:
 
         vector = vectors[0]
         fingerprint = compute_model_fingerprint(selector.raw, actual_model, len(vector), self._schema_version)
-        mismatch = self._detect_mismatch(
+        mismatch = await self._detect_mismatch(
             status,
             selector_raw=selector.raw,
             actual_model=actual_model,
@@ -962,7 +962,7 @@ class VectorIndex:
             expected_dimension=expected_dimension,
         )
 
-    def _detect_mismatch(
+    async def _detect_mismatch(
         self,
         status: VectorIndexStatus,
         *,
@@ -971,6 +971,8 @@ class VectorIndex:
         dimension: int,
         fingerprint: str,
     ) -> LRSError | None:
+        """比对 generation metadata；Lance schema 探测必须走 ``_run_lance``，禁止在事件循环线程 open_table。"""
+
         if status.selector is not None and status.selector != selector_raw:
             return EmbeddingGenerationMismatch(
                 "embedding selector 与 active generation 不一致",
@@ -992,21 +994,27 @@ class VectorIndex:
                 {"active": status.model_fingerprint, "current": fingerprint},
             )
         if status.table_name:
-            try:
+            table_name = str(status.table_name)
+            generation_dimension = status.dimension
+
+            def _probe_schema_dimension() -> int | None:
                 assert self._db is not None
-                table = self._db.open_table(status.table_name)
-                schema_dim = _schema_vector_dimension(table.schema)
-                if schema_dim is not None and status.dimension is not None and schema_dim != status.dimension:
+                table = self._db.open_table(table_name)
+                return _schema_vector_dimension(table.schema)
+
+            try:
+                schema_dim = await self._run_lance(_probe_schema_dimension)
+                if schema_dim is not None and generation_dimension is not None and schema_dim != generation_dimension:
                     return EmbeddingGenerationMismatch(
                         "LanceDB table schema 维度与 generation metadata 不一致",
-                        {"schema_dimension": schema_dim, "generation_dimension": status.dimension},
+                        {"schema_dimension": schema_dim, "generation_dimension": generation_dimension},
                     )
             except LRSError:
                 raise
             except Exception as exc:
                 return VectorIndexUnavailable(
                     f"无法校验 LanceDB schema：{exc}",
-                    {"table_name": status.table_name},
+                    {"table_name": table_name},
                 )
         return None
 

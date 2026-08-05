@@ -356,6 +356,62 @@ async def test_feedback_cancels_pending_reminder(reminder_harness: ReminderHarne
 
 
 @pytest.mark.asyncio
+async def test_submit_suppresses_already_triggered_reminder_outbox(
+    reminder_harness: ReminderHarness,
+) -> None:
+    """C-I1: process_due 已插入 outbox 后提交反馈，不得再向 Maisaka nudge。"""
+
+    await reminder_harness.finish("COMPLETED")
+    reminder_harness.clock.advance(600)
+    await reminder_harness.service.process_due()
+
+    def _outbox(connection: Any) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            "SELECT outbox_id, status, idempotency_key FROM maisaka_outbox "
+            "WHERE idempotency_key = ?",
+            (f"lrs:feedback-reminder:{reminder_harness.round_id}",),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    pending = await reminder_harness.store.run_locked(_outbox)
+    assert pending and pending[0]["status"].upper() == "PENDING"
+
+    await reminder_harness.submit_feedback()
+    after = await reminder_harness.store.run_locked(_outbox)
+    assert after and after[0]["status"].lower() == "cancelled"
+
+    await reminder_harness.outbox.deliver_once()
+    assert reminder_harness.maisaka.trigger_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_deliver_skips_feedback_reminder_when_feedback_already_submitted(
+    reminder_harness: ReminderHarness,
+) -> None:
+    """C-I1 defense: even if outbox stays PENDING, deliver re-checks feedback_events."""
+
+    await reminder_harness.finish("COMPLETED")
+    reminder_harness.clock.advance(600)
+    await reminder_harness.service.process_due()
+    await reminder_harness.submit_feedback()
+
+    # Force outbox back to PENDING to simulate cancel race / missed cancel.
+    def _reopen(connection: Any) -> None:
+        connection.execute(
+            """
+            UPDATE maisaka_outbox
+            SET status = 'PENDING', last_error = NULL, next_attempt_at = 0
+            WHERE idempotency_key = ?
+            """,
+            (f"lrs:feedback-reminder:{reminder_harness.round_id}",),
+        )
+
+    await reminder_harness.store.run_locked(_reopen)
+    await reminder_harness.outbox.deliver_once()
+    assert reminder_harness.maisaka.trigger_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_continue_cancels_pending_reminder(reminder_harness: ReminderHarness) -> None:
     await reminder_harness.finish("STOPPED")
     await reminder_harness.continue_round()

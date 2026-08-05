@@ -654,7 +654,7 @@ async def test_transient_index_unavailable_does_not_auto_rebuild(vector_harness)
 
     original_detect = vector_harness.index._detect_mismatch
 
-    def _io_fail(*args, **kwargs):
+    async def _io_fail(*args, **kwargs):
         from lunagentic_research_swarm.storage.vectors import VectorIndexUnavailable
 
         return VectorIndexUnavailable("simulated open_table IO", {"table_name": old.table_name})
@@ -677,6 +677,38 @@ async def test_transient_index_unavailable_does_not_auto_rebuild(vector_harness)
     assert status.dimension == old.dimension
     # 仅探测 embedding，无全量 rebuild
     assert len(vector_harness.embedder.calls) == calls_before + 1
+
+
+@pytest.mark.asyncio
+async def test_detect_mismatch_schema_probe_routes_through_run_lance(vector_harness) -> None:
+    """C-C1: Lance open_table for schema probe must not run on the asyncio thread."""
+
+    await vector_harness.build_with_vectors([[1.0, 2.0, 3.0]])
+    status = await vector_harness.status()
+    assert status.table_name and status.model_fingerprint and status.dimension is not None
+
+    lance_calls = 0
+    original = vector_harness.index._run_lance
+
+    async def _counting(function):
+        nonlocal lance_calls
+        lance_calls += 1
+        return await original(function)
+
+    vector_harness.index._run_lance = _counting  # type: ignore[method-assign]
+    try:
+        err = await vector_harness.index._detect_mismatch(
+            status,
+            selector_raw=str(status.selector),
+            actual_model=str(status.actual_model_name or vector_harness.embedder.model_name),
+            dimension=int(status.dimension),
+            fingerprint=str(status.model_fingerprint),
+        )
+    finally:
+        vector_harness.index._run_lance = original  # type: ignore[method-assign]
+
+    assert err is None
+    assert lance_calls >= 1
 
 
 @pytest.mark.asyncio

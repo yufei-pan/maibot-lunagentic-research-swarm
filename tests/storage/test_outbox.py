@@ -154,6 +154,61 @@ async def test_delivery_failure_persists_only_safe_error_code(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_deliver_once_releases_lock_before_maisaka_io(tmp_path) -> None:
+    """C-I2: claim under lock; network I/O must not hold ``_lock``."""
+
+    store = SQLiteStateStore(tmp_path / "state.sqlite3")
+    await store.open()
+    await store.transact(
+        [
+            StoreCommand("insert_task", {"task_id": "task-1", "stream_id": "stream-1", "created_at": 1.0}),
+            StoreCommand(
+                "insert_round",
+                {
+                    "round_id": "round-1", "task_id": "task-1", "round_number": 1, "generation": 0,
+                    "status": "RUNNING", "time_budget_seconds": 10, "credit_pool": 1.0, "started_at": 1.0,
+                },
+            ),
+            StoreCommand(
+                "insert_outbox",
+                {
+                    "outbox_id": "out-trigger", "task_id": "task-1", "round_id": "round-1", "report_id": "report-1",
+                    "delivery_kind": "trigger_report_review", "idempotency_key": "lrs:task-1:1:report-1:trigger",
+                    "payload_json": json.dumps({"intent": "review_intermediate_report"}),
+                    "status": "PENDING", "next_attempt_at": 0.0, "created_at": 1.0,
+                },
+            ),
+        ]
+    )
+
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    class BlockingMaisaka(FakeMaisaka):
+        async def trigger(self, stream_id, intent, **kwargs):
+            entered.set()
+            await gate.wait()
+            return await super().trigger(stream_id, intent, **kwargs)
+
+    maisaka = BlockingMaisaka()
+    outbox = MaisakaOutbox(store, maisaka, clock=lambda: 100.0)
+    task = asyncio.create_task(outbox.deliver_once())
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    # While Maisaka I/O is blocked, the outbox lock must be free.
+    acquired = False
+    try:
+        await asyncio.wait_for(outbox._lock.acquire(), timeout=0.2)
+        acquired = True
+    finally:
+        if acquired:
+            outbox._lock.release()
+    assert acquired, "MaisakaOutbox._lock was held across network I/O"
+    gate.set()
+    assert await task == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_sqlite_claim_due_outbox_is_exclusive_between_workers(tmp_path) -> None:
     path = tmp_path / "state.sqlite3"
     first, second = SQLiteStateStore(path), SQLiteStateStore(path)

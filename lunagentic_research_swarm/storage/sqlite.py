@@ -1042,7 +1042,8 @@ class SQLiteStateStore:
         rows = connection.execute(
             """SELECT o.*, t.stream_id FROM maisaka_outbox AS o
                JOIN tasks AS t ON t.task_id = o.task_id
-               WHERE UPPER(o.status) != 'DELIVERED' AND o.next_attempt_at <= ?
+               WHERE UPPER(o.status) NOT IN ('DELIVERED', 'CANCELLED')
+                 AND o.next_attempt_at <= ?
                ORDER BY o.next_attempt_at, o.created_at, o.outbox_id LIMIT ?""",
             (now, limit),
         ).fetchall()
