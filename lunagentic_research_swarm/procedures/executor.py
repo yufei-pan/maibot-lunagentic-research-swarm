@@ -230,6 +230,7 @@ class ProcedureExecutor:
         summarizer: Any | None = None,
         agent_id: str = "lrs.executor",
         local_invokers: Mapping[str, LocalProcedureInvoker] | None = None,
+        debug_store: Any | None = None,
     ) -> None:
         # 允许历史调用方使用 ProcedureExecutor(ctx.api, catalog)。
         if catalog is not None and hasattr(catalog, "call") and api is not None and hasattr(api, "get"):
@@ -242,6 +243,7 @@ class ProcedureExecutor:
         self.api = api
         self.summarizer = summarizer
         self.agent_id = str(agent_id or "lrs.executor")
+        self.debug_store = debug_store
 
     def _entry(self, procedure_id: str) -> Any | None:
         getter = getattr(self.catalog, "get", None)
@@ -522,9 +524,62 @@ class ProcedureExecutor:
             has_business_result = result.data is not None
             if not result.success and idempotent and retryable and not has_business_result and attempts == 1:
                 continue
+            await self._maybe_save_payload(
+                context=context,
+                request=request,
+                request_id=request_id,
+                procedure_id=procedure_id,
+                raw_result=raw,
+            )
             return ProcedureExecutionResult(
                 procedure_id, request_id, result, provider_id, api_name, api_version, attempts, duration_ms
             )
+
+    async def _maybe_save_payload(
+        self,
+        *,
+        context: Mapping[str, Any],
+        request: Any,
+        request_id: str,
+        procedure_id: str,
+        raw_result: Any,
+    ) -> None:
+        store = self.debug_store
+        if store is None or not getattr(store, "store_raw_procedure_payloads", False):
+            return
+        save = getattr(store, "save_payload", None)
+        if not callable(save):
+            return
+        arguments = dict(_request_value(request, "arguments", {}) or {})
+        request_payload = {
+            "procedure_id": procedure_id,
+            "request_id": request_id,
+            "arguments": arguments,
+        }
+        try:
+            await save(
+                task_id=context["task_id"],
+                round_id=context["round_id"],
+                branch_id=context["branch_id"],
+                turn_id=context["turn_id"],
+                request_id=request_id,
+                procedure_id=procedure_id,
+                request=request_payload,
+                arguments=arguments,
+                raw_result=_jsonable(raw_result),
+            )
+        except Exception:
+            record = getattr(store, "_record_failure", None)
+            if callable(record):
+                try:
+                    await record(
+                        kind="payload",
+                        error=RuntimeError("debug payload 写入失败"),
+                        task_id=context["task_id"],
+                        round_id=context["round_id"],
+                    )
+                except Exception:
+                    pass
 
     async def invoke_core(
         self,

@@ -42,6 +42,8 @@ from lunagentic_research_swarm.runtime.effect_runner import RuntimeEffectRunner
 from lunagentic_research_swarm.runtime.manager import ResearchManager
 from lunagentic_research_swarm.runtime.scheduler import FairScheduler
 from lunagentic_research_swarm.runtime.turns import TurnWorker
+from lunagentic_research_swarm.statistics import StatisticsService
+from lunagentic_research_swarm.storage.debug import DebugStore
 from lunagentic_research_swarm.storage.outbox import MaisakaOutbox
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
 from lunagentic_research_swarm.storage.vectors import VectorIndex
@@ -154,6 +156,8 @@ class LRSServiceContainer:
         self.outbox: MaisakaOutbox | None = None
         self.feedback: FeedbackService | None = None
         self.vector_index: VectorIndex | None = None
+        self.debug_store: DebugStore | None = None
+        self.statistics: StatisticsService | None = None
         self.manager: ResearchManager | None = None
         self.scheduler: FairScheduler | None = None
         self._effect_runner: RuntimeEffectRunner | None = None
@@ -302,6 +306,20 @@ class LRSServiceContainer:
                 "reminders_enabled": bool(self._config.feedback.reminders_enabled),
                 "index_lessons": bool(self._config.feedback.index_lessons),
             }
+            self.debug_store = DebugStore(
+                Path(self._ctx.paths.data_dir),
+                store_agent_transcripts=bool(self._config.storage.store_agent_transcripts),
+                store_raw_procedure_payloads=bool(self._config.storage.store_raw_procedure_payloads),
+                authority_store=self._store,
+            )
+            await self.debug_store.open()
+            self.statistics = StatisticsService(self._store)
+            self._status["debug_storage"] = {
+                "status": "healthy",
+                "store_agent_transcripts": bool(self._config.storage.store_agent_transcripts),
+                "store_raw_procedure_payloads": bool(self._config.storage.store_raw_procedure_payloads),
+                "enabled": self.debug_store.enabled,
+            }
             interrupted = await self._store.mark_active_rounds_interrupted(time.time())
             self._status["legacy_rounds"] = {
                 "status": "healthy",
@@ -371,12 +389,15 @@ class LRSServiceContainer:
             ("runtime_scheduler", self.scheduler),
             ("extension_discovery", self._discovery),
             ("feedback", self.feedback),
+            ("debug_store", self.debug_store),
             ("vector_index", self.vector_index),
             ("maisaka_outbox", self.outbox),
             ("sqlite", self._store),
         )
         self._discovery = None
         self.feedback = None
+        self.debug_store = None
+        self.statistics = None
         self.vector_index = None
         self.outbox = None
         manager = self.manager
@@ -439,6 +460,7 @@ class LRSServiceContainer:
             ctx=self._ctx,
             summarizer=summarizer,
             local_invokers=local_invokers,
+            debug_store=self.debug_store,
         )
 
         def procedure_factory(catalog: Any) -> ProcedureExecutor:
@@ -447,6 +469,7 @@ class LRSServiceContainer:
                 ctx=self._ctx,
                 summarizer=summarizer,
                 local_invokers=local_invokers,
+                debug_store=self.debug_store,
             )
 
         turn_worker = TurnWorker(
@@ -454,6 +477,7 @@ class LRSServiceContainer:
             procedures,
             pricing=self.price_catalog,
             procedure_factory=procedure_factory,
+            debug_store=self.debug_store,
         )
         runner = RuntimeEffectRunner(turn_worker)
         scheduler = FairScheduler(
@@ -876,6 +900,14 @@ class LRSServiceContainer:
                     if close_error is None:
                         close_error = exc
                 self.feedback = None
+            if self.debug_store is not None:
+                try:
+                    await self.debug_store.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+                self.debug_store = None
+            self.statistics = None
             if self.outbox is not None:
                 try:
                     await self.outbox.close()

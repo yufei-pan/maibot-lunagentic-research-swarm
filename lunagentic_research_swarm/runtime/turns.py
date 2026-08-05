@@ -215,11 +215,52 @@ class TurnWorker:
         *,
         pricing: Any | None = None,
         procedure_factory: Callable[[Any], Any] | None = None,
+        debug_store: Any | None = None,
     ) -> None:
         self.llm = llm
         self.procedures = procedures
         self.pricing = pricing
         self.procedure_factory = procedure_factory
+        self.debug_store = debug_store
+
+    async def _maybe_save_transcript(
+        self,
+        *,
+        task_id: str,
+        round_id: str,
+        branch_id: str,
+        turn_id: str,
+        messages: Any,
+        envelope: Mapping[str, Any] | None,
+    ) -> None:
+        store = self.debug_store
+        if store is None or not getattr(store, "store_agent_transcripts", False):
+            return
+        save = getattr(store, "save_transcript", None)
+        if not callable(save):
+            return
+        try:
+            await save(
+                task_id=task_id,
+                round_id=round_id,
+                branch_id=branch_id,
+                turn_id=turn_id,
+                messages=messages or (),
+                envelope=envelope,
+            )
+        except Exception:
+            # DebugStore 通常自行吞掉异常；若调用方覆写抛出，仍不得影响权威 turn。
+            record = getattr(store, "_record_failure", None)
+            if callable(record):
+                try:
+                    await record(
+                        kind="transcript",
+                        error=RuntimeError("debug transcript 写入失败"),
+                        task_id=task_id,
+                        round_id=round_id,
+                    )
+                except Exception:
+                    pass
 
     async def perform_agent_call(self, effect: PerformAgentCall) -> AgentCallCompleted | AgentCallFailed:
         payload = effect.payload
@@ -261,6 +302,14 @@ class TurnWorker:
             actual_charge = float(charged.credits)
         if not result.success:
             error = result.error
+            await self._maybe_save_transcript(
+                task_id=common["task_id"],
+                round_id=common["round_id"],
+                branch_id=common["branch_id"],
+                turn_id=common["call_id"],
+                messages=payload.get("messages", ()),
+                envelope={"error_code": error.code if error is not None else "llm_generation_failed"},
+            )
             return AgentCallFailed(
                 **common,
                 error_code=error.code if error is not None else "llm_generation_failed",
@@ -282,6 +331,15 @@ class TurnWorker:
                 envelope = parse_json_envelope(result.response)
         except ProtocolError as exc:
             protocol_error = {"message": exc.message, "errors": list(exc.errors)}
+        envelope_payload = envelope.model_dump(mode="python") if envelope is not None else protocol_error
+        await self._maybe_save_transcript(
+            task_id=common["task_id"],
+            round_id=common["round_id"],
+            branch_id=common["branch_id"],
+            turn_id=common["call_id"],
+            messages=payload.get("messages", ()),
+            envelope=envelope_payload if isinstance(envelope_payload, Mapping) else None,
+        )
         return AgentCallCompleted(
             **common,
             result_id=str(payload.get("result_id") or f"{common['call_id']}:result"),
