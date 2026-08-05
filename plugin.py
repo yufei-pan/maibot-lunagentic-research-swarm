@@ -12,6 +12,7 @@ _PLUGIN_DIR = Path(__file__).resolve().parent
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
+from lunagentic_research_swarm.commands import SwarmCommandsMixin  # noqa: E402
 from lunagentic_research_swarm.config import LRSConfig, normalize_config  # noqa: E402
 from lunagentic_research_swarm.feedback import validate_feedback_arguments  # noqa: E402
 from lunagentic_research_swarm.services import LRSServiceContainer  # noqa: E402
@@ -39,7 +40,7 @@ from lunagentic_research_swarm.tools import (  # noqa: E402
 )
 
 
-class LunagenticResearchSwarmPlugin(MaiBotPlugin):
+class LunagenticResearchSwarmPlugin(SwarmCommandsMixin, MaiBotPlugin):
     plugin_id = "com.0-hz.lunagentic-research-swarm"
     config_reload_subscriptions = {ON_MODEL_CONFIG_RELOAD}
     config_model = LRSConfig
