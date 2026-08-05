@@ -1,0 +1,98 @@
+# Task 5 Report: 实现可重建 LanceDB generation 索引
+
+## Status
+
+**DONE**
+
+## Summary
+
+SQLite remains authoritative; LanceDB is a rebuildable derived case index under `data/vectors/lancedb`.
+
+- Added `lancedb>=0.34.0,<0.35.0` synced across `pyproject.toml` / `requirements.txt` / `_manifest.json`.
+- Migration 002: `vector_generations`, `vector_documents`, unique active-generation index.
+- `VectorIndex` (`storage/vectors.py`): `start/close/enqueue/rebuild/status/search` with generation fingerprint, dimension validation, atomic active↔retired switch, failed-candidate retention.
+- Wired into `LRSServiceContainer` (degrades when `ctx.llm` missing).
+
+Whitelist sources only: formalized task, checkpoint/branch-final summary, intermediate/final report, feedback lesson. Raw chat/transcript/procedure/compact/reasoning never indexed.
+
+## TDD Evidence
+
+1. **RED** — Wrote `tests/storage/test_vectors.py` + `tests/storage/test_vector_rebuild.py` first. Collection failed with `ModuleNotFoundError: lunagentic_research_swarm.storage.vectors`.
+2. **GREEN** — Added deps + migration 002 + `vectors.py` + services wiring; privacy/deps tests updated.
+3. **VERIFY** — `PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest tests/storage/test_vectors.py tests/storage/test_vector_rebuild.py tests/test_dependencies.py -v` → **20 passed**.
+
+Regression: privacy + services startup cleanup → **24 passed** with vector suite.
+
+Covered: selector/model/dimension/schema mismatch, batch inconsistency abort, failed candidate keeps old active, atomic switch, rebuild-time `vector_index_rebuilding`, `model:` → `physical_embedding_selector_unsupported`, already_current / force rebuild.
+
+## Files Changed
+
+| Path | Action |
+|---|---|
+| `pyproject.toml` / `requirements.txt` / `_manifest.json` | Add lancedb pin |
+| `lunagentic_research_swarm/storage/migrations.py` | Migration 002 |
+| `lunagentic_research_swarm/storage/vectors.py` | Created |
+| `lunagentic_research_swarm/storage/sqlite.py` | `run_locked` for vector metadata |
+| `lunagentic_research_swarm/services.py` | Start/close/health for VectorIndex |
+| `lunagentic_research_swarm/llm/gateway.py` | `ModelSelector.task_name` |
+| `tests/storage/test_vectors.py` | Created |
+| `tests/storage/test_vector_rebuild.py` | Created |
+| `tests/test_dependencies.py` / `tests/storage/test_privacy.py` | Sync pins + schema expectations |
+
+## Commits
+
+- `8bdf2ee` — `feat: add rebuildable LanceDB case index`
+
+## Concerns
+
+1. Host `llm.embed` still has no physical model pin; `model:` selectors are explicitly rejected (`physical_embedding_selector_unsupported`).
+2. Mismatch with `auto_rebuild=True` marks a building candidate and sets `rebuilding` immediately; full rebuild is advanced by explicit `rebuild()` / future worker (avoids test/runtime race on the mismatch window). Task 6 past_cases should treat `status.rebuilding` / `VECTOR_INDEX_REBUILDING` as unavailable.
+3. Retired Lance tables are purged only after `retired_generation_retention_seconds` and only when at least one retired generation remains.
+
+## Verification Command
+
+```bash
+cd /mnt/klein/work/maibot-plugins/maibot-lunagentic-research-swarm/.worktrees/lrs-runtime-reporting
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
+  tests/storage/test_vectors.py \
+  tests/storage/test_vector_rebuild.py \
+  tests/test_dependencies.py -v
+```
+
+Result: **20 passed**.
+
+---
+
+## Review-1 Fixes (post `8bdf2ee`)
+
+**Status:** DONE — addressed Critical/Important findings from `task-5-review-1.md`.
+
+### Fixes
+
+1. **Status whitelist** — `_load_indexable_sources` now accepts `SUCCEEDED`/`FAILED`/`DEGRADED` (`INDEXABLE_CONTENT_STATUSES`), matching `runtime/epochs.py` writers. Fixtures use real statuses (not harness-only `READY`).
+2. **Mismatch rebuilds** — `auto_rebuild=True` runs in-process `_run_full_rebuild` (full SQLite re-read + re-embed + atomic activate). Added `ensure_ready()` for Task 6.
+3. **Stranded building** — `rebuild(force=False)` / empty rebuild clears stranded `building` candidates when fingerprint is current.
+4. **Search fingerprint** — query path recomputes model fingerprint and runs `_detect_mismatch` (same-dimension model swap no longer returns silent wrong hits).
+5. **Error codes** — `vector_rebuild_failed` / `vector_index_unavailable` distinct from `embedding_generation_mismatch`.
+6. **Upsert** — Lance delete-then-add on `id` for re-index; non-numeric/bool embeddings fail the job (not stuck PENDING); negative privacy test for FORMALIZATION/TASK_FINAL.
+
+### Spec note
+
+Brief mentioned summary/report readiness loosely; preferred actual runtime enum from `epochs.py` over inventing `READY`.
+
+### Verification
+
+```bash
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
+  tests/storage/test_vectors.py \
+  tests/storage/test_vector_rebuild.py \
+  tests/test_dependencies.py \
+  tests/storage/test_privacy.py -v
+```
+
+Result: **31 passed**.
+
+### Remaining
+
+- Startup reconcile of orphan Lance tables vs `vector_generations` still deferred.
+- `vector_documents` rows for retired/purged generations not yet GC'd.

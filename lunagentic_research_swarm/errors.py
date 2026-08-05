@@ -17,6 +17,8 @@ STORAGE_COMMIT_FAILED = "storage_commit_failed"
 TASK_FINISHED_INSUFFICIENT_FUNDS = "task_finished_insufficient_funds"
 EMBEDDING_GENERATION_MISMATCH = "embedding_generation_mismatch"
 VECTOR_INDEX_REBUILDING = "vector_index_rebuilding"
+VECTOR_REBUILD_FAILED = "vector_rebuild_failed"
+VECTOR_INDEX_UNAVAILABLE = "vector_index_unavailable"
 
 
 class LRSError(Exception):

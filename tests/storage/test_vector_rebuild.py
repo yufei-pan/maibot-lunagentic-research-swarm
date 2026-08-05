@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+import time
 
 import pytest
 
 from lunagentic_research_swarm.errors import EMBEDDING_GENERATION_MISMATCH
-from lunagentic_research_swarm.storage.vectors import EmbeddingGenerationMismatch
+from lunagentic_research_swarm.storage.vectors import EmbeddingGenerationMismatch, _insert_generation, _table_name_for
 
 from test_vectors import VectorHarness
 
@@ -73,7 +73,43 @@ async def test_rebuild_force_false_returns_already_current_when_fingerprint_matc
     assert result.success
     assert result.code == "already_current"
     status = await vector_harness.status()
-    assert status.active_generation == 1 or status.active_generation is not None
+    assert status.active_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_rebuild_force_false_clears_stranded_building_candidate(vector_harness) -> None:
+    await vector_harness.build_with_vectors([[1.0, 2.0, 3.0]])
+    old = await vector_harness.status()
+
+    def _strand(connection) -> None:
+        _insert_generation(
+            connection,
+            generation=99,
+            selector=str(old.selector),
+            actual_model_name=None,
+            model_fingerprint="pending",
+            dimension=None,
+            table_name=_table_name_for(99),
+            schema_version=1,
+            status="building",
+            created_at=time.time(),
+        )
+
+    await vector_harness.store.run_locked(_strand)
+    vector_harness.index._rebuilding = True
+    stranded = await vector_harness.status()
+    assert stranded.candidate_active
+    assert stranded.rebuilding
+
+    result = await vector_harness.rebuild(force=False)
+    assert result.success
+    assert result.code == "already_current"
+    status = await vector_harness.status()
+    assert not status.candidate_active
+    assert not status.rebuilding
+    assert status.active_generation == old.active_generation
+    search = await vector_harness.search("正式任务种子")
+    assert search.success
 
 
 @pytest.mark.asyncio
@@ -91,6 +127,7 @@ async def test_rebuild_force_creates_new_generation_even_when_current(vector_har
 async def test_mismatch_job_marked_and_authoritative_sqlite_untouched(vector_harness) -> None:
     await vector_harness.build_with_vectors([[1.0, 2.0, 3.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0]])
+    vector_harness.embedder.return_vectors([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]])
     result = await vector_harness.index_new_source("summary-keep-sqlite")
     assert not result.success
     assert result.error.code == EMBEDDING_GENERATION_MISMATCH
@@ -113,7 +150,8 @@ async def test_successful_index_search_returns_hits(vector_harness) -> None:
     hit = search.data["hits"][0]
     assert hit["source_kind"] == "formalized_task"
     assert hit["source_id"] == "task-seed"
-    assert "vector" not in hit or isinstance(hit.get("text"), str)
+    assert "vector" not in hit
+    assert isinstance(hit.get("text"), str)
 
 
 @pytest.mark.asyncio
@@ -125,3 +163,30 @@ async def test_fingerprint_includes_selector_model_dimension_schema(vector_harne
     assert status.actual_model_name == "fake-embed-v1"
     assert status.dimension == 3
     assert status.schema_version == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_rebuilds_stranded_candidate(vector_harness) -> None:
+    await vector_harness.build_with_vectors([[1.0, 2.0, 3.0]])
+
+    def _strand(connection) -> None:
+        _insert_generation(
+            connection,
+            generation=77,
+            selector="task:embedding",
+            actual_model_name=None,
+            model_fingerprint="pending",
+            dimension=None,
+            table_name=_table_name_for(77),
+            schema_version=1,
+            status="building",
+            created_at=time.time(),
+        )
+
+    await vector_harness.store.run_locked(_strand)
+    vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
+    result = await vector_harness.index.ensure_ready()
+    assert result.success
+    status = await vector_harness.status()
+    assert not status.candidate_active
+    assert not status.rebuilding

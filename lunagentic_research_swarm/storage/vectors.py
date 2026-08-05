@@ -17,6 +17,8 @@ from lunagentic_research_swarm.config import EmbeddingSection
 from lunagentic_research_swarm.errors import (
     EMBEDDING_GENERATION_MISMATCH,
     VECTOR_INDEX_REBUILDING,
+    VECTOR_INDEX_UNAVAILABLE,
+    VECTOR_REBUILD_FAILED,
     LRSError,
 )
 from lunagentic_research_swarm.llm.gateway import ModelSelector
@@ -24,6 +26,8 @@ from lunagentic_research_swarm.models import ReportKind, SummaryKind
 
 VECTOR_SCHEMA_VERSION = 1
 
+# 与 runtime/epochs.py 写入的 summaries/reports.status 对齐（非 READY）
+INDEXABLE_CONTENT_STATUSES = frozenset({"SUCCEEDED", "FAILED", "DEGRADED"})
 INDEXABLE_SUMMARY_KINDS = frozenset({SummaryKind.CHECKPOINT.value, SummaryKind.BRANCH_FINAL.value})
 INDEXABLE_REPORT_KINDS = frozenset({ReportKind.INTERMEDIATE.value, ReportKind.FINAL.value})
 
@@ -51,6 +55,20 @@ class EmbeddingGenerationMismatch(LRSError):
 
     def __init__(self, message: str, metadata: Mapping[str, Any] | None = None) -> None:
         super().__init__(EMBEDDING_GENERATION_MISMATCH, message, metadata)
+
+
+class VectorRebuildFailed(LRSError):
+    """重建过程中的磁盘 / SQLite / LanceDB 等基础设施失败（非 fingerprint mismatch）。"""
+
+    def __init__(self, message: str, metadata: Mapping[str, Any] | None = None) -> None:
+        super().__init__(VECTOR_REBUILD_FAILED, message, metadata)
+
+
+class VectorIndexUnavailable(LRSError):
+    """向量索引暂时不可读（如 LanceDB IO），不等于模型 fingerprint 变更。"""
+
+    def __init__(self, message: str, metadata: Mapping[str, Any] | None = None) -> None:
+        super().__init__(VECTOR_INDEX_UNAVAILABLE, message, metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,12 +174,19 @@ def _validate_embedding_results(
             raise EmbeddingGenerationMismatch(f"embedding 结果[{index}] 缺少 model_name")
         if not isinstance(raw_vector, Sequence) or isinstance(raw_vector, (str, bytes)):
             raise EmbeddingGenerationMismatch(f"embedding 结果[{index}] 向量非法")
-        vector = [float(value) for value in raw_vector]
-        if not _is_finite_vector(vector):
+        # 先校验元素类型再强制转换，避免 ValueError 泄漏 / bool 被当作 int
+        if not _is_finite_vector(raw_vector):
             raise EmbeddingGenerationMismatch(
                 f"embedding 结果[{index}] 向量必须为非空有限浮点",
                 {"index": index},
             )
+        try:
+            vector = [float(value) for value in raw_vector]
+        except (TypeError, ValueError) as exc:
+            raise EmbeddingGenerationMismatch(
+                f"embedding 结果[{index}] 向量元素无法转为浮点",
+                {"index": index},
+            ) from exc
         if expected_dimension is not None and len(vector) != expected_dimension:
             raise EmbeddingGenerationMismatch(
                 "embedding 维度与期望不一致",
@@ -303,7 +328,10 @@ class VectorIndex:
 
     async def rebuild(self, *, force: bool = False) -> VectorOpResult:
         async with self._lock:
-            return await self._rebuild_unlocked(force=force)
+            try:
+                return await self._rebuild_unlocked(force=force)
+            except VectorRebuildFailed as exc:
+                return VectorOpResult.fail(exc)
 
     async def search(self, query: str, *, limit: int = 10) -> VectorOpResult:
         status = await self.status()
@@ -322,18 +350,23 @@ class VectorIndex:
             return VectorOpResult.fail(exc)
 
         try:
-            vectors, _model = await self._embed_texts([query], selector=selector)
+            vectors, actual_model = await self._embed_texts([query], selector=selector)
         except EmbeddingGenerationMismatch as exc:
             return VectorOpResult.fail(exc)
 
         query_vector = vectors[0]
-        if len(query_vector) != status.dimension:
-            return VectorOpResult.fail(
-                EmbeddingGenerationMismatch(
-                    "查询向量维度与 active generation 不一致",
-                    {"expected": status.dimension, "actual": len(query_vector)},
-                )
-            )
+        fingerprint = compute_model_fingerprint(
+            selector.raw, actual_model, len(query_vector), self._schema_version
+        )
+        mismatch = self._detect_mismatch(
+            status,
+            selector_raw=selector.raw,
+            actual_model=actual_model,
+            dimension=len(query_vector),
+            fingerprint=fingerprint,
+        )
+        if mismatch is not None:
+            return VectorOpResult.fail(mismatch)
 
         table_name = status.table_name
         top_k = max(1, int(limit))
@@ -356,8 +389,27 @@ class VectorIndex:
                 )
             return hits
 
-        hits = await asyncio.to_thread(_search)
+        try:
+            hits = await asyncio.to_thread(_search)
+        except Exception as exc:
+            return VectorOpResult.fail(
+                VectorIndexUnavailable(f"LanceDB 检索失败：{exc}", {"table_name": table_name})
+            )
         return VectorOpResult.ok(data={"hits": hits})
+
+    async def ensure_ready(self) -> VectorOpResult:
+        """推进 stranded / 未初始化索引到可用态；供 Task 6 与维护路径复用。"""
+
+        async with self._lock:
+            status = await self.status()
+            if status.candidate_active or self._rebuilding:
+                return await self._rebuild_unlocked(force=True)
+            if status.active_generation is None:
+                sources = await self._list_indexable_sources()
+                if not sources:
+                    return VectorOpResult.ok(code="empty")
+                return await self._rebuild_unlocked(force=True)
+            return await self._rebuild_unlocked(force=False)
 
     async def _enqueue_unlocked(self, *, source_kind: str, source_id: str) -> VectorOpResult:
         now = time.time()
@@ -389,6 +441,9 @@ class VectorIndex:
             except EmbeddingGenerationMismatch as exc:
                 await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
                 raise
+            except VectorRebuildFailed as exc:
+                await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
+                return VectorOpResult.fail(exc)
             if not rebuild.success:
                 await self._fail_job(
                     job_id,
@@ -404,8 +459,7 @@ class VectorIndex:
         except EmbeddingGenerationMismatch as exc:
             await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
             if self._config.auto_rebuild:
-                self._rebuilding = True
-                await self._begin_candidate_placeholder(selector.raw)
+                await self._auto_rebuild_after_mismatch(selector)
             return VectorOpResult.fail(exc)
 
         vector = vectors[0]
@@ -422,10 +476,7 @@ class VectorIndex:
         if mismatch is not None:
             await self._fail_job(job_id, mismatch.code, mismatch.message, metadata=mismatch.metadata)
             if self._config.auto_rebuild:
-                self._rebuilding = True
-                # 创建 building candidate，使 status.rebuilding / past_cases 立刻显式不可用；
-                # 全量重建由 rebuild()/后台 worker 推进，避免与调用方竞态吞掉断言窗口。
-                await self._begin_candidate_placeholder(selector.raw)
+                await self._auto_rebuild_after_mismatch(selector)
             return VectorOpResult.fail(mismatch)
 
         try:
@@ -441,12 +492,29 @@ class VectorIndex:
         except EmbeddingGenerationMismatch as exc:
             await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
             if self._config.auto_rebuild:
-                self._rebuilding = True
-                await self._begin_candidate_placeholder(selector.raw)
+                await self._auto_rebuild_after_mismatch(selector)
+            return VectorOpResult.fail(exc)
+        except VectorIndexUnavailable as exc:
+            await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
+            if self._config.auto_rebuild:
+                await self._auto_rebuild_after_mismatch(selector)
             return VectorOpResult.fail(exc)
 
         await self._complete_job(job_id, generation=int(status.active_generation))
         return VectorOpResult.ok(code="indexed")
+
+    async def _auto_rebuild_after_mismatch(self, selector: ModelSelector) -> None:
+        """mismatch 后进程内全量重建；失败保留旧 active + failed candidate。"""
+
+        self._rebuilding = True
+        try:
+            await self._run_full_rebuild(selector=selector)
+        except (EmbeddingGenerationMismatch, VectorRebuildFailed):
+            # 调用方已拿到原始 mismatch；重建失败细节留在 failed candidate
+            pass
+        finally:
+            status_after = await self.status()
+            self._rebuilding = bool(status_after.candidate_active)
 
     async def _rebuild_unlocked(self, *, force: bool) -> VectorOpResult:
         try:
@@ -459,6 +527,8 @@ class VectorIndex:
             # 无 mismatch 时 already_current；先用当前 config selector + 一次探测 embedding 验证
             sources = await self._list_indexable_sources()
             if not sources:
+                if status.candidate_active:
+                    await self._fail_stranded_building()
                 return VectorOpResult.ok(code="already_current")
             try:
                 probe_vectors, probe_model = await self._embed_texts([sources[0].text], selector=selector)
@@ -473,6 +543,9 @@ class VectorIndex:
                 and status.dimension == len(probe_vectors[0])
                 and status.schema_version == self._schema_version
             ):
+                # fingerprint 仍匹配时清掉 stranded building，避免索引永久不可用
+                if status.candidate_active:
+                    await self._fail_stranded_building()
                 return VectorOpResult.ok(code="already_current")
 
         self._rebuilding = True
@@ -483,8 +556,40 @@ class VectorIndex:
             status_after = await self.status()
             self._rebuilding = bool(status_after.candidate_active)
 
+    async def _fail_stranded_building(self) -> None:
+        def _fail(connection: Any) -> list[str]:
+            rows = connection.execute(
+                "SELECT table_name FROM vector_generations WHERE status = 'building'"
+            ).fetchall()
+            connection.execute(
+                "UPDATE vector_generations SET status = 'failed' WHERE status = 'building'"
+            )
+            return [str(row["table_name"]) for row in rows]
+
+        table_names = await self._store.run_locked(_fail)
+        for table_name in table_names:
+            await self._drop_lance_table(table_name)
+        self._rebuilding = False
+
+    async def _drop_lance_table(self, table_name: str) -> None:
+        def _drop() -> None:
+            if self._db is None:
+                return
+            if table_name in _list_lancedb_tables(self._db):
+                self._db.drop_table(table_name)
+
+        try:
+            await asyncio.to_thread(_drop)
+        except Exception:
+            pass
+
     async def _run_full_rebuild(self, *, selector: ModelSelector) -> VectorOpResult:
         sources = await self._list_indexable_sources()
+        if not sources:
+            # 空库不分配 generation，避免幽灵 failed candidate
+            await self._fail_stranded_building()
+            return VectorOpResult.ok(code="empty")
+
         now = time.time()
 
         def _prepare(connection: Any) -> tuple[int, str]:
@@ -512,13 +617,6 @@ class VectorIndex:
             return generation, table_name
 
         generation, table_name = await self._store.run_locked(_prepare)
-
-        if not sources:
-            # 空库：记录 idle generation 占位后立即失败并清理 candidate，保持 uninitialized
-            await self._store.run_locked(
-                lambda connection: _set_generation_status(connection, generation, "failed", now=time.time())
-            )
-            return VectorOpResult.ok(code="empty")
 
         batch_size = max(1, int(self._config.batch_size))
         prepared_rows: list[dict[str, Any]] = []
@@ -637,26 +735,18 @@ class VectorIndex:
                 code="rebuilt",
                 data={"generation": generation, "dimension": dimension, "count": len(prepared_rows)},
             )
-        except EmbeddingGenerationMismatch as exc:
+        except EmbeddingGenerationMismatch:
             await self._store.run_locked(
                 lambda connection: _set_generation_status(connection, generation, "failed", now=time.time())
             )
-
-            def _drop_candidate() -> None:
-                assert self._db is not None
-                if table_name in _list_lancedb_tables(self._db):
-                    self._db.drop_table(table_name)
-
-            try:
-                await asyncio.to_thread(_drop_candidate)
-            except Exception:
-                pass
+            await self._drop_lance_table(table_name)
             raise
         except Exception as exc:
             await self._store.run_locked(
                 lambda connection: _set_generation_status(connection, generation, "failed", now=time.time())
             )
-            raise EmbeddingGenerationMismatch(f"重建失败：{exc}") from exc
+            await self._drop_lance_table(table_name)
+            raise VectorRebuildFailed(f"重建失败：{exc}") from exc
 
     def _require_task_selector(self) -> ModelSelector:
         selector = ModelSelector.parse(str(self._config.selector))
@@ -696,7 +786,7 @@ class VectorIndex:
         actual_model: str,
         dimension: int,
         fingerprint: str,
-    ) -> EmbeddingGenerationMismatch | None:
+    ) -> LRSError | None:
         if status.selector is not None and status.selector != selector_raw:
             return EmbeddingGenerationMismatch(
                 "embedding selector 与 active generation 不一致",
@@ -727,8 +817,10 @@ class VectorIndex:
                         "LanceDB table schema 维度与 generation metadata 不一致",
                         {"schema_dimension": schema_dim, "generation_dimension": status.dimension},
                     )
+            except LRSError:
+                raise
             except Exception as exc:
-                return EmbeddingGenerationMismatch(
+                return VectorIndexUnavailable(
                     f"无法校验 LanceDB schema：{exc}",
                     {"table_name": status.table_name},
                 )
@@ -755,7 +847,7 @@ class VectorIndex:
             "vector": vector,
         }
 
-        def _add() -> None:
+        def _upsert() -> None:
             assert self._db is not None
             table = self._db.open_table(table_name)
             schema_dim = _schema_vector_dimension(table.schema)
@@ -769,9 +861,16 @@ class VectorIndex:
                     "禁止截断或 padding 向量以适配旧 table",
                     {"table_dimension": dimension, "vector_dimension": len(vector)},
                 )
+            row_id = str(row["id"]).replace("'", "''")
+            table.delete(f"id = '{row_id}'")
             table.add([row])
 
-        await asyncio.to_thread(_add)
+        try:
+            await asyncio.to_thread(_upsert)
+        except EmbeddingGenerationMismatch:
+            raise
+        except Exception as exc:
+            raise VectorIndexUnavailable(f"LanceDB 写入失败：{exc}", {"table_name": table_name}) from exc
         indexed_at = time.time()
 
         def _doc(connection: Any) -> None:
@@ -795,54 +894,10 @@ class VectorIndex:
 
         await self._store.run_locked(_doc)
 
-    async def _begin_candidate_placeholder(self, selector_raw: str) -> None:
-        """在后台 rebuild 启动前写入 building 行，使 status.rebuilding 立刻可见。"""
-
-        def _ensure(connection: Any) -> None:
-            existing = connection.execute(
-                "SELECT 1 FROM vector_generations WHERE status = 'building' LIMIT 1"
-            ).fetchone()
-            if existing:
-                return
-            generation = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(generation), 0) + 1 FROM vector_generations"
-                ).fetchone()[0]
-            )
-            _insert_generation(
-                connection,
-                generation=generation,
-                selector=selector_raw,
-                actual_model_name=None,
-                model_fingerprint="pending",
-                dimension=None,
-                table_name=_table_name_for(generation),
-                schema_version=self._schema_version,
-                status="building",
-                created_at=time.time(),
-            )
-
-        await self._store.run_locked(_ensure)
-
-    async def _next_generation_id(self) -> int:
-        def _next(connection: Any) -> int:
-            return int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(generation), 0) + 1 FROM vector_generations"
-                ).fetchone()[0]
-            )
-
-        return await self._store.run_locked(_next)
-
     async def _list_indexable_sources(self) -> list[IndexableSource]:
         return await self._store.run_locked(_load_indexable_sources)
 
     async def _resolve_source(self, source_kind: str, source_id: str) -> IndexableSource | None:
-        sources = await self._list_indexable_sources()
-        for source in sources:
-            if source.source_kind == source_kind and source.source_id == source_id:
-                return source
-        # enqueue 可能在 seed 后立刻调用；再按 kind 特判读取
         return await self._store.run_locked(
             lambda connection: _load_single_source(connection, source_kind, source_id)
         )
@@ -946,10 +1001,10 @@ class VectorIndex:
             table_name = str(row["table_name"])
             generation = int(row["generation"])
 
-            def _drop() -> None:
+            def _drop(name: str = table_name) -> None:
                 assert self._db is not None
-                if table_name in _list_lancedb_tables(self._db):
-                    self._db.drop_table(table_name)
+                if name in _list_lancedb_tables(self._db):
+                    self._db.drop_table(name)
 
             try:
                 await asyncio.to_thread(_drop)
@@ -1031,6 +1086,8 @@ def _set_generation_status(connection: Any, generation: int, status: str, *, now
 
 def _load_indexable_sources(connection: Any) -> list[IndexableSource]:
     sources: list[IndexableSource] = []
+    status_list = sorted(INDEXABLE_CONTENT_STATUSES)
+    status_placeholders = ",".join("?" * len(status_list))
 
     for row in connection.execute(
         """
@@ -1049,16 +1106,18 @@ def _load_indexable_sources(connection: Any) -> list[IndexableSource]:
             )
         )
 
+    summary_kinds = sorted(INDEXABLE_SUMMARY_KINDS)
+    summary_placeholders = ",".join("?" * len(summary_kinds))
     for row in connection.execute(
-        """
+        f"""
         SELECT summary_id, task_id, kind, text
         FROM summaries
-        WHERE status = 'READY'
+        WHERE status IN ({status_placeholders})
           AND text IS NOT NULL AND TRIM(text) != ''
-          AND kind IN (?, ?)
+          AND kind IN ({summary_placeholders})
         ORDER BY created_at ASC, summary_id ASC
         """,
-        tuple(sorted(INDEXABLE_SUMMARY_KINDS)),
+        (*status_list, *summary_kinds),
     ).fetchall():
         kind = str(row["kind"])
         source_kind = _SUMMARY_KIND_TO_SOURCE.get(kind)
@@ -1073,16 +1132,18 @@ def _load_indexable_sources(connection: Any) -> list[IndexableSource]:
             )
         )
 
+    report_kinds = sorted(INDEXABLE_REPORT_KINDS)
+    report_placeholders = ",".join("?" * len(report_kinds))
     for row in connection.execute(
-        """
+        f"""
         SELECT report_id, task_id, kind, text
         FROM reports
-        WHERE status = 'READY'
+        WHERE status IN ({status_placeholders})
           AND text IS NOT NULL AND TRIM(text) != ''
-          AND kind IN (?, ?)
+          AND kind IN ({report_placeholders})
         ORDER BY created_at ASC, report_id ASC
         """,
-        tuple(sorted(INDEXABLE_REPORT_KINDS)),
+        (*status_list, *report_kinds),
     ).fetchall():
         kind = str(row["kind"])
         source_kind = _REPORT_KIND_TO_SOURCE.get(kind)
