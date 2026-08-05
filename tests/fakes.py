@@ -18,6 +18,7 @@ from lunagentic_research_swarm.models import (
     FormalizedTask,
     TaskStatus,
 )
+from lunagentic_research_swarm.runtime.context import release_raw_context
 from lunagentic_research_swarm.runtime.epochs import ReportCoordinator
 from lunagentic_research_swarm.runtime.manager import ResearchManager
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
@@ -319,7 +320,6 @@ class RuntimeHarness:
         self.coordinator: ReportCoordinator | None = None
         self._root_branch_id = ""
         self._status = TaskStatus.FORMALIZING
-        self._raw_context_count = 0
         self._started = False
 
     async def open(self) -> RuntimeHarness:
@@ -376,7 +376,6 @@ class RuntimeHarness:
         )
         self.task_id = str(result["task_id"])
         self.round_id = str((await self.manager.status(self.task_id))["round_id"])
-        self._raw_context_count = 1
         return result
 
     async def formalize(self, text: str) -> None:
@@ -387,7 +386,6 @@ class RuntimeHarness:
         self.formalized_task = (await self.store.load_task(self.task_id)).formalized_task
         assert self.formalized_task is not None
         self.round_id = str((await self.manager.status(self.task_id))["round_id"])
-        self._raw_context_count = 0
         self.coordinator = self.manager.report_coordinators[self.task_id]
 
     async def root_delegates(self, allocations: dict[str, float]) -> None:
@@ -475,11 +473,18 @@ class RuntimeHarness:
         await self.coordinator.wait_for_synthesis()
 
     async def finalize_all(self) -> None:
-        assert self.coordinator is not None
+        assert self.coordinator is not None and self.manager is not None
         # 保证真实 SQLite 的 created_at 排序与报告 epoch 的时间顺序一致。
         self.clock.advance(1)
+        # Mirror ResearchManager.handle_branch_summary_effect: summarize at the
+        # terminal safe point, then release_raw_context and drop the manager
+        # activity-graph entry so COMPLETED retains summary layer only.
         for branch_id in list(self.coordinator.active_branch_ids()):
             await self.coordinator.on_branch_safe_point(branch_id, terminal=True)
+            branch = self.coordinator.branches.get(branch_id)
+            if branch is not None:
+                release_raw_context(branch)
+            self.manager._branches.get(self.task_id, {}).pop(branch_id, None)
         await self.coordinator.wait_for_synthesis()
 
     async def persisted_report_kinds(self) -> list[str]:
@@ -513,7 +518,21 @@ class RuntimeHarness:
 
     @property
     def raw_context_count(self) -> int:
-        return self._raw_context_count
+        """Retained raw transcript messages in coordinator + manager branch caches."""
+
+        count = 0
+        if self.coordinator is not None:
+            for branch in self.coordinator.branches.values():
+                count += len(branch.messages)
+        if self.manager is not None and self.task_id:
+            for entry in self.manager._branches.get(self.task_id, {}).values():
+                messages = entry.get("messages") if isinstance(entry, dict) else None
+                if messages:
+                    count += len(messages)
+                pending = entry.get("pending_context") if isinstance(entry, dict) else None
+                if pending:
+                    count += len(pending)
+        return count
 
     @property
     def resources_closed(self) -> bool:

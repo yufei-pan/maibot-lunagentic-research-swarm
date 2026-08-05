@@ -34,6 +34,8 @@
 - 默认时间预算 120s，超时后 **60s grace**；frontier 齐备可提前结束 grace。
 - Planner tools：`start` / `pause` / `continue` / `stop` / `add_research_context` / `get_research_status` / `list_research_tasks` / `submit_research_feedback`。
 - `start` **立即返回** `task_id`，不等 formalize / 总结器。
+- `pause`：等待在途调用结算后进入 `PAUSED`；超时未 `continue` → `EXPIRED` 并释放 raw 上下文。
+- `stop`：取消当前 generation，释放 raw 上下文，进入 `STOPPED`。
 - 中间报告：先持久化到 SQLite / outbox，再 Maisaka append + trigger；最终报告含确定性统计区块。
 - `continue` 在无活动叶子时只从 **summary layer** 开新 round，不回放 raw。
 - Core procedures：`core.compact` / `core.checkpoint` / `core.terminate`。

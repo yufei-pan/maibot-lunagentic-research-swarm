@@ -162,6 +162,9 @@ async def test_release_flow_start_formalize_report_privacy_and_stats(runtime_har
     assert any(row["source_kind"] == "formalized_task" for row in jobs)
 
     await harness.root_delegates({"A": 50.0, "B": 50.0})
+    # Evidence must exist before terminal release or the gate is vacuous.
+    assert harness.raw_context_count > 0
+    assert any(branch.messages for branch in harness.coordinator.branches.values())
     await harness.branch_checkpoint("A")
     harness.clock.advance(120)
     await harness.run_until_idle()
@@ -188,7 +191,10 @@ async def test_release_flow_start_formalize_report_privacy_and_stats(runtime_har
     )
     assert report_rows
     assert report_rows[0]["stats_json"]
+    # all contexts release：终态后 activity graph 无 raw transcript，仅 summary layer。
     assert harness.raw_context_count == 0
+    assert all(not branch.messages for branch in harness.coordinator.branches.values())
+    assert not harness.manager._branches.get(harness.task_id)
     layer = await harness.store.load_summary_layer(harness.task_id)
     assert layer is not None
     durable = repr(layer)

@@ -17,6 +17,7 @@ async def test_complete_branching_research_flow(runtime_harness) -> None:
     task = await harness.start("比较两个方案", credits=100.0, time_budget=120)
     await harness.formalize("正式任务")
     await harness.root_delegates({"A": 50.0, "B": 25.0, "C": 25.0})
+    assert harness.raw_context_count > 0
     await harness.branch_checkpoint("A")
 
     harness.clock.advance(120)
@@ -34,6 +35,8 @@ async def test_complete_branching_research_flow(runtime_harness) -> None:
     assert harness.reports[-1].kind is ReportKind.FINAL
     assert harness.task_status is TaskStatus.COMPLETED
     assert harness.raw_context_count == 0
+    assert all(not branch.messages for branch in harness.coordinator.branches.values())
+    assert not harness.manager._branches.get(harness.task_id)
     assert await harness.persisted_report_kinds() == ["INTERMEDIATE", "FINAL"]
     layer = await harness.store.load_summary_layer(harness.task_id)
     assert layer is not None
