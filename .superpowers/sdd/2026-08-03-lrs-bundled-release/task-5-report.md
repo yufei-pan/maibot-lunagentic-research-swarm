@@ -146,3 +146,32 @@ PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
 ```
 
 Result: **40 passed** (includes concurrency fail-fast + ensure_ready degrade coverage).
+
+---
+
+## Review-4 Fixes (post `734b6ee`)
+
+**Status:** DONE — addressed Critical/Important findings from `task-5-review-4.md`.
+
+### Fixes
+
+1. **CRITICAL — suite green** — `LRSServiceContainer.start()` now wraps VectorIndex construction + `start()` + `ensure_ready()` in one `try/except Exception` that records `vector_index` as `unavailable`, closes any partial index, and continues LRS start (no more `sqlite_initialization_failed` mislabel). Lifecycle `FakeStore` gained a `run_locked` stub; `make_context` sets `llm=None` so lifecycle does not open real LanceDB. SQLite migration tests updated for migration 002 (`vector_generations`) / failing fixture version=3.
+2. **IMPORTANT — vector start degradation** — production path never aborts the plugin on LanceDB import/IO/`OSError`/broad Exception during vector startup; never reports `healthy` on failure.
+3. **IMPORTANT — background rebuild catch-all** — `_auto_rebuild_task` catches broad Exception, logs, fails stranded building, records `_last_rebuild_error` surfaced via `status().last_error_*`, and always clears `_rebuilding`. `_await_background_rebuild` swallows task exceptions so `rebuild()` / `ensure_ready()` keep the `VectorOpResult` contract. Those methods also convert `EmbeddingGenerationMismatch` / infra exceptions into fail results (tests updated accordingly).
+
+### Verification
+
+```bash
+timeout 180s env PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest -q
+# 542 passed in 1.75s
+
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest -q \
+  tests/test_lifecycle.py \
+  tests/storage/test_sqlite.py \
+  tests/storage/test_vectors.py \
+  tests/storage/test_vector_rebuild.py \
+  tests/test_services_startup_cleanup.py
+# 74 passed in 1.09s
+```
+
+Result: **542 passed, 0 failed** (full suite).

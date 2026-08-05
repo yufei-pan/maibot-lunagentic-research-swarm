@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +51,8 @@ _REPORT_KIND_TO_SOURCE = {
 }
 
 PHYSICAL_EMBEDDING_SELECTOR_UNSUPPORTED = "physical_embedding_selector_unsupported"
+
+_LOG = logging.getLogger(__name__)
 
 
 class EmbeddingGenerationMismatch(LRSError):
@@ -103,6 +107,8 @@ class VectorIndexStatus:
     dimension: int | None
     schema_version: int | None
     table_name: str | None
+    last_error_code: str | None = None
+    last_error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +257,7 @@ class VectorIndex:
         self._started = False
         self._rebuilding = False
         self._rebuild_task: asyncio.Task[None] | None = None
+        self._last_rebuild_error: LRSError | None = None
         self._lock = asyncio.Lock()
 
     def set_selector(self, selector: str) -> None:
@@ -295,6 +302,7 @@ class VectorIndex:
         self._db = None
         self._started = False
         self._rebuilding = False
+        self._last_rebuild_error = None
 
     async def status(self) -> VectorIndexStatus:
         rows = await self._store.run_locked(_load_generation_rows)
@@ -303,6 +311,7 @@ class VectorIndex:
         failed = next((row for row in reversed(rows) if row["status"] == "failed"), None)
         retired = tuple(int(row["generation"]) for row in rows if row["status"] == "retired")
         idle = active is None and building is None
+        last_error = self._last_rebuild_error
         return VectorIndexStatus(
             idle=idle,
             uninitialized=idle,
@@ -317,6 +326,8 @@ class VectorIndex:
             dimension=int(active["dimension"]) if active and active["dimension"] is not None else None,
             schema_version=int(active["schema_version"]) if active else None,
             table_name=str(active["table_name"]) if active else None,
+            last_error_code=last_error.code if last_error is not None else None,
+            last_error_message=last_error.message if last_error is not None else None,
         )
 
     async def list_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:
@@ -363,9 +374,22 @@ class VectorIndex:
         await self._await_background_rebuild()
         async with self._lock:
             try:
-                return await self._rebuild_unlocked(force=force)
+                result = await self._rebuild_unlocked(force=force)
             except VectorRebuildFailed as exc:
+                self._last_rebuild_error = exc
                 return VectorOpResult.fail(exc)
+            except LRSError as exc:
+                self._last_rebuild_error = exc
+                return VectorOpResult.fail(exc)
+            except Exception as exc:
+                wrapped = VectorRebuildFailed(f"重建失败：{exc}")
+                self._last_rebuild_error = wrapped
+                return VectorOpResult.fail(wrapped)
+            if result.success:
+                self._last_rebuild_error = None
+            elif result.error is not None:
+                self._last_rebuild_error = result.error
+            return result
 
     async def search(self, query: str, *, limit: int = 10) -> VectorOpResult:
         status = await self.status()
@@ -442,18 +466,32 @@ class VectorIndex:
                     # 指纹仍匹配时 force=False 即可清 stranded，避免无谓全量重嵌
                     soft = await self._rebuild_unlocked(force=False)
                     if soft.success and not (await self.status()).candidate_active:
-                        return soft
-                    return await self._rebuild_unlocked(force=True)
-                if status.active_generation is None:
+                        result = soft
+                    else:
+                        result = await self._rebuild_unlocked(force=True)
+                elif status.active_generation is None:
                     sources = await self._list_indexable_sources()
                     if not sources:
-                        return VectorOpResult.ok(code="empty")
-                    return await self._rebuild_unlocked(force=True)
-                return await self._rebuild_unlocked(force=False)
+                        result = VectorOpResult.ok(code="empty")
+                    else:
+                        result = await self._rebuild_unlocked(force=True)
+                else:
+                    result = await self._rebuild_unlocked(force=False)
             except (EmbeddingGenerationMismatch, VectorRebuildFailed) as exc:
+                self._last_rebuild_error = exc
                 return VectorOpResult.fail(exc)
             except LRSError as exc:
+                self._last_rebuild_error = exc
                 return VectorOpResult.fail(exc)
+            except Exception as exc:
+                wrapped = VectorRebuildFailed(f"ensure_ready 失败：{exc}")
+                self._last_rebuild_error = wrapped
+                return VectorOpResult.fail(wrapped)
+            if result.success:
+                self._last_rebuild_error = None
+            elif result.error is not None:
+                self._last_rebuild_error = result.error
+            return result
 
     async def wait_rebuild(self, timeout: float | None = None) -> None:
         """测试/运维：等待后台 auto-rebuild 结束（若有）。"""
@@ -490,12 +528,22 @@ class VectorIndex:
         )
 
     async def _await_background_rebuild(self) -> None:
+        """等待后台 rebuild 结束；吞掉任务异常，避免破坏 VectorOpResult 契约。"""
+
         task = self._rebuild_task
-        if task is None or task.done():
+        if task is None:
+            return
+        if task.done():
+            with suppress(asyncio.CancelledError, Exception):
+                if not task.cancelled():
+                    _ = task.exception()
             return
         try:
             await task
         except asyncio.CancelledError:
+            pass
+        except Exception:
+            # 异常已由 _auto_rebuild_task 记录；此处不得再抛入 rebuild/ensure_ready。
             pass
 
     async def _auto_rebuild_task(
@@ -511,14 +559,36 @@ class VectorIndex:
         try:
             try:
                 await self._run_full_rebuild(selector=selector)
-            except (EmbeddingGenerationMismatch, VectorRebuildFailed):
+            except (EmbeddingGenerationMismatch, VectorRebuildFailed) as exc:
+                self._last_rebuild_error = exc
+                _LOG.warning("LRS 向量后台重建失败：%s", exc.message)
                 return
-            if await self._source_in_active_generation(source_kind, source_id):
-                generation = int((await self.status()).active_generation or 0)
-                await self._complete_job(job_id, generation=generation)
+            except Exception as exc:
+                wrapped = VectorRebuildFailed(f"后台重建失败：{exc}")
+                self._last_rebuild_error = wrapped
+                _LOG.exception("LRS 向量后台重建基础设施异常")
+                with suppress(Exception):
+                    await self._fail_stranded_building()
+                return
+            self._last_rebuild_error = None
+            try:
+                if await self._source_in_active_generation(source_kind, source_id):
+                    generation = int((await self.status()).active_generation or 0)
+                    await self._complete_job(job_id, generation=generation)
+            except Exception as exc:
+                # 重建本体已成功；job 收尾失败不回滚索引，但要可观测。
+                self._last_rebuild_error = VectorRebuildFailed(
+                    f"重建成功但完成 job 失败：{exc}",
+                    {"job_id": job_id, "source_id": source_id},
+                )
+                _LOG.exception("LRS 向量后台重建成功后完成 job 失败")
         finally:
-            status_after = await self.status()
-            self._rebuilding = bool(status_after.candidate_active)
+            try:
+                status_after = await self.status()
+                self._rebuilding = bool(status_after.candidate_active)
+            except Exception:
+                self._rebuilding = False
+                _LOG.exception("LRS 向量后台重建收尾读取 status 失败")
 
     async def _enqueue_unlocked(
         self, *, source_kind: str, source_id: str

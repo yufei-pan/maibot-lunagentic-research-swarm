@@ -7,6 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -42,12 +43,7 @@ from lunagentic_research_swarm.runtime.scheduler import FairScheduler
 from lunagentic_research_swarm.runtime.turns import TurnWorker
 from lunagentic_research_swarm.storage.outbox import MaisakaOutbox
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
-from lunagentic_research_swarm.storage.vectors import (
-    EmbeddingGenerationMismatch,
-    VectorIndex,
-    VectorIndexUnavailable,
-    VectorRebuildFailed,
-)
+from lunagentic_research_swarm.storage.vectors import VectorIndex
 
 StoreFactory = Callable[[Path], Any]
 DiscoveryFactory = Callable[..., Any]
@@ -231,24 +227,17 @@ class LRSServiceContainer:
             self._status["sqlite"] = {"status": "healthy"}
             llm = getattr(self._ctx, "llm", None)
             if llm is not None:
-                self.vector_index = VectorIndex(
-                    self._store,
-                    llm,
-                    self._config.embedding,
-                    Path(self._ctx.paths.data_dir) / "vectors" / "lancedb",
-                )
-                await self.vector_index.start()
-                # ensure_ready：清启动前残留 / 推进未初始化有源索引（与 start 内 stranded reconcile 互补）
-                # 向量层是可重建派生索引：失败只降级 vector_index，不拖垮整个 LRS 启动。
+                # 向量层是可重建派生索引：start / ensure_ready / LanceDB IO 失败只降级
+                # vector_index，绝不拖垮整个 LRS 启动（勿把异常误标为 sqlite_initialization_failed）。
                 try:
+                    self.vector_index = VectorIndex(
+                        self._store,
+                        llm,
+                        self._config.embedding,
+                        Path(self._ctx.paths.data_dir) / "vectors" / "lancedb",
+                    )
+                    await self.vector_index.start()
                     ready = await self.vector_index.ensure_ready()
-                except (EmbeddingGenerationMismatch, VectorRebuildFailed, VectorIndexUnavailable, LRSError) as exc:
-                    self._status["vector_index"] = {
-                        "status": "unavailable",
-                        "code": getattr(exc, "code", "vector_index_unavailable"),
-                        "message": getattr(exc, "message", str(exc)),
-                    }
-                else:
                     if not ready.success:
                         err = ready.error
                         self._status["vector_index"] = {
@@ -265,6 +254,20 @@ class LRSServiceContainer:
                             "dimension": vector_status.dimension,
                             "rebuilding": vector_status.rebuilding,
                         }
+                except Exception as exc:
+                    if self.vector_index is not None:
+                        with suppress(Exception):
+                            await self.vector_index.close()
+                    self.vector_index = None
+                    self._status["vector_index"] = {
+                        "status": "unavailable",
+                        "code": getattr(exc, "code", None) or "vector_index_unavailable",
+                        "message": getattr(exc, "message", None) or str(exc),
+                    }
+                    self._ctx.logger.warning(
+                        "LRS 向量索引启动失败；插件将以降级向量层继续加载",
+                        exc_info=True,
+                    )
             else:
                 self._status["vector_index"] = {"status": "degraded", "code": "llm_unavailable"}
             maisaka = getattr(self._ctx, "maisaka", None)

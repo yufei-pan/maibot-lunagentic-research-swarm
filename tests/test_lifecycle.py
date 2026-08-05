@@ -46,6 +46,25 @@ class FakeStore:
     async def transact(self, commands: Any) -> None:
         assert commands
 
+    async def run_locked(self, function: Any) -> Any:
+        """最小 stub：生命周期测试不打开真实 SQLite，向量元数据读写返回空结果。"""
+
+        class _StubConnection:
+            def execute(self, *_args: Any, **_kwargs: Any) -> _StubConnection:
+                return self
+
+            def fetchall(self) -> list[Any]:
+                return []
+
+            def fetchone(self) -> None:
+                return None
+
+            @property
+            def rowcount(self) -> int:
+                return 0
+
+        return function(_StubConnection())
+
 
 class FakeDiscovery:
     def __init__(
@@ -198,11 +217,14 @@ def make_context(tmp_path: Path) -> PluginContext:
             return {"success": True, "apis": []}
         raise AssertionError(f"未声明的测试 capability：{capability}")
 
-    return PluginContext(
+    context = PluginContext(
         "com.0-hz.lunagentic-research-swarm",
         rpc_call=rpc,
         paths=PluginPaths(data_dir=tmp_path / "data", runtime_dir=tmp_path / "runtime"),
     )
+    # 生命周期套件不覆盖 embedding；禁用 llm 以免真实 LanceDB 连接污染后续向量测试。
+    context.llm = None
+    return context
 
 
 def build_container(

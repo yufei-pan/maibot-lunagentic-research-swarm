@@ -285,7 +285,7 @@ async def test_migration_is_recorded_once_and_reopen_is_idempotent(tmp_path) -> 
             "SELECT version, name FROM schema_migrations ORDER BY version"
         ).fetchall()
     assert loaded is not None
-    assert migrations == [(1, "authoritative_state")]
+    assert migrations == [(1, "authoritative_state"), (2, "vector_generations")]
 
 
 @pytest.mark.asyncio
@@ -294,7 +294,7 @@ async def test_failing_migration_rolls_back_its_schema_and_record(tmp_path, monk
 
     path = tmp_path / "state.sqlite3"
     failing = Migration(
-        version=2,
+        version=3,
         name="deliberate_failure",
         statements=(
             "CREATE TABLE migration_atomicity_probe (probe_id TEXT PRIMARY KEY)",
@@ -313,7 +313,7 @@ async def test_failing_migration_rolls_back_its_schema_and_record(tmp_path, monk
         ).fetchone()
         versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
     assert probe is None
-    assert versions == [(1,)]
+    assert versions == [(1,), (2,)]
 
 
 @pytest.mark.asyncio

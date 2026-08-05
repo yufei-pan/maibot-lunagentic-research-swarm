@@ -16,7 +16,6 @@ from lunagentic_research_swarm.config import EmbeddingSection
 from lunagentic_research_swarm.errors import EMBEDDING_GENERATION_MISMATCH, VECTOR_INDEX_REBUILDING
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
 from lunagentic_research_swarm.storage.vectors import (
-    EmbeddingGenerationMismatch,
     INDEXABLE_CONTENT_STATUSES,
     VectorIndex,
     VECTOR_SCHEMA_VERSION,
@@ -306,12 +305,15 @@ async def test_batch_dimension_inconsistency_aborts_generation(vector_harness) -
     await vector_harness.seed_formalized("t1", "正式任务一")
     await vector_harness.seed_formalized("t2", "正式任务二")
     vector_harness.embedder.return_vectors([[1.0, 2.0], [1.0, 2.0, 3.0]])
-    with pytest.raises(EmbeddingGenerationMismatch):
-        await vector_harness.rebuild(force=True)
+    result = await vector_harness.rebuild(force=True)
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
     status = await vector_harness.status()
     assert not status.candidate_active
     assert status.active_generation is None
     assert status.idle
+    assert status.last_error_code == EMBEDDING_GENERATION_MISMATCH
 
 
 @pytest.mark.asyncio
@@ -461,8 +463,10 @@ async def test_empty_force_rebuild_does_not_create_failed_candidate(vector_harne
 async def test_vectors_are_finite_and_nonempty_required(vector_harness) -> None:
     await vector_harness.seed_formalized("bad", "正式任务")
     vector_harness.embedder.return_vectors([[math.nan, 1.0, 2.0]])
-    with pytest.raises(EmbeddingGenerationMismatch):
-        await vector_harness.rebuild(force=True)
+    result = await vector_harness.rebuild(force=True)
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
 
 
 @pytest.mark.asyncio
@@ -486,8 +490,10 @@ async def test_non_numeric_embedding_fails_job_not_pending(vector_harness) -> No
 async def test_bool_embedding_elements_rejected(vector_harness) -> None:
     await vector_harness.seed_formalized("bool-bad", "正式任务")
     vector_harness.embedder.return_vectors([[True, False, True]])
-    with pytest.raises(EmbeddingGenerationMismatch):
-        await vector_harness.rebuild(force=True)
+    result = await vector_harness.rebuild(force=True)
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
 
 
 @pytest.mark.asyncio

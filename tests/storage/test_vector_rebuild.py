@@ -7,7 +7,7 @@ import time
 import pytest
 
 from lunagentic_research_swarm.errors import EMBEDDING_GENERATION_MISMATCH, VECTOR_INDEX_REBUILDING
-from lunagentic_research_swarm.storage.vectors import EmbeddingGenerationMismatch, _insert_generation, _table_name_for
+from lunagentic_research_swarm.storage.vectors import _insert_generation, _table_name_for
 
 from test_vectors import VectorHarness
 
@@ -33,8 +33,10 @@ async def test_failed_candidate_preserves_old_active(vector_harness) -> None:
     await vector_harness.seed_formalized("extra-b", "额外正式任务乙")
     # 主动 generation 仍是 3 维；force rebuild 时一批内维度不一致 → 候选失败
     vector_harness.embedder.return_vectors([[1.0, 2.0], [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    with pytest.raises(EmbeddingGenerationMismatch):
-        await vector_harness.rebuild(force=True)
+    result = await vector_harness.rebuild(force=True)
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == EMBEDDING_GENERATION_MISMATCH
 
     status = await vector_harness.status()
     assert status.active_generation == old_generation
@@ -42,6 +44,7 @@ async def test_failed_candidate_preserves_old_active(vector_harness) -> None:
     assert not status.candidate_active
     assert not status.rebuilding
     assert status.failed_candidate is not None
+    assert status.last_error_code == EMBEDDING_GENERATION_MISMATCH
 
 
 @pytest.mark.asyncio
