@@ -201,19 +201,42 @@ class LRSServiceContainer:
                 "status": "healthy",
                 "interrupted": int(interrupted),
             }
+            self._load_initial_price_catalog()
+            self._builtin_provider_loader(self.agent_registry, self.procedure_registry)
+            self._discovery = self._new_discovery(self._refresh_interval_seconds)
+            await self._refresh_external_extensions()
+            self._record_physical_pinning_health()
+            self._warn_for_low_root_budget()
+            self._discovery.start()
+            self._state = "running"
         except BaseException:
             self._status["sqlite"] = {"status": "critical", "code": "sqlite_initialization_failed"}
+            await self._cleanup_start_failure()
             self._state = "failed"
             raise
 
-        self._load_initial_price_catalog()
-        self._builtin_provider_loader(self.agent_registry, self.procedure_registry)
-        self._discovery = self._new_discovery(self._refresh_interval_seconds)
-        await self._refresh_external_extensions()
-        self._record_physical_pinning_health()
-        self._warn_for_low_root_budget()
-        self._discovery.start()
-        self._state = "running"
+    async def _cleanup_start_failure(self) -> None:
+        """释放启动阶段已经创建的资源而不遮蔽原始异常。"""
+
+        resources: tuple[tuple[str, Any | None], ...] = (
+            ("extension_discovery", self._discovery),
+            ("maisaka_outbox", self.outbox),
+            ("sqlite", self._store),
+        )
+        self._discovery = None
+        self.outbox = None
+        for resource_name, resource in resources:
+            if resource is None:
+                continue
+            try:
+                await resource.close()
+            except BaseException as exc:
+                # 只记录安全的错误类型，清理异常不能覆盖启动原始异常。
+                self._ctx.logger.error(
+                    "LRS 启动失败后的资源清理异常：resource=%s；error_type=%s",
+                    resource_name,
+                    type(exc).__name__,
+                )
 
     def _load_initial_price_catalog(self) -> None:
         loader = self._host_snapshot_loader

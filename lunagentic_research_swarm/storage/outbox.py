@@ -199,7 +199,7 @@ class MaisakaOutbox:
         await self.store.mark_outbox_failed(
             str(row["outbox_id"]), attempt_count=attempt,
             next_attempt_at=float(self.clock()) + delay,
-            error=f"{type(exc).__name__}: {exc}"[:1000],
+            error=f"delivery_failed:{type(exc).__name__}"[:128],
             **self._lease_kwargs(row),
         )
 

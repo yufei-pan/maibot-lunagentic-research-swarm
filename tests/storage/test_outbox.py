@@ -118,6 +118,42 @@ async def test_trigger_includes_stable_outbox_metadata(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delivery_failure_persists_only_safe_error_code(tmp_path) -> None:
+    store = SQLiteStateStore(tmp_path / "state.sqlite3")
+    await store.open()
+    await store.transact(
+        [
+            StoreCommand("insert_task", {"task_id": "task-1", "stream_id": "stream-1", "created_at": 1.0}),
+            StoreCommand(
+                "insert_round",
+                {
+                    "round_id": "round-1", "task_id": "task-1", "round_number": 1, "generation": 0,
+                    "status": "RUNNING", "time_budget_seconds": 10, "credit_pool": 1.0, "started_at": 1.0,
+                },
+            ),
+            StoreCommand(
+                "insert_outbox",
+                {
+                    "outbox_id": "out-trigger", "task_id": "task-1", "round_id": "round-1", "report_id": "report-1",
+                    "delivery_kind": "trigger_report_review", "idempotency_key": "lrs:task-1:1:report-1:trigger",
+                    "payload_json": json.dumps({"intent": "review_intermediate_report"}),
+                    "status": "PENDING", "next_attempt_at": 0.0, "created_at": 1.0,
+                },
+            ),
+        ]
+    )
+    maisaka = FakeMaisaka()
+    maisaka.fail_trigger = 1
+    outbox = MaisakaOutbox(store, maisaka, clock=lambda: 100.0)
+    await outbox.deliver_once()
+    row = await _row(store, "out-trigger")
+    assert row["status"].lower() == "pending"
+    assert row["last_error"] == "delivery_failed:RuntimeError"
+    assert "transient trigger" not in row["last_error"]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_sqlite_claim_due_outbox_is_exclusive_between_workers(tmp_path) -> None:
     path = tmp_path / "state.sqlite3"
     first, second = SQLiteStateStore(path), SQLiteStateStore(path)
