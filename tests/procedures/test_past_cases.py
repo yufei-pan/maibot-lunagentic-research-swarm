@@ -382,6 +382,62 @@ async def test_past_cases_empty_real_vector_index_is_success(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_past_cases_failed_rebuild_real_vector_index_is_structured(tmp_path: Path) -> None:
+    """真实 VectorIndex 首建失败：past_cases 须结构化失败，不得 success + cases=[]。"""
+
+    from lunagentic_research_swarm.config import EmbeddingSection
+    from lunagentic_research_swarm.storage.vectors import VectorIndex
+
+    store = SQLiteStateStore(tmp_path / "state.sqlite3")
+    await store.open()
+    await store.transact(
+        [
+            StoreCommand(
+                "insert_task",
+                {
+                    "task_id": "failed-rebuild-task",
+                    "stream_id": "stream_failed",
+                    "formalized_text": "有语料但 embedding 失败",
+                    "formalized_sha256": "sha_failed",
+                    "created_at": 1.0,
+                },
+            )
+        ]
+    )
+
+    class _FailingEmbedder:
+        async def embed(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("embedding provider down")
+
+    index = VectorIndex(
+        store,
+        _FailingEmbedder(),
+        EmbeddingSection(selector="task:embedding"),
+        tmp_path / "vectors" / "lancedb",
+    )
+    await index.start()
+    try:
+        ready = await index.ensure_ready()
+        assert not ready.success
+        assert ready.error is not None
+        assert ready.error.code == VECTOR_REBUILD_FAILED
+        status = await index.status()
+        assert status.active_generation is None
+        assert status.failed_candidate is not None
+        assert status.last_error_code == VECTOR_REBUILD_FAILED
+
+        provider = BundledProcedureProvider(object(), store=store, vector_index=index)
+        result = await provider.invoke("builtin.past_cases", {"query": "有语料"})
+        assert not result.success
+        assert result.error is not None
+        assert result.error["code"] == VECTOR_REBUILD_FAILED
+        assert result.data is None or "cases" not in (result.data or {})
+    finally:
+        await index.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_past_cases_excludes_scoped_task_id_via_invoker(
     past_case_harness: PastCaseHarness,
 ) -> None:

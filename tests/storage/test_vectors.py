@@ -13,12 +13,16 @@ from typing import Any
 import pytest
 
 from lunagentic_research_swarm.config import EmbeddingSection
-from lunagentic_research_swarm.errors import EMBEDDING_GENERATION_MISMATCH, VECTOR_INDEX_REBUILDING
+from lunagentic_research_swarm.errors import (
+    EMBEDDING_GENERATION_MISMATCH,
+    VECTOR_INDEX_REBUILDING,
+    VECTOR_REBUILD_FAILED,
+)
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
 from lunagentic_research_swarm.storage.vectors import (
     INDEXABLE_CONTENT_STATUSES,
-    VectorIndex,
     VECTOR_SCHEMA_VERSION,
+    VectorIndex,
     _load_indexable_sources,
 )
 
@@ -65,9 +69,7 @@ class FakeEmbedder:
             vectors = [[0.1, 0.2, 0.3] for _ in batch]
         return {
             "success": True,
-            "results": [
-                {"embedding": list(vector), "model_name": self.model_name} for vector in vectors
-            ],
+            "results": [{"embedding": list(vector), "model_name": self.model_name} for vector in vectors],
         }
 
 
@@ -395,9 +397,7 @@ async def test_concurrent_enqueue_fails_fast_while_auto_rebuild_in_progress(vect
     assert not release.is_set(), "second enqueue must not wait for full rebuild"
 
     # 放行后台重建（corpus: task-seed + task_for_summary-a + summary-a + task_for_summary-b + summary-b）
-    vector_harness.embedder.return_vectors(
-        [[1.0, 2.0], [1.0, 2.0], [1.0, 2.0], [1.0, 2.0], [1.0, 2.0]]
-    )
+    vector_harness.embedder.return_vectors([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0], [1.0, 2.0], [1.0, 2.0]])
     release.set()
     await vector_harness.index.wait_rebuild(timeout=5.0)
     status = await vector_harness.status()
@@ -456,12 +456,93 @@ async def test_search_on_empty_uninitialized_returns_empty_hits_not_rebuilding(v
     status = await vector_harness.status()
     assert status.uninitialized
     assert not status.rebuilding
+    assert status.failed_candidate is None
+    assert status.last_error_code is None
     search = await vector_harness.search("任意查询")
     assert search.success
     assert search.code == "empty"
     assert search.data is not None
     assert search.data["hits"] == []
     assert search.error is None
+
+
+@pytest.mark.asyncio
+async def test_search_after_failed_rebuild_is_structured_not_empty(vector_harness) -> None:
+    """有语料但首建失败：search 须结构化失败，不得 success + hits=[]。"""
+
+    await vector_harness.seed_formalized("t1", "正式任务一")
+    await vector_harness.seed_formalized("t2", "正式任务二")
+    vector_harness.embedder.return_vectors([[1.0, 2.0], [1.0, 2.0, 3.0]])
+    rebuild = await vector_harness.rebuild(force=True)
+    assert not rebuild.success
+    status = await vector_harness.status()
+    assert status.active_generation is None
+    assert status.failed_candidate is not None
+    assert status.last_error_code == EMBEDDING_GENERATION_MISMATCH
+
+    search = await vector_harness.search("正式任务")
+    assert not search.success
+    assert search.error is not None
+    assert search.error.code == EMBEDDING_GENERATION_MISMATCH
+    assert search.data is None or "hits" not in (search.data or {})
+
+
+@pytest.mark.asyncio
+async def test_search_after_stranded_first_rebuild_is_structured_not_empty(tmp_path) -> None:
+    """首建中崩溃留下 stranded building：restart 后 search 不得伪装空成功。"""
+
+    import time
+
+    from lunagentic_research_swarm.storage.vectors import _insert_generation, _table_name_for
+
+    harness = await VectorHarness.create(tmp_path)
+    try:
+        await harness.seed_formalized("stranded-task", "崩溃中的正式任务")
+
+        def _strand_first_build(connection) -> None:
+            _insert_generation(
+                connection,
+                generation=1,
+                selector="task:embedding",
+                actual_model_name=None,
+                model_fingerprint="pending",
+                dimension=None,
+                table_name=_table_name_for(1),
+                schema_version=1,
+                status="building",
+                created_at=time.time(),
+            )
+
+        await harness.store.run_locked(_strand_first_build)
+        lance_dir = harness.tmp_path / "vectors" / "lancedb"
+        await harness.index.close()
+
+        restarted = VectorIndex(
+            harness.store,
+            harness.embedder,
+            EmbeddingSection(
+                selector="task:embedding",
+                batch_size=8,
+                max_concurrent=2,
+                auto_rebuild=True,
+                retired_generation_retention_seconds=86400,
+            ),
+            lance_dir,
+        )
+        await restarted.start()
+        try:
+            status = await restarted.status()
+            assert status.active_generation is None
+            assert status.failed_candidate is not None
+            assert not status.rebuilding
+            search = await restarted.search("崩溃中的正式任务")
+            assert not search.success
+            assert search.error is not None
+            assert search.error.code == VECTOR_REBUILD_FAILED
+        finally:
+            await restarted.close()
+    finally:
+        await harness.close()
 
 
 @pytest.mark.asyncio

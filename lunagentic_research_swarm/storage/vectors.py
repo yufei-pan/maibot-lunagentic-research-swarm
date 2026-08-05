@@ -395,8 +395,15 @@ class VectorIndex:
         status = await self.status()
         if status.rebuilding:
             return VectorOpResult.fail(LRSError(VECTOR_INDEX_REBUILDING, "向量索引正在重建，历史案例暂不可用"))
-        # 从未建库 / 空语料：可检索为空结果，不得伪装成「重建中」（否则 day-one 永久失败）。
+        # 从未建库 / 健康空语料：可检索为空结果，不得伪装成「重建中」（否则 day-one 永久失败）。
+        # 失败重建 / stranded failed_candidate / last_error → 结构化失败，不得伪装成空成功。
         if status.active_generation is None or status.dimension is None or status.table_name is None:
+            if status.failed_candidate is not None or status.last_error_code is not None:
+                if self._last_rebuild_error is not None:
+                    return VectorOpResult.fail(self._last_rebuild_error)
+                return VectorOpResult.fail(
+                    VectorRebuildFailed(status.last_error_message or "向量索引重建失败或未完成，历史案例暂不可用")
+                )
             return VectorOpResult.ok(code="empty", data={"hits": []})
 
         try:
