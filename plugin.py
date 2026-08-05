@@ -420,14 +420,19 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
             return failure_result("invalid_argument", str(exc)[:256], task_id=task_id)
         except Exception:
             return failure_result("feedback_error", "反馈提交失败", task_id=task_id)
-        return {
+        payload: dict[str, Any] = {
             "success": True,
             "feedback_id": result.feedback_id,
             "lesson_id": result.lesson_id,
             "disposition": result.disposition,
             "task_id": task_id,
             "round_id": result.round_id,
+            "lesson_indexing": getattr(result, "lesson_indexing", "skipped"),
         }
+        index_error = getattr(result, "lesson_index_error", None)
+        if index_error:
+            payload["lesson_index_error"] = index_error
+        return payload
 
     def _default_time_budget_seconds(self) -> int:
         if self._services is not None:

@@ -593,11 +593,13 @@ class SQLiteStateStore:
 
     @staticmethod
     def _insert_feedback_reminder(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        # ON CONFLICT DO NOTHING：派生 reminder 不得因 UNIQUE(round_id) 中断终态事务。
         connection.execute(
             """
             INSERT INTO feedback_reminders(
                 reminder_id, task_id, round_id, due_at, status, triggered_at
             ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(round_id) DO NOTHING
             """,
             (
                 values["reminder_id"],

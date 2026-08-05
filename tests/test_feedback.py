@@ -184,6 +184,54 @@ async def test_feedback_renders_deterministic_lesson_and_enqueues_vector(
     assert feedback_harness.index.enqueued == [(SOURCE_KIND_FEEDBACK_LESSON, result.feedback_id)]
     assert result.lesson_id == result.feedback_id
     assert result.disposition == "accepted"
+    assert result.lesson_indexing == "indexed"
+    assert result.lesson_index_error is None
+
+
+@pytest.mark.asyncio
+async def test_post_commit_enqueue_exception_does_not_fail_submit(
+    feedback_harness: FeedbackHarness,
+) -> None:
+    class BoomIndex(FakeVectorIndex):
+        async def enqueue(self, *, source_kind: str, source_id: str) -> Any:
+            self.enqueued.append((source_kind, source_id))
+            raise RuntimeError("lancedb unavailable")
+
+    boom = BoomIndex()
+    feedback_harness.index = boom
+    feedback_harness.service.vector_index = boom
+
+    result = await feedback_harness.submit(task_id="lrs_1", disposition="accepted", notes="仍应成功")
+    rows = await feedback_harness.events()
+    assert len(rows) == 1
+    assert result.feedback_id
+    assert result.lesson_indexing == "failed"
+    assert result.lesson_index_error is not None
+    assert "lancedb" in result.lesson_index_error
+
+
+@pytest.mark.asyncio
+async def test_post_commit_enqueue_vector_op_failure_is_reported(
+    feedback_harness: FeedbackHarness,
+) -> None:
+    from lunagentic_research_swarm.errors import LRSError, VECTOR_INDEX_REBUILDING
+    from lunagentic_research_swarm.storage.vectors import VectorOpResult
+
+    class FailIndex(FakeVectorIndex):
+        async def enqueue(self, *, source_kind: str, source_id: str) -> Any:
+            self.enqueued.append((source_kind, source_id))
+            return VectorOpResult.fail(LRSError(VECTOR_INDEX_REBUILDING, "向量索引正在重建"))
+
+    failing = FailIndex()
+    feedback_harness.index = failing
+    feedback_harness.service.vector_index = failing
+
+    result = await feedback_harness.submit(task_id="lrs_1", disposition="mixed", corrections=["x"])
+    assert result.feedback_id
+    assert result.lesson_indexing == "pending"
+    assert result.lesson_index_error == VECTOR_INDEX_REBUILDING
+    rows = await feedback_harness.events()
+    assert len(rows) == 1
 
 
 @pytest.mark.asyncio
@@ -218,3 +266,31 @@ async def test_submit_cancels_pending_reminder_for_round(feedback_harness: Feedb
     reminders = await feedback_harness.store.run_locked(_read)
     assert reminders
     assert all(row["status"] == "cancelled" for row in reminders)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_reminder_insert_is_noop(feedback_harness: FeedbackHarness) -> None:
+    """UNIQUE(round_id) conflict must not abort; second insert is discarded."""
+
+    await feedback_harness.store.transact(
+        [
+            feedback_harness.service.schedule_command(task_id="lrs_1", round_id="rnd_1", ended_at=10.0),
+        ]
+    )
+    await feedback_harness.store.transact(
+        [
+            feedback_harness.service.schedule_command(task_id="lrs_1", round_id="rnd_1", ended_at=20.0),
+        ]
+    )
+
+    def _read(connection: Any) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            "SELECT due_at, status FROM feedback_reminders WHERE round_id = ?",
+            ("rnd_1",),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    rows = await feedback_harness.store.run_locked(_read)
+    assert len(rows) == 1
+    assert rows[0]["due_at"] == 610.0
+    assert rows[0]["status"] == "pending"

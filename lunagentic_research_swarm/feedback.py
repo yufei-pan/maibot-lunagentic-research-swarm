@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -16,6 +17,8 @@ from typing import Any
 from lunagentic_research_swarm.models import TaskStatus
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
 from lunagentic_research_swarm.storage.vectors import SOURCE_KIND_FEEDBACK_LESSON
+
+_LOG = logging.getLogger(__name__)
 
 DISPOSITIONS = frozenset({"accepted", "mixed", "rejected", "superseded"})
 REMINDER_TERMINAL_STATUSES = frozenset(
@@ -44,6 +47,10 @@ class FeedbackResult:
     disposition: str
     round_id: str
     lesson: str
+    # 提交已持久化后的 lesson 索引状态；不得因索引失败而让 submit 看起来失败。
+    # indexed | pending | failed | skipped | degraded
+    lesson_indexing: str = "skipped"
+    lesson_index_error: str | None = None
 
 
 def render_feedback_lesson(
@@ -330,11 +337,85 @@ class FeedbackService:
             )
 
         result = await self.store.run_locked(_commit)
-        if self.index_lessons and self.vector_index is not None:
-            enqueue = getattr(self.vector_index, "enqueue", None)
-            if callable(enqueue):
-                await enqueue(source_kind=SOURCE_KIND_FEEDBACK_LESSON, source_id=result.feedback_id)
-        return result
+        return await self._index_lesson_after_commit(result)
+
+    async def _index_lesson_after_commit(self, result: FeedbackResult) -> FeedbackResult:
+        """提交已提交后尽力入队；失败只降级报告，绝不回滚或冒充 submit 失败。"""
+
+        if not self.index_lessons:
+            return result
+        if self.vector_index is None:
+            return FeedbackResult(
+                feedback_id=result.feedback_id,
+                lesson_id=result.lesson_id,
+                disposition=result.disposition,
+                round_id=result.round_id,
+                lesson=result.lesson,
+                lesson_indexing="degraded",
+                lesson_index_error="vector_index_unavailable",
+            )
+        enqueue = getattr(self.vector_index, "enqueue", None)
+        if not callable(enqueue):
+            return FeedbackResult(
+                feedback_id=result.feedback_id,
+                lesson_id=result.lesson_id,
+                disposition=result.disposition,
+                round_id=result.round_id,
+                lesson=result.lesson,
+                lesson_indexing="degraded",
+                lesson_index_error="vector_enqueue_unavailable",
+            )
+        try:
+            op = await enqueue(source_kind=SOURCE_KIND_FEEDBACK_LESSON, source_id=result.feedback_id)
+        except Exception as exc:
+            _LOG.warning(
+                "feedback lesson enqueue failed after commit feedback_id=%s: %s",
+                result.feedback_id,
+                exc,
+                exc_info=True,
+            )
+            return FeedbackResult(
+                feedback_id=result.feedback_id,
+                lesson_id=result.lesson_id,
+                disposition=result.disposition,
+                round_id=result.round_id,
+                lesson=result.lesson,
+                lesson_indexing="failed",
+                lesson_index_error=str(exc)[:256] or type(exc).__name__,
+            )
+        success = bool(getattr(op, "success", False))
+        code = getattr(op, "code", None)
+        error = getattr(op, "error", None)
+        error_code = getattr(error, "code", None) if error is not None else None
+        if success:
+            indexing = "indexed" if code in (None, "indexed") else str(code)
+            return FeedbackResult(
+                feedback_id=result.feedback_id,
+                lesson_id=result.lesson_id,
+                disposition=result.disposition,
+                round_id=result.round_id,
+                lesson=result.lesson,
+                lesson_indexing=indexing,
+                lesson_index_error=None,
+            )
+        # 重建中等可恢复状态报告为 pending，其余为 failed；均不抛出。
+        status = "pending" if error_code == "vector_index_rebuilding" or code == "vector_index_rebuilding" else "failed"
+        detail = str(error_code or code or "vector_enqueue_failed")
+        _LOG.warning(
+            "feedback lesson enqueue returned %s feedback_id=%s code=%s",
+            status,
+            result.feedback_id,
+            detail,
+        )
+        return FeedbackResult(
+            feedback_id=result.feedback_id,
+            lesson_id=result.lesson_id,
+            disposition=result.disposition,
+            round_id=result.round_id,
+            lesson=result.lesson,
+            lesson_indexing=status,
+            lesson_index_error=detail,
+        )
 
     async def process_due(self) -> int:
         """处理到期 reminder：无该 round feedback/新 round 时写 outbox 并标 triggered。"""
@@ -458,7 +539,7 @@ class FeedbackService:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                pass
+                _LOG.exception("feedback reminder process_due failed; will retry on next poll")
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=self.poll_interval_seconds)
             except asyncio.TimeoutError:
