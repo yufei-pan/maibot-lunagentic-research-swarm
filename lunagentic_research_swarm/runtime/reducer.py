@@ -292,6 +292,10 @@ def _state_generation(state: Any) -> int:
     return int(getattr(state, "generation", 0))
 
 
+def _state_report_epoch(state: Any) -> int:
+    return int(getattr(state, "report_epoch", 0))
+
+
 def _state_credit_pool(state: Any) -> float:
     try:
         return float(getattr(state, "credit_pool", getattr(state, "pool", 0.0)))
@@ -832,7 +836,12 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     if isinstance(event, ReportDeadlineReached):
         if status is not TaskStatus.RUNNING:
             return _invalid(state, event, "ReportDeadlineReached 只能用于 RUNNING")
-        epoch = event.epoch if event.epoch is not None else int(getattr(state, "report_epoch", 0)) + 1
+        current_epoch = _state_report_epoch(state)
+        epoch = event.epoch if event.epoch is not None else current_epoch + 1
+        if epoch <= current_epoch:
+            return Transition.from_ignored(state, reason="stale_report_epoch")
+        if epoch != current_epoch + 1:
+            return Transition.from_ignored(state, reason="future_report_epoch")
         effects = (
             _effect(OpenReportEpoch, event, priority="barrier", payload={"epoch": epoch, "kind": "INTERMEDIATE"}),
         )
@@ -846,16 +855,19 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     if isinstance(event, GraceExpired):
         if status is not TaskStatus.REPORTING:
             return _invalid(state, event, "GraceExpired 只能用于 REPORTING")
-        return _transition_status(
-            state,
-            event,
-            TaskStatus.FINALIZING,
-            effects=(_effect(PerformTaskSummary, event, priority="barrier", payload={"kind": "FINAL"}),),
-        )
+        current_epoch = _state_report_epoch(state)
+        if event.epoch is not None and event.epoch < current_epoch:
+            return Transition.from_ignored(state, reason="stale_report_epoch")
+        if event.epoch is not None and event.epoch > current_epoch:
+            return Transition.from_ignored(state, reason="future_report_epoch")
+        # The coordinator clones the epoch frontier after this durable no-op.
+        # It later reports whether the persisted synthesis was intermediate or
+        # final, so grace itself must not preemptively force FINALIZING.
+        return Transition(state)
 
     if isinstance(event, FinalReportCompleted):
-        if status is not TaskStatus.FINALIZING:
-            return _invalid(state, event, "FinalReportCompleted 只能用于 FINALIZING")
+        if status not in {TaskStatus.FINALIZING, TaskStatus.REPORTING}:
+            return _invalid(state, event, "FinalReportCompleted 只能用于活跃报告 round")
         return _transition_status(
             state,
             event,

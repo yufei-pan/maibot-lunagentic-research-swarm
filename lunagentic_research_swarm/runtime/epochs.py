@@ -97,6 +97,7 @@ class ReportCoordinator:
         clock: Callable[[], float],
         launch_delegation: Callable[[str, Mapping[str, Any]], Awaitable[None] | None] | None = None,
         broadcast_summary: Callable[[CoverageSummary], Awaitable[None] | None] | None = None,
+        on_synthesis_complete: Callable[[ReportRecord], Awaitable[None] | None] | None = None,
         time_budget_seconds: int = 120,
         grace_period_seconds: int = 60,
         credit_pool: float = 0.0,
@@ -108,6 +109,7 @@ class ReportCoordinator:
         self.branches = dict(branches)
         self.store, self.summarizer, self.clock = store, summarizer, clock
         self.launch_delegation, self.broadcast_summary = launch_delegation, broadcast_summary
+        self.on_synthesis_complete = on_synthesis_complete
         self.time_budget_seconds, self.grace_period_seconds = time_budget_seconds, grace_period_seconds
         self.credit_pool = float(credit_pool)
         self.started_at = float(clock() if started_at is None else started_at)
@@ -184,7 +186,15 @@ class ReportCoordinator:
                 entry = self.current_epoch.frontier[branch_id]
                 entry.terminal_summary_id = summary_id
                 entry.failed = summary_id is None
-                await self._maybe_start_synthesis(self.current_epoch)
+                if not self.current_epoch.synthesis_finished:
+                    await self._maybe_start_synthesis(self.current_epoch)
+                    return self.current_epoch
+                # This branch reached a terminal safe point after the frozen
+                # intermediate report was already delivered.  It cannot
+                # alter that record, but an empty frontier now warrants the
+                # next FINAL epoch immediately.
+                if not self.active_branch_ids():
+                    return await self.open_epoch()
                 return self.current_epoch
             # A terminal-only investigation has no deadline frontier to
             # create its final report.  Open an empty frontier after the
@@ -339,6 +349,15 @@ class ReportCoordinator:
         self.reports.append(record)
         report_epoch.synthesis_finished = True
         self.deadline_at = created_at + self.time_budget_seconds
+        if self.on_synthesis_complete is not None:
+            completed = self.on_synthesis_complete(record)
+            if hasattr(completed, "__await__"):
+                await completed
+        # A synthesis that was necessarily intermediate at its frozen start
+        # may finish after every branch has become terminal.  Do not mutate
+        # that immutable record; open a distinct final epoch instead.
+        if frozen_kind is ReportKind.INTERMEDIATE and not self.active_branch_ids():
+            await self.open_epoch()
         return record
 
     async def wait_for_synthesis(self) -> None:

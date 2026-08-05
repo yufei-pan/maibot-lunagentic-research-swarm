@@ -106,6 +106,12 @@ class FakeSummarizer:
             return SummaryResult(False, "", "", None, SimpleNamespace(code="provider_error", message=self.error))
         return SummaryResult(True, "形式化后的调查任务", "fake-model", None, None)
 
+    async def finalize_branch(self, request):
+        return SummaryResult(True, "分支摘要", "fake-model", None, None)
+
+    async def finalize_task(self, request):
+        return SummaryResult(True, "任务报告", "fake-model", None, None)
+
 
 class FakeMessageAPI:
     def __init__(self) -> None:

@@ -61,10 +61,12 @@ class ControllableScheduler(FakeScheduler):
         return 1
 
 
-async def _running_manager(harness, *, effort_level: float = 1.0):
+async def _running_manager(harness, *, effort_level: float = 1.0, report_coordinator_factory=None):
     manager, store, summarizer, _, message, config = harness
     scheduler = ControllableScheduler()
     manager.scheduler = scheduler
+    if report_coordinator_factory is not None:
+        manager._report_coordinator_factory = report_coordinator_factory
     result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120, effort_level=effort_level)
     await manager.wait_idle(result["task_id"])
     return manager, store, summarizer, scheduler, result["task_id"]

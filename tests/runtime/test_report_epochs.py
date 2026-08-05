@@ -110,10 +110,11 @@ async def test_intermediate_does_not_upgrade_if_branches_finish_during_synthesis
     await report_harness.coordinator.on_branch_safe_point("A", terminal=True)
     await report_harness.coordinator.wait_for_synthesis()
 
-    assert report_harness.coordinator.reports[-1].kind is ReportKind.INTERMEDIATE
-    final = await report_harness.coordinator.open_epoch()
-    await report_harness.coordinator.wait_for_synthesis()
-    assert final.kind is ReportKind.FINAL
+    assert [record.kind for record in report_harness.coordinator.reports] == [
+        ReportKind.INTERMEDIATE,
+        ReportKind.FINAL,
+    ]
+    assert report_harness.coordinator.epochs[-1].kind is ReportKind.FINAL
 
 
 @pytest.mark.asyncio
@@ -142,6 +143,7 @@ async def test_synthesis_uses_coverage_snapshot_taken_before_later_terminal_summ
     await report_harness.coordinator.on_branch_safe_point("A", terminal=True)
     await report_harness.coordinator.wait_for_synthesis()
 
-    report = report_harness.coordinator.reports[-1]
+    report = report_harness.coordinator.reports[0]
     assert report.kind is ReportKind.INTERMEDIATE
     assert [item.summary_id for item in report.coverage.items] == [checkpoint_id]
+    assert report_harness.coordinator.reports[-1].kind is ReportKind.FINAL

@@ -15,8 +15,18 @@ import uuid
 from typing import Any
 
 from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
-from lunagentic_research_swarm.models import BranchLifecycle, FormalizedTask, TaskStatus, new_branch_id, new_round_id, new_task_id
+from lunagentic_research_swarm.models import (
+    BranchLifecycle,
+    BranchRuntime,
+    FormalizedTask,
+    ReportKind,
+    TaskStatus,
+    new_branch_id,
+    new_round_id,
+    new_task_id,
+)
 from lunagentic_research_swarm.runtime.controller import TaskController
+from lunagentic_research_swarm.runtime.epochs import ReportCoordinator, ReportRecord
 from lunagentic_research_swarm.runtime.events import (
     AllInflightSettled,
     ContinueRequested,
@@ -25,10 +35,17 @@ from lunagentic_research_swarm.runtime.events import (
     GraceExpired,
     PauseExpired,
     PauseRequested,
+    FinalReportCompleted,
+    ReportCompleted,
     ReportDeadlineReached,
     StopRequested,
 )
-from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformFormalization, RuntimeState
+from lunagentic_research_swarm.runtime.reducer import (
+    OpenReportEpoch,
+    PerformAgentCall,
+    PerformFormalization,
+    RuntimeState,
+)
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
 
 
@@ -55,6 +72,7 @@ class ResearchManager:
         pause_timeout_seconds: int = 1200,
         grace_period_seconds: int = 60,
         report_coordinators: dict[str, Any] | None = None,
+        report_coordinator_factory: Any | None = None,
     ) -> None:
         self.ctx, self.store, self.summarizer, self.scheduler = ctx, store, summarizer, scheduler
         self._snapshot_provider = snapshot_provider
@@ -70,6 +88,7 @@ class ResearchManager:
         # coordinator owns ephemeral report/branch state; TaskController stays
         # the sole authority for durable RuntimeState transitions.
         self.report_coordinators: dict[str, Any] = report_coordinators if report_coordinators is not None else {}
+        self._report_coordinator_factory = report_coordinator_factory or ReportCoordinator
 
     async def start(
         self,
@@ -156,6 +175,16 @@ class ResearchManager:
             if not accepted:
                 return
             self._branches[task_id][branch_id] = {"credits": credits, "pending_context": []}
+            self._register_report_coordinator(
+                task_id=task_id,
+                round_id=controller.state.active_round_id or "",
+                formalized_task=formalized,
+                root_branch_id=branch_id,
+                credits=credits,
+                catalog_fingerprint=snapshot.agent_catalog.fingerprint,
+                generation=controller.state.generation,
+                time_budget_seconds=time_budget_seconds,
+            )
         except Exception as exc:
             await controller.apply(
                 FormalizationFailed(
@@ -357,9 +386,17 @@ class ResearchManager:
         if controller.state.status is not TaskStatus.RUNNING:
             return
         await self._submit(controller, event)
-        coordinator = self.report_coordinators.get(event.task_id)
-        if coordinator is not None:
-            await coordinator.open_epoch(epoch=event.epoch if event.epoch is not None else controller.state.report_epoch)
+        if controller.state.status is not TaskStatus.REPORTING:
+            return
+        await self.handle_runtime_effect(
+            OpenReportEpoch(
+                event.task_id,
+                event.round_id,
+                event.generation,
+                priority="barrier",
+                payload={"epoch": controller.state.report_epoch},
+            )
+        )
 
     async def handle_grace_expired(self, event: GraceExpired) -> None:
         """Durably process grace expiry, then ask the coordinator for clones."""
@@ -370,9 +407,108 @@ class ResearchManager:
         if controller.state.status is not TaskStatus.REPORTING:
             return
         await self._submit(controller, event)
+        if controller.state.status is not TaskStatus.REPORTING:
+            return
         coordinator = self.report_coordinators.get(event.task_id)
-        if coordinator is not None:
+        if coordinator is not None and (event.epoch is None or event.epoch == controller.state.report_epoch):
             await coordinator.on_grace_expired(epoch=controller.state.report_epoch)
+
+    async def handle_runtime_effect(self, effect: Any) -> None:
+        """Consume report effects after the controller's durable transition.
+
+        Scheduler integrations may hand report effects here; deadline handling
+        uses the same path directly so a default production manager never
+        depends on tests manually injecting a coordinator.
+        """
+
+        if not isinstance(effect, OpenReportEpoch):
+            return
+        controller = self._controllers.get(effect.task_id)
+        if controller is None or controller.state.status is not TaskStatus.REPORTING:
+            return
+        coordinator = self.report_coordinators.get(effect.task_id)
+        if coordinator is None:
+            return
+        epoch = int(effect.payload.get("epoch", controller.state.report_epoch))
+        current = getattr(coordinator, "current_epoch", None)
+        if current is not None and getattr(current, "epoch", None) == epoch:
+            return
+        await coordinator.open_epoch(epoch=epoch)
+
+    async def _on_report_synthesis_complete(self, task_id: str, record: ReportRecord) -> None:
+        """Return a committed coordinator report to the sole state controller."""
+
+        controller = self._controllers.get(task_id)
+        if controller is None:
+            return
+        state = controller.state
+        if record.kind is ReportKind.FINAL:
+            if state.status is TaskStatus.RUNNING:
+                # The intermediate completion returned this task to RUNNING.
+                # Commit the new final epoch before publishing its completed
+                # event, preserving transaction-before-effect for both steps.
+                if record.epoch != state.report_epoch + 1:
+                    return
+                await self._submit(
+                    controller,
+                    ReportDeadlineReached(
+                        _event_id(), task_id, state.active_round_id or "", state.generation, epoch=record.epoch
+                    ),
+                )
+                state = controller.state
+            if state.status not in {TaskStatus.REPORTING, TaskStatus.FINALIZING}:
+                return
+            event = FinalReportCompleted(
+                _event_id(), task_id, state.active_round_id or "", state.generation, report_id=record.report_id
+            )
+        else:
+            if state.status is not TaskStatus.REPORTING:
+                return
+            event = ReportCompleted(
+                _event_id(), task_id, state.active_round_id or "", state.generation, report_id=record.report_id
+            )
+        await self._submit(controller, event)
+
+    def _register_report_coordinator(
+        self,
+        *,
+        task_id: str,
+        round_id: str,
+        formalized_task: FormalizedTask,
+        root_branch_id: str,
+        credits: float,
+        catalog_fingerprint: str,
+        generation: int,
+        time_budget_seconds: int,
+    ) -> None:
+        if task_id in self.report_coordinators:
+            return
+        branch = BranchRuntime(
+            branch_id=root_branch_id,
+            task=formalized_task,
+            catalog_fingerprint=catalog_fingerprint,
+            generation=generation,
+            messages=[],
+            credits=credits,
+            depth=0,
+        )
+
+        async def on_synthesis_complete(record: ReportRecord) -> None:
+            await self._on_report_synthesis_complete(task_id, record)
+
+        self.report_coordinators[task_id] = self._report_coordinator_factory(
+            task_id=task_id,
+            round_id=round_id,
+            formalized_task=formalized_task,
+            branches={root_branch_id: branch},
+            store=self.store,
+            summarizer=self.summarizer,
+            clock=_now,
+            on_synthesis_complete=on_synthesis_complete,
+            time_budget_seconds=time_budget_seconds,
+            grace_period_seconds=self._grace_period_seconds,
+            credit_pool=0.0,
+        )
 
     async def handle_branch_safe_point(
         self,

@@ -20,6 +20,8 @@ from lunagentic_research_swarm.runtime.events import (
     event_to_json,
     AgentCallRequested,
     OutboxDelivered,
+    GraceExpired,
+    ReportDeadlineReached,
 )
 from lunagentic_research_swarm.runtime.reducer import RuntimeState, reduce_event
 
@@ -79,6 +81,27 @@ def test_late_generation_is_ignored_without_commands_or_effects() -> None:
 
     assert transition.ignored
     assert transition.reason == "late_generation"
+    assert transition.commands == ()
+    assert transition.effects == ()
+
+
+@pytest.mark.parametrize(
+    ("event", "reason"),
+    [
+        (ReportDeadlineReached("old-deadline", "task-1", "round-1", 0, epoch=2), "stale_report_epoch"),
+        (ReportDeadlineReached("future-deadline", "task-1", "round-1", 0, epoch=10), "future_report_epoch"),
+        (GraceExpired("old-grace", "task-1", "round-1", 0, epoch=7), "stale_report_epoch"),
+    ],
+)
+def test_stale_or_future_report_epoch_event_cannot_advance_current_epoch(event, reason: str) -> None:
+    status = TaskStatus.REPORTING if isinstance(event, GraceExpired) else TaskStatus.RUNNING
+    state = RuntimeState("task-1", status, generation=0, active_round_id="round-1", report_epoch=8)
+
+    transition = reduce_event(state, event)
+
+    assert transition.ignored
+    assert transition.reason == reason
+    assert transition.next_state == state
     assert transition.commands == ()
     assert transition.effects == ()
 

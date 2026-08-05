@@ -292,7 +292,9 @@ class ReportDeadlineReached(Event):
 @_register
 @dataclass(frozen=True, slots=True)
 class GraceExpired(Event):
-    pass
+    # ``None`` preserves persisted events emitted before epochs were carried
+    # by the grace timer.  New timers must include the epoch they armed for.
+    epoch: int | None = None
 
 
 @_register
