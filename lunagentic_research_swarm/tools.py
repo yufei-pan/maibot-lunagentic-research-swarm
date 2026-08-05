@@ -122,6 +122,11 @@ def success_result(
             }
         else:
             output["error"] = {"code": "manager_error", "message": "研究任务未能继续"}
+        output.setdefault("task_id", task_id)
+        output.setdefault("round", output.get("round_id"))
+        output.setdefault("status", None)
+        output.setdefault("effective_time_budget_seconds", effective_time_budget_seconds)
+        output.setdefault("effective_credits_or_adjustment", adjustment)
         return output
     output = public_task_dto(result, task_id=task_id)
     output["success"] = True
@@ -136,6 +141,27 @@ def failure_result(code: str, message: str, *, task_id: str | None = None) -> di
     output: dict[str, Any] = {"success": False, "error": {"code": str(code), "message": str(message)}}
     if task_id:
         output["task_id"] = task_id
+    return output
+
+
+def mutation_failure_result(
+    code: str,
+    message: str,
+    *,
+    task_id: str | None = None,
+    round_value: Any = None,
+    status: str | None = None,
+    effective_time_budget_seconds: int | None = None,
+    adjustment: float | None = None,
+) -> dict[str, Any]:
+    """构造所有 mutating Tool 共用的失败 envelope。"""
+
+    output = failure_result(code, message, task_id=task_id)
+    output["task_id"] = task_id
+    output["round"] = round_value
+    output["status"] = status
+    output["effective_time_budget_seconds"] = effective_time_budget_seconds
+    output["effective_credits_or_adjustment"] = adjustment
     return output
 
 
@@ -204,7 +230,14 @@ async def invoke_manager(manager: Any, method_name: str, *args: Any, **kwargs: A
     return result
 
 
-def manager_error(exc: BaseException, *, task_id: str | None = None) -> dict[str, Any]:
+def manager_error(
+    exc: BaseException,
+    *,
+    task_id: str | None = None,
+    mutating: bool = False,
+    effective_time_budget_seconds: int | None = None,
+    adjustment: float | None = None,
+) -> dict[str, Any]:
     if isinstance(exc, PermissionError):
         code, message = "task_access_denied", "无权访问该调查任务"
     elif isinstance(exc, LookupError):
@@ -217,12 +250,20 @@ def manager_error(exc: BaseException, *, task_id: str | None = None) -> dict[str
         code, message = "invalid_argument", "研究任务参数无效"
     else:
         code, message = "manager_error", "研究运行时暂时不可用"
+    if mutating:
+        return mutation_failure_result(
+            code,
+            message,
+            task_id=task_id,
+            effective_time_budget_seconds=effective_time_budget_seconds,
+            adjustment=adjustment,
+        )
     return failure_result(code, message, task_id=task_id)
 
 
 __all__ = [
     "CONTEXT_SCHEMA", "CONTINUE_SCHEMA", "LIST_SCHEMA", "START_SCHEMA", "STOP_SCHEMA", "TASK_SCHEMA",
-    "failure_result", "invoke_manager", "manager_error", "parse_iso_timestamp", "public_task_dto",
+    "failure_result", "invoke_manager", "manager_error", "mutation_failure_result", "parse_iso_timestamp", "public_task_dto",
     "success_result", "validate_adjustment", "validate_effort", "validate_iso_timestamp", "validate_nonblank",
     "validate_status", "validate_time_budget",
 ]

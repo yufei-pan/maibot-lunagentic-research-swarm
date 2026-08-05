@@ -137,7 +137,11 @@ async def test_status_and_list_tools_return_stable_shapes(fake_plugin) -> None:
 async def test_start_requires_host_stream_id_and_manager_errors_are_structured(fake_plugin) -> None:
     plugin, manager = fake_plugin
     missing = await plugin.start_deep_research(objective="调查")
-    assert missing == {"success": False, "error": {"code": "stream_id_required", "message": "stream_id 不能为空"}}
+    assert missing["success"] is False
+    assert missing["error"] == {"code": "stream_id_required", "message": "stream_id 不能为空"}
+    assert all(key in missing for key in (
+        "task_id", "round", "status", "effective_time_budget_seconds", "effective_credits_or_adjustment",
+    ))
     assert manager.calls == []
 
     plugin._manager = SimpleNamespace(start=lambda **kwargs: (_ for _ in ()).throw(LookupError("not found")))
@@ -164,6 +168,9 @@ async def test_structured_manager_failure_and_strict_time_filtering(fake_plugin)
     failed = await plugin.continue_deep_research("lrs_fake", stream_id="s1")
     assert failed["success"] is False
     assert failed["error"]["code"] == "task_finished_insufficient_funds"
+    assert all(key in failed for key in (
+        "task_id", "round", "status", "effective_time_budget_seconds", "effective_credits_or_adjustment",
+    ))
 
     before = await plugin.list_research_tasks(
         created_before="2026-08-04T11:00:00Z", stream_id="s1"
@@ -171,3 +178,10 @@ async def test_structured_manager_failure_and_strict_time_filtering(fake_plugin)
     assert before["tasks"] == []
     invalid = await plugin.list_research_tasks(created_after="2026-08-04", stream_id="s1")
     assert invalid["error"]["code"] == "invalid_argument"
+
+    plugin._manager = None
+    unavailable = await plugin.stop_deep_research("lrs_fake", stream_id="s1")
+    assert unavailable["error"]["code"] == "manager_unavailable"
+    assert all(key in unavailable for key in (
+        "task_id", "round", "status", "effective_time_budget_seconds", "effective_credits_or_adjustment",
+    ))
