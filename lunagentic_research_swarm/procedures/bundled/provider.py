@@ -9,9 +9,17 @@ import httpx
 
 from lunagentic_research_swarm.config import WebSearchSection
 from lunagentic_research_swarm.extensions.contracts import ProcedureResult
+from lunagentic_research_swarm.procedures.bundled.analysis import (
+    ANALYSIS_HANDLERS,
+    analysis_procedure_definitions,
+)
 from lunagentic_research_swarm.procedures.bundled.memory import (
     MEMORY_HANDLERS,
     memory_procedure_definitions,
+)
+from lunagentic_research_swarm.procedures.bundled.provenance import (
+    PROVENANCE_HANDLERS,
+    provenance_procedure_definitions,
 )
 from lunagentic_research_swarm.procedures.bundled.web_search import (
     WEB_SEARCH_PROCEDURE_ID,
@@ -46,6 +54,8 @@ class BundledProcedureProvider:
                 self._http = http_client
             self._web_search = WebSearchService(section, self._http)
         self._handlers = dict(MEMORY_HANDLERS)
+        self._handlers.update(ANALYSIS_HANDLERS)
+        self._handlers.update(PROVENANCE_HANDLERS)
         self._handlers[WEB_SEARCH_PROCEDURE_ID] = make_web_search_handler(self._web_search)
 
     @property
@@ -55,7 +65,12 @@ class BundledProcedureProvider:
     def describe(self) -> list[dict[str, Any]]:
         """返回可交给 ProcedureRegistry.replace_provider 的 model_dump payload。"""
 
-        definitions = memory_procedure_definitions() + web_search_procedure_definitions(self._web_search)
+        definitions = (
+            memory_procedure_definitions()
+            + analysis_procedure_definitions()
+            + provenance_procedure_definitions()
+            + web_search_procedure_definitions(self._web_search)
+        )
         return [item.model_dump(mode="json") for item in definitions]
 
     async def invoke(self, procedure_id: str, arguments: Mapping[str, Any] | None = None) -> ProcedureResult:
