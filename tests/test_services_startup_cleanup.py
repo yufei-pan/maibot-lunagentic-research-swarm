@@ -169,3 +169,79 @@ async def test_start_failure_after_providers_closes_bundled_provider(
     assert container._bundled_procedure_provider is None
     assert container._state == "failed"
     assert store.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_failure_degrades_vector_without_aborting_start(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """unsupported selector / ensure_ready 失败时 vector_index 降级，LRS 其余部分仍可启动。"""
+    import lunagentic_research_swarm.services as services_module
+    from lunagentic_research_swarm.errors import LRSError
+    from lunagentic_research_swarm.storage.vectors import VectorOpResult
+
+    class FakeDiscovery:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        async def refresh(self) -> None:
+            return None
+
+        def start(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    def loader(
+        agents: Any,
+        procedures: Any,
+        *,
+        ctx: Any | None = None,
+        web_search_config: Any | None = None,
+        **kwargs: Any,
+    ) -> RecordingProvider:
+        del web_search_config, kwargs
+        from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
+
+        provider = RecordingProvider(ctx)
+        agents.replace_provider(
+            "builtin",
+            [definition.model_dump(mode="json") for definition in bundled_agent_definitions()],
+        )
+        procedures.replace_provider("builtin", provider.describe())
+        return provider
+
+    async def boom_ready(self: Any) -> VectorOpResult:
+        return VectorOpResult.fail(
+            LRSError(
+                "physical_embedding_selector_unsupported",
+                "首发 embedding 不支持 model: 物理 pinning，请使用 task: selector",
+            )
+        )
+
+    monkeypatch.setattr(services_module.VectorIndex, "ensure_ready", boom_ready)
+
+    context = SimpleNamespace(
+        paths=SimpleNamespace(data_dir=tmp_path / "data", runtime_dir=tmp_path / "runtime"),
+        logger=logging.getLogger("lrs-vector-degrade-test"),
+        llm=object(),
+        maisaka=None,
+    )
+    container = LRSServiceContainer(
+        context,
+        LRSConfig(),
+        discovery_factory=FakeDiscovery,
+        host_snapshot_loader=lambda: {"models": [], "model_task_config": {}},
+        builtin_provider_loader=loader,
+    )
+
+    await container.start()
+    try:
+        assert container._state == "running"
+        vector_status = container._status["vector_index"]
+        assert vector_status["status"] == "degraded"
+        assert vector_status["code"] == "physical_embedding_selector_unsupported"
+        assert vector_status["status"] != "healthy"
+    finally:
+        await container.close()

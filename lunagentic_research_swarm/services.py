@@ -18,6 +18,7 @@ from lunagentic_research_swarm.agents.registry import (
     RootAgentUnavailableError,
 )
 from lunagentic_research_swarm.config import AgentOverride, LRSConfig, ProcedureOverride
+from lunagentic_research_swarm.errors import LRSError
 from lunagentic_research_swarm.extensions.contracts import ExtensionRefreshDelta
 from lunagentic_research_swarm.extensions.discovery import ExtensionDiscovery
 from lunagentic_research_swarm.llm.gateway import (
@@ -41,7 +42,12 @@ from lunagentic_research_swarm.runtime.scheduler import FairScheduler
 from lunagentic_research_swarm.runtime.turns import TurnWorker
 from lunagentic_research_swarm.storage.outbox import MaisakaOutbox
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
-from lunagentic_research_swarm.storage.vectors import VectorIndex
+from lunagentic_research_swarm.storage.vectors import (
+    EmbeddingGenerationMismatch,
+    VectorIndex,
+    VectorIndexUnavailable,
+    VectorRebuildFailed,
+)
 
 StoreFactory = Callable[[Path], Any]
 DiscoveryFactory = Callable[..., Any]
@@ -233,15 +239,32 @@ class LRSServiceContainer:
                 )
                 await self.vector_index.start()
                 # ensure_ready：清启动前残留 / 推进未初始化有源索引（与 start 内 stranded reconcile 互补）
-                await self.vector_index.ensure_ready()
-                vector_status = await self.vector_index.status()
-                self._status["vector_index"] = {
-                    "status": "healthy",
-                    "idle": vector_status.idle,
-                    "active_generation": vector_status.active_generation,
-                    "dimension": vector_status.dimension,
-                    "rebuilding": vector_status.rebuilding,
-                }
+                # 向量层是可重建派生索引：失败只降级 vector_index，不拖垮整个 LRS 启动。
+                try:
+                    ready = await self.vector_index.ensure_ready()
+                except (EmbeddingGenerationMismatch, VectorRebuildFailed, VectorIndexUnavailable, LRSError) as exc:
+                    self._status["vector_index"] = {
+                        "status": "unavailable",
+                        "code": getattr(exc, "code", "vector_index_unavailable"),
+                        "message": getattr(exc, "message", str(exc)),
+                    }
+                else:
+                    if not ready.success:
+                        err = ready.error
+                        self._status["vector_index"] = {
+                            "status": "degraded",
+                            "code": err.code if err is not None else "vector_index_unavailable",
+                            "message": err.message if err is not None else "ensure_ready failed",
+                        }
+                    else:
+                        vector_status = await self.vector_index.status()
+                        self._status["vector_index"] = {
+                            "status": "healthy",
+                            "idle": vector_status.idle,
+                            "active_generation": vector_status.active_generation,
+                            "dimension": vector_status.dimension,
+                            "rebuilding": vector_status.rebuilding,
+                        }
             else:
                 self._status["vector_index"] = {"status": "degraded", "code": "llm_unavailable"}
             maisaka = getattr(self._ctx, "maisaka", None)

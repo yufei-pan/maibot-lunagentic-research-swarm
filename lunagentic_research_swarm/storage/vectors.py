@@ -250,6 +250,7 @@ class VectorIndex:
         self._db: Any | None = None
         self._started = False
         self._rebuilding = False
+        self._rebuild_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
     def set_selector(self, selector: str) -> None:
@@ -283,6 +284,14 @@ class VectorIndex:
         await self._maybe_cleanup_retired()
 
     async def close(self) -> None:
+        task = self._rebuild_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._rebuild_task = None
         self._db = None
         self._started = False
         self._rebuilding = False
@@ -328,34 +337,30 @@ class VectorIndex:
         return await self._store.run_locked(_list)
 
     async def enqueue(self, *, source_kind: str, source_id: str) -> VectorOpResult:
-        # 探测/写入在锁内；全量 auto-rebuild 在锁外再入，避免整个 corpus re-embed
-        # 占住 enqueue 临界区。重建期间 `_rebuilding` 已置位，并发 enqueue 快速失败，
-        # search 返回 vector_index_rebuilding；重建本身仍串行占用 `_lock`（安全边界）。
+        # 探测/写入在锁内；mismatch auto-rebuild 调度为后台任务（不占 `_lock` 做全量
+        # re-embed）。调度前先置 `_rebuilding`，并发 enqueue 观察后快速失败；触发方
+        # 立即返回 `vector_index_rebuilding`，不 await 整库重建。
         async with self._lock:
             result, pending = await self._enqueue_unlocked(source_kind=source_kind, source_id=source_id)
-            if pending is not None:
-                self._rebuilding = True
-
-        if pending is None:
-            return result
-
-        selector, job_id, pending_kind, pending_id = pending
-        async with self._lock:
-            try:
-                await self._run_full_rebuild(selector=selector)
-            except (EmbeddingGenerationMismatch, VectorRebuildFailed):
-                pass
-            finally:
-                status_after = await self.status()
-                self._rebuilding = bool(status_after.candidate_active)
-
-            if await self._source_in_active_generation(pending_kind, pending_id):
-                generation = int((await self.status()).active_generation or 0)
-                await self._complete_job(job_id, generation=generation)
-                return VectorOpResult.ok(code="indexed", data={"rebuilt": True})
-            return result
+            if pending is None:
+                return result
+            selector, job_id, pending_kind, pending_id = pending
+            self._schedule_auto_rebuild(
+                selector,
+                job_id=job_id,
+                source_kind=pending_kind,
+                source_id=pending_id,
+            )
+            return VectorOpResult.fail(
+                LRSError(
+                    VECTOR_INDEX_REBUILDING,
+                    "向量索引正在重建",
+                    {"queued": True, "job_id": job_id, "source_id": pending_id},
+                )
+            )
 
     async def rebuild(self, *, force: bool = False) -> VectorOpResult:
+        await self._await_background_rebuild()
         async with self._lock:
             try:
                 return await self._rebuild_unlocked(force=force)
@@ -429,20 +434,91 @@ class VectorIndex:
     async def ensure_ready(self) -> VectorOpResult:
         """推进 stranded / 未初始化索引到可用态；供 Task 6 与维护路径复用。"""
 
+        await self._await_background_rebuild()
         async with self._lock:
-            status = await self.status()
-            if status.candidate_active or self._rebuilding:
-                # 指纹仍匹配时 force=False 即可清 stranded，避免无谓全量重嵌
-                soft = await self._rebuild_unlocked(force=False)
-                if soft.success and not (await self.status()).candidate_active:
-                    return soft
-                return await self._rebuild_unlocked(force=True)
-            if status.active_generation is None:
-                sources = await self._list_indexable_sources()
-                if not sources:
-                    return VectorOpResult.ok(code="empty")
-                return await self._rebuild_unlocked(force=True)
-            return await self._rebuild_unlocked(force=False)
+            try:
+                status = await self.status()
+                if status.candidate_active or self._rebuilding:
+                    # 指纹仍匹配时 force=False 即可清 stranded，避免无谓全量重嵌
+                    soft = await self._rebuild_unlocked(force=False)
+                    if soft.success and not (await self.status()).candidate_active:
+                        return soft
+                    return await self._rebuild_unlocked(force=True)
+                if status.active_generation is None:
+                    sources = await self._list_indexable_sources()
+                    if not sources:
+                        return VectorOpResult.ok(code="empty")
+                    return await self._rebuild_unlocked(force=True)
+                return await self._rebuild_unlocked(force=False)
+            except (EmbeddingGenerationMismatch, VectorRebuildFailed) as exc:
+                return VectorOpResult.fail(exc)
+            except LRSError as exc:
+                return VectorOpResult.fail(exc)
+
+    async def wait_rebuild(self, timeout: float | None = None) -> None:
+        """测试/运维：等待后台 auto-rebuild 结束（若有）。"""
+
+        task = self._rebuild_task
+        if task is None or task.done():
+            return
+        if timeout is None:
+            await task
+        else:
+            await asyncio.wait_for(task, timeout=timeout)
+
+    def _schedule_auto_rebuild(
+        self,
+        selector: ModelSelector,
+        *,
+        job_id: str,
+        source_kind: str,
+        source_id: str,
+    ) -> None:
+        """置 `_rebuilding` 并调度后台全量重建（调用方须已持有 `_lock`）。"""
+
+        self._rebuilding = True
+        if self._rebuild_task is not None and not self._rebuild_task.done():
+            return
+        self._rebuild_task = asyncio.create_task(
+            self._auto_rebuild_task(
+                selector,
+                job_id=job_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            ),
+            name="lrs-vector-auto-rebuild",
+        )
+
+    async def _await_background_rebuild(self) -> None:
+        task = self._rebuild_task
+        if task is None or task.done():
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _auto_rebuild_task(
+        self,
+        selector: ModelSelector,
+        *,
+        job_id: str,
+        source_kind: str,
+        source_id: str,
+    ) -> None:
+        """在锁外执行全量重建；成功后补完触发该次 rebuild 的 job。"""
+
+        try:
+            try:
+                await self._run_full_rebuild(selector=selector)
+            except (EmbeddingGenerationMismatch, VectorRebuildFailed):
+                return
+            if await self._source_in_active_generation(source_kind, source_id):
+                generation = int((await self.status()).active_generation or 0)
+                await self._complete_job(job_id, generation=generation)
+        finally:
+            status_after = await self.status()
+            self._rebuilding = bool(status_after.candidate_active)
 
     async def _enqueue_unlocked(
         self, *, source_kind: str, source_id: str

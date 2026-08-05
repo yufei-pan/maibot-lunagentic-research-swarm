@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from lunagentic_research_swarm.errors import EMBEDDING_GENERATION_MISMATCH
+from lunagentic_research_swarm.errors import EMBEDDING_GENERATION_MISMATCH, VECTOR_INDEX_REBUILDING
 from lunagentic_research_swarm.storage.vectors import EmbeddingGenerationMismatch, _insert_generation, _table_name_for
 
 from test_vectors import VectorHarness
@@ -129,8 +129,10 @@ async def test_mismatch_job_marked_and_authoritative_sqlite_untouched(vector_har
     vector_harness.embedder.return_vectors([[1.0, 2.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]])
     result = await vector_harness.index_new_source("summary-keep-sqlite")
-    # auto-rebuild 自愈后 enqueue 成功；权威 SQLite 层始终未被动过
-    assert result.success
+    # 触发方立即拿到 rebuilding；后台完成后 job done，权威 SQLite 层始终未被动过
+    assert not result.success
+    assert result.error.code == VECTOR_INDEX_REBUILDING
+    await vector_harness.index.wait_rebuild()
 
     layer = await vector_harness.store.load_summary_layer("task_for_summary-keep-sqlite")
     assert layer is not None

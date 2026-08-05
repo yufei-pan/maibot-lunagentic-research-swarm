@@ -122,3 +122,27 @@ PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
 ```
 
 Result: **36 passed**.
+
+---
+
+## Review-3 Fixes (post `e32e53f`)
+
+**Status:** DONE — addressed remaining Important findings from `task-5-review-3.md`.
+
+### Fixes
+
+1. **Non-blocking auto-rebuild** — mismatch path sets `_rebuilding` then schedules a tracked `asyncio.Task` (`_auto_rebuild_task`) that runs `_run_full_rebuild` **without** holding `_lock`. Triggering `enqueue()` returns `vector_index_rebuilding` immediately (option a); concurrent `enqueue()` observes `_rebuilding` and fails fast. Background task completes the original job when the source lands in the new active generation. `rebuild` / `ensure_ready` / `close` await or cancel the task.
+2. **Startup `ensure_ready` health** — `LRSServiceContainer.start()` inspects `VectorOpResult`; failures mark `vector_index` `degraded` with the error code. Catches `EmbeddingGenerationMismatch` / `VectorRebuildFailed` / `VectorIndexUnavailable` / `LRSError` so a derived-index failure does not abort LRS start. Never reports healthy when `ensure_ready` failed. `ensure_ready()` itself converts rebuild raises into `VectorOpResult.fail`.
+
+### Verification
+
+```bash
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
+  tests/storage/test_vectors.py \
+  tests/storage/test_vector_rebuild.py \
+  tests/test_dependencies.py \
+  tests/storage/test_privacy.py \
+  tests/test_services_startup_cleanup.py -v
+```
+
+Result: **40 passed** (includes concurrency fail-fast + ensure_ready degrade coverage).

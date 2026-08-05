@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from collections.abc import Sequence
@@ -283,13 +284,13 @@ async def vector_harness(tmp_path):
 async def test_dimension_change_starts_new_generation_without_padding(vector_harness) -> None:
     await vector_harness.build_with_vectors([[1.0, 2.0, 3.0]])
     old = await vector_harness.status()
-    # enqueue 探测 2 维 → mismatch；随后 auto_rebuild 全量重嵌（task-seed + task_for_* + summary）
+    # enqueue 探测 2 维 → mismatch；立即返回 rebuilding，后台全量重嵌
     vector_harness.embedder.return_vectors([[1.0, 2.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     result = await vector_harness.index_new_source("summary-2")
-    # auto-rebuild 成功后源已在新 generation → enqueue 报告成功
-    assert result.success
-    assert result.code == "indexed"
+    assert not result.success
+    assert result.error.code == VECTOR_INDEX_REBUILDING
+    await vector_harness.index.wait_rebuild()
     status = await vector_harness.status()
     assert not status.rebuilding
     assert not status.candidate_active
@@ -320,7 +321,9 @@ async def test_selector_change_triggers_mismatch_rebuild(vector_harness) -> None
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
     result = await vector_harness.index_new_source("summary-selector")
-    assert result.success
+    assert not result.success
+    assert result.error.code == VECTOR_INDEX_REBUILDING
+    await vector_harness.index.wait_rebuild()
     status = await vector_harness.status()
     assert not status.rebuilding
     assert status.selector == "task:other-embedding"
@@ -333,7 +336,9 @@ async def test_actual_model_change_triggers_mismatch(vector_harness) -> None:
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
     result = await vector_harness.index_new_source("summary-model")
-    assert result.success
+    assert not result.success
+    assert result.error.code == VECTOR_INDEX_REBUILDING
+    await vector_harness.index.wait_rebuild()
     status = await vector_harness.status()
     assert status.actual_model_name == "fake-embed-v2"
     assert not status.rebuilding
@@ -346,10 +351,58 @@ async def test_schema_version_bump_forces_rebuild(vector_harness) -> None:
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0]])
     vector_harness.embedder.return_vectors([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
     result = await vector_harness.index_new_source("summary-schema")
-    assert result.success
+    assert not result.success
+    assert result.error.code == VECTOR_INDEX_REBUILDING
+    await vector_harness.index.wait_rebuild()
     status = await vector_harness.status()
     assert status.schema_version == VECTOR_SCHEMA_VERSION + 1
     assert not status.rebuilding
+
+
+@pytest.mark.asyncio
+async def test_concurrent_enqueue_fails_fast_while_auto_rebuild_in_progress(vector_harness) -> None:
+    """第二路 enqueue 在全量 rebuild 进行中必须快速返回，不得排队等待整库 re-embed。"""
+
+    await vector_harness.build_with_vectors([[1.0, 2.0, 3.0]])
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_rebuild = vector_harness.index._run_full_rebuild
+
+    async def blocked_rebuild(*, selector):  # type: ignore[no-untyped-def]
+        entered.set()
+        await release.wait()
+        return await real_rebuild(selector=selector)
+
+    vector_harness.index._run_full_rebuild = blocked_rebuild  # type: ignore[method-assign]
+    vector_harness.embedder.return_vectors([[1.0, 2.0]])  # mismatch probe
+
+    first = await vector_harness.index_new_source("summary-a")
+    assert not first.success
+    assert first.error.code == VECTOR_INDEX_REBUILDING
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    assert vector_harness.index._rebuilding
+
+    await vector_harness.seed_summary("summary-b", text="并发摘要")
+    second = await asyncio.wait_for(
+        vector_harness.index.enqueue(source_kind="checkpoint_summary", source_id="summary-b"),
+        timeout=1.0,
+    )
+    assert not second.success
+    assert second.error.code == VECTOR_INDEX_REBUILDING
+    assert not release.is_set(), "second enqueue must not wait for full rebuild"
+
+    # 放行后台重建（corpus: task-seed + task_for_summary-a + summary-a + task_for_summary-b + summary-b）
+    vector_harness.embedder.return_vectors(
+        [[1.0, 2.0], [1.0, 2.0], [1.0, 2.0], [1.0, 2.0], [1.0, 2.0]]
+    )
+    release.set()
+    await vector_harness.index.wait_rebuild(timeout=5.0)
+    status = await vector_harness.status()
+    assert not status.rebuilding
+    assert status.dimension == 2
+    done = await vector_harness.index.list_jobs(status="done")
+    assert any(job["source_id"] == "summary-a" for job in done)
 
 
 @pytest.mark.asyncio
