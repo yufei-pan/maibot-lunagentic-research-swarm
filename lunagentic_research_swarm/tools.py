@@ -8,6 +8,8 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any
 
+from lunagentic_research_swarm.models import TaskStatus
+
 
 START_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -18,7 +20,10 @@ START_SCHEMA: dict[str, Any] = {
         "planner_context": {"type": "string", "description": "Planner 提供的补充上下文。"},
     },
     "required": ["objective"],
-    "additionalProperties": True,
+    # ``stream_id`` is injected by the Host execution context, never supplied
+    # as a planner argument.  Rejecting extra arguments prevents a model from
+    # selecting another stream in the normal SDK validation path.
+    "additionalProperties": False,
 }
 
 TASK_SCHEMA: dict[str, Any] = {
@@ -70,11 +75,55 @@ LIST_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+PUBLIC_TASK_FIELDS = (
+    "task_id", "status", "round_id", "round_number", "generation", "active_leaves",
+    "raw_context_released", "created_at", "initial_credits", "effective_time_budget_seconds",
+    "effective_credits_or_adjustment", "round",
+)
 
-def success_result(result: Mapping[str, Any], *, effective_time_budget_seconds: int | None = None, adjustment: float = 0.0) -> dict[str, Any]:
+
+def public_task_dto(result: Mapping[str, Any], *, task_id: str | None = None) -> dict[str, Any]:
+    """只保留可向 Planner 公开的任务快照字段。"""
+
+    output = {key: result[key] for key in PUBLIC_TASK_FIELDS if key in result}
+    if task_id and "task_id" not in output:
+        output["task_id"] = task_id
+    leaves = output.get("active_leaves")
+    if isinstance(leaves, (list, tuple)):
+        output["active_leaves"] = [
+            {
+                key: leaf[key]
+                for key in ("branch_id", "credits")
+                if isinstance(leaf, Mapping) and key in leaf
+            }
+            for leaf in leaves
+            if isinstance(leaf, Mapping)
+        ]
+    return output
+
+
+def success_result(
+    result: Mapping[str, Any],
+    *,
+    effective_time_budget_seconds: int | None = None,
+    adjustment: float = 0.0,
+    task_id: str | None = None,
+) -> dict[str, Any]:
     """将 manager 的公开快照统一为 Planner 稳定 JSON shape。"""
 
-    output = dict(result)
+    if result.get("success") is False or "error" in result:
+        output = public_task_dto(result, task_id=task_id)
+        output["success"] = False
+        error = result.get("error")
+        if isinstance(error, Mapping):
+            output["error"] = {
+                "code": str(error.get("code") or "manager_error")[:64],
+                "message": str(error.get("message") or "研究任务未能继续")[:256],
+            }
+        else:
+            output["error"] = {"code": "manager_error", "message": "研究任务未能继续"}
+        return output
+    output = public_task_dto(result, task_id=task_id)
     output["success"] = True
     if "round" not in output:
         output["round"] = output.get("round_id")
@@ -122,9 +171,26 @@ def validate_iso_timestamp(value: Any, field: str) -> str | None:
     if not isinstance(value, str):
         return f"{field} 必须为 ISO 8601 字符串"
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return f"{field} 必须为 ISO 8601 字符串"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return f"{field} 必须包含时区"
+    return None
+
+
+def parse_iso_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("时间戳必须包含时区")
+    return parsed
+
+
+def validate_status(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in {item.value for item in TaskStatus}:
+        return "status 不是受支持的任务状态"
     return None
 
 
@@ -139,21 +205,24 @@ async def invoke_manager(manager: Any, method_name: str, *args: Any, **kwargs: A
 
 
 def manager_error(exc: BaseException, *, task_id: str | None = None) -> dict[str, Any]:
-    if isinstance(exc, LookupError):
-        code = "task_not_found"
+    if isinstance(exc, PermissionError):
+        code, message = "task_access_denied", "无权访问该调查任务"
+    elif isinstance(exc, LookupError):
+        code, message = "task_not_found", "调查任务不存在"
     elif isinstance(exc, ValueError):
-        code = "invalid_state"
+        code, message = "invalid_state", str(exc)[:256]
     elif isinstance(exc, AttributeError):
-        code = "manager_unavailable"
+        code, message = "manager_unavailable", "研究运行时尚未初始化"
     elif isinstance(exc, TypeError):
-        code = "invalid_argument"
+        code, message = "invalid_argument", "研究任务参数无效"
     else:
-        code = "manager_error"
-    return failure_result(code, str(exc), task_id=task_id)
+        code, message = "manager_error", "研究运行时暂时不可用"
+    return failure_result(code, message, task_id=task_id)
 
 
 __all__ = [
     "CONTEXT_SCHEMA", "CONTINUE_SCHEMA", "LIST_SCHEMA", "START_SCHEMA", "STOP_SCHEMA", "TASK_SCHEMA",
-    "failure_result", "invoke_manager", "manager_error", "success_result", "validate_adjustment",
-    "validate_effort", "validate_iso_timestamp", "validate_nonblank", "validate_time_budget",
+    "failure_result", "invoke_manager", "manager_error", "parse_iso_timestamp", "public_task_dto",
+    "success_result", "validate_adjustment", "validate_effort", "validate_iso_timestamp", "validate_nonblank",
+    "validate_status", "validate_time_budget",
 ]

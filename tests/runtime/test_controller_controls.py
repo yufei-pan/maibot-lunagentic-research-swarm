@@ -209,6 +209,17 @@ async def test_add_context_is_durable_and_broadcasts_to_active_branches(harness)
 
 
 @pytest.mark.asyncio
+async def test_stream_ownership_is_enforced_for_public_manager_controls(harness) -> None:
+    manager, _, _, _, task_id = await _running_manager(harness)
+
+    with pytest.raises(PermissionError):
+        await manager.status(task_id, stream_id="another-stream")
+    assert (await manager.status(task_id, stream_id="s"))["task_id"] == task_id
+    assert [item["task_id"] for item in await manager.list_tasks(stream_id="s")] == [task_id]
+    assert await manager.list_tasks(stream_id="another-stream") == []
+
+
+@pytest.mark.asyncio
 async def test_continue_redistributes_pool_at_barrier_including_all_zero_leaves(harness) -> None:
     manager, store, _, _, task_id = await _running_manager(harness, effort_level=0.0)
     await manager.pause(task_id)

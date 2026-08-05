@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +24,14 @@ from lunagentic_research_swarm.tools import (  # noqa: E402
     failure_result,
     invoke_manager,
     manager_error,
+    parse_iso_timestamp,
+    public_task_dto,
     success_result,
     validate_adjustment,
     validate_effort,
     validate_iso_timestamp,
     validate_nonblank,
+    validate_status,
     validate_time_budget,
 )
 
@@ -129,6 +133,9 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
             return failure_result("invalid_argument", message)
         if (message := validate_effort(effort_level)) is not None:
             return failure_result("invalid_argument", message)
+        planner_context = kwargs.get("planner_context")
+        if planner_context is not None and not isinstance(planner_context, str):
+            return failure_result("invalid_argument", "planner_context 必须为字符串")
         stream_id = kwargs.get("stream_id")
         if (message := validate_nonblank(stream_id, "stream_id")) is not None:
             return failure_result("stream_id_required", message)
@@ -145,7 +152,7 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
                 stream_id=stream_id,
                 time_budget_seconds=time_budget_seconds,
                 effort_level=float(effort_level),
-                planner_context=kwargs.get("planner_context"),
+                planner_context=planner_context,
             )
         except Exception as exc:
             return manager_error(exc)
@@ -155,6 +162,7 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
             result,
             effective_time_budget_seconds=time_budget_seconds,
             adjustment=float(result.get("initial_credits", 0.0)),
+            task_id=str(result.get("task_id") or "") or None,
         )
 
     @Tool(
@@ -164,8 +172,11 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
         core_tool=True,
         visibility="visible",
     )
-    async def pause_deep_research(self, task_id: str) -> dict[str, Any]:
-        return await self._call_mutating("pause", task_id)
+    async def pause_deep_research(self, task_id: str, **kwargs: Any) -> dict[str, Any]:
+        stream_id, error = self._stream_from_host(kwargs, task_id=task_id)
+        if error is not None:
+            return error
+        return await self._call_mutating("pause", task_id, stream_id=stream_id)
 
     @Tool(
         "continue_deep_research",
@@ -179,6 +190,7 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
         task_id: str,
         time_budget_seconds: int | None = None,
         credit_adjustment: float = 0.0,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         if (message := validate_nonblank(task_id, "task_id")) is not None:
             return failure_result("invalid_argument", message)
@@ -186,6 +198,9 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
             return failure_result("invalid_argument", message, task_id=task_id)
         if (message := validate_adjustment(credit_adjustment)) is not None:
             return failure_result("invalid_argument", message, task_id=task_id)
+        stream_id, error = self._stream_from_host(kwargs, task_id=task_id)
+        if error is not None:
+            return error
         manager = self._require_manager()
         if manager is None:
             return self._manager_unavailable(task_id=task_id)
@@ -196,12 +211,18 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
                 task_id,
                 time_budget_seconds=time_budget_seconds,
                 credit_adjustment=float(credit_adjustment),
+                stream_id=stream_id,
             )
         except Exception as exc:
             return manager_error(exc, task_id=task_id)
         if not isinstance(result, dict):
             return failure_result("manager_error", "研究运行时返回了无效结果", task_id=task_id)
-        return success_result(result, effective_time_budget_seconds=time_budget_seconds, adjustment=float(credit_adjustment))
+        return success_result(
+            result,
+            effective_time_budget_seconds=time_budget_seconds,
+            adjustment=float(credit_adjustment),
+            task_id=task_id,
+        )
 
     @Tool(
         "stop_deep_research",
@@ -210,21 +231,24 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
         core_tool=True,
         visibility="visible",
     )
-    async def stop_deep_research(self, task_id: str, reason: str = "") -> dict[str, Any]:
+    async def stop_deep_research(self, task_id: str, reason: str = "", **kwargs: Any) -> dict[str, Any]:
         if (message := validate_nonblank(task_id, "task_id")) is not None:
             return failure_result("invalid_argument", message)
         if not isinstance(reason, str):
             return failure_result("invalid_argument", "reason 必须为字符串", task_id=task_id)
+        stream_id, error = self._stream_from_host(kwargs, task_id=task_id)
+        if error is not None:
+            return error
         manager = self._require_manager()
         if manager is None:
             return self._manager_unavailable(task_id=task_id)
         try:
-            result = await invoke_manager(manager, "stop", task_id, reason=reason)
+            result = await invoke_manager(manager, "stop", task_id, reason=reason, stream_id=stream_id)
         except Exception as exc:
             return manager_error(exc, task_id=task_id)
         if not isinstance(result, dict):
             return failure_result("manager_error", "研究运行时返回了无效结果", task_id=task_id)
-        return success_result(result, adjustment=0.0)
+        return success_result(result, adjustment=0.0, task_id=task_id)
 
     @Tool(
         "add_research_context",
@@ -233,21 +257,24 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
         core_tool=True,
         visibility="visible",
     )
-    async def add_research_context(self, task_id: str, information: str) -> dict[str, Any]:
+    async def add_research_context(self, task_id: str, information: str, **kwargs: Any) -> dict[str, Any]:
         if (message := validate_nonblank(task_id, "task_id")) is not None:
             return failure_result("invalid_argument", message)
         if (message := validate_nonblank(information, "information")) is not None:
             return failure_result("invalid_argument", message, task_id=task_id)
+        stream_id, error = self._stream_from_host(kwargs, task_id=task_id)
+        if error is not None:
+            return error
         manager = self._require_manager()
         if manager is None:
             return self._manager_unavailable(task_id=task_id)
         try:
-            result = await invoke_manager(manager, "add_context", task_id, information)
+            result = await invoke_manager(manager, "add_context", task_id, information, stream_id=stream_id)
         except Exception as exc:
             return manager_error(exc, task_id=task_id)
         if not isinstance(result, dict):
             return failure_result("manager_error", "研究运行时返回了无效结果", task_id=task_id)
-        return success_result(result, adjustment=0.0)
+        return success_result(result, adjustment=0.0, task_id=task_id)
 
     @Tool(
         "get_research_status",
@@ -256,19 +283,22 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
         core_tool=True,
         visibility="visible",
     )
-    async def get_research_status(self, task_id: str) -> dict[str, Any]:
+    async def get_research_status(self, task_id: str, **kwargs: Any) -> dict[str, Any]:
         if (message := validate_nonblank(task_id, "task_id")) is not None:
             return failure_result("invalid_argument", message)
+        stream_id, error = self._stream_from_host(kwargs, task_id=task_id)
+        if error is not None:
+            return error
         manager = self._require_manager()
         if manager is None:
             return self._manager_unavailable(task_id=task_id)
         try:
-            result = await invoke_manager(manager, "status", task_id)
+            result = await invoke_manager(manager, "status", task_id, stream_id=stream_id)
         except Exception as exc:
             return manager_error(exc, task_id=task_id)
         if not isinstance(result, dict):
             return failure_result("manager_error", "研究运行时返回了无效结果", task_id=task_id)
-        return {"success": True, **result}
+        return {"success": True, **public_task_dto(result, task_id=task_id)}
 
     @Tool(
         "list_research_tasks",
@@ -283,19 +313,26 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
         created_after: str | None = None,
         created_before: str | None = None,
         limit: int = 20,
+        **kwargs: Any,
     ) -> dict[str, Any]:
-        if status is not None and (message := validate_nonblank(status, "status")) is not None:
+        if (message := validate_status(status)) is not None:
             return failure_result("invalid_argument", message)
         for value, field in ((created_after, "created_after"), (created_before, "created_before")):
             if (message := validate_iso_timestamp(value, field)) is not None:
                 return failure_result("invalid_argument", message)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             return failure_result("invalid_argument", "limit 必须在 1 到 100 之间")
+        if created_after is not None and created_before is not None:
+            if parse_iso_timestamp(created_after) > parse_iso_timestamp(created_before):
+                return failure_result("invalid_argument", "created_after 不能晚于 created_before")
+        stream_id, error = self._stream_from_host(kwargs)
+        if error is not None:
+            return error
         manager = self._require_manager()
         if manager is None:
             return self._manager_unavailable()
         try:
-            tasks = await invoke_manager(manager, "list_tasks")
+            tasks = await invoke_manager(manager, "list_tasks", stream_id=stream_id)
         except Exception as exc:
             return manager_error(exc)
         if not isinstance(tasks, list):
@@ -303,31 +340,43 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
         if status is not None:
             tasks = [item for item in tasks if isinstance(item, Mapping) and item.get("status") == status]
         if created_after is not None:
-            boundary = datetime.fromisoformat(created_after.replace("Z", "+00:00"))
-            tasks = [item for item in tasks if not isinstance(item, Mapping) or not item.get("created_at") or _after_boundary(item["created_at"], boundary)]
+            boundary = parse_iso_timestamp(created_after)
+            tasks = [item for item in tasks if isinstance(item, Mapping) and _after_boundary(item.get("created_at"), boundary)]
         if created_before is not None:
-            boundary = datetime.fromisoformat(created_before.replace("Z", "+00:00"))
-            tasks = [item for item in tasks if not isinstance(item, Mapping) or not item.get("created_at") or _before_boundary(item["created_at"], boundary)]
-        return {"success": True, "tasks": tasks[:limit], "limit": limit}
+            boundary = parse_iso_timestamp(created_before)
+            tasks = [item for item in tasks if isinstance(item, Mapping) and _before_boundary(item.get("created_at"), boundary)]
+        return {
+            "success": True,
+            "tasks": [public_task_dto(item) for item in tasks[:limit] if isinstance(item, Mapping)],
+            "limit": limit,
+        }
 
     def _default_time_budget_seconds(self) -> int:
         if self._services is not None:
             return int(self._services.safety_limits.get("default_time_budget_seconds", 120))
         return 120
 
-    async def _call_mutating(self, method_name: str, task_id: str) -> dict[str, Any]:
+    async def _call_mutating(self, method_name: str, task_id: str, *, stream_id: str) -> dict[str, Any]:
         if (message := validate_nonblank(task_id, "task_id")) is not None:
             return failure_result("invalid_argument", message)
         manager = self._require_manager()
         if manager is None:
             return self._manager_unavailable(task_id=task_id)
         try:
-            result = await invoke_manager(manager, method_name, task_id)
+            result = await invoke_manager(manager, method_name, task_id, stream_id=stream_id)
         except Exception as exc:
             return manager_error(exc, task_id=task_id)
         if not isinstance(result, dict):
             return failure_result("manager_error", "研究运行时返回了无效结果", task_id=task_id)
-        return success_result(result, adjustment=0.0)
+        return success_result(result, adjustment=0.0, task_id=task_id)
+
+    def _stream_from_host(
+        self, kwargs: Mapping[str, Any], *, task_id: str | None = None
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        stream_id = kwargs.get("stream_id")
+        if (message := validate_nonblank(stream_id, "stream_id")) is not None:
+            return None, failure_result("stream_id_required", message, task_id=task_id)
+        return str(stream_id), None
 
 
 def _after_boundary(value: Any, boundary: datetime) -> bool:

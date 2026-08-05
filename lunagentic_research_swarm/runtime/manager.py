@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
@@ -58,6 +59,10 @@ def _now() -> float:
     return time.time()
 
 
+def _iso_timestamp(value: float) -> str:
+    return datetime.fromtimestamp(float(value), tz=UTC).isoformat().replace("+00:00", "Z")
+
+
 class ResearchManager:
     """Creates and controls independently durable research tasks."""
 
@@ -82,6 +87,8 @@ class ResearchManager:
         self._grace_period_seconds = grace_period_seconds
         self._controllers: dict[str, TaskController] = {}
         self._round_numbers: dict[str, int] = {}
+        self._task_streams: dict[str, str] = {}
+        self._task_created_at: dict[str, float] = {}
         self._branches: dict[str, dict[str, dict[str, Any]]] = {}
         self._jobs: dict[str, set[asyncio.Task[Any]]] = {}
         self._pause_jobs: dict[str, asyncio.Task[Any]] = {}
@@ -134,6 +141,8 @@ class ResearchManager:
         await self.store.transact(initial)
         self._controllers[task_id] = controller
         self._round_numbers[task_id] = 1
+        self._task_streams[task_id] = stream_id
+        self._task_created_at[task_id] = created_at
         self._branches[task_id] = {}
         await self.scheduler.enqueue(PerformFormalization(task_id, round_id, 0, payload={"stream_id": stream_id}))
         self._track(task_id, self._formalize(task_id, objective, stream_id, planner_context, credits, snapshot, time_budget_seconds))
@@ -199,7 +208,8 @@ class ResearchManager:
             objective = ""
             planner_context = None
 
-    async def pause(self, task_id: str) -> dict[str, Any]:
+    async def pause(self, task_id: str, *, stream_id: str | None = None) -> dict[str, Any]:
+        await self._assert_stream_owner(task_id, stream_id)
         controller = self._controller(task_id)
         if controller.state.status not in {TaskStatus.RUNNING, TaskStatus.REPORTING}:
             raise ValueError("task 不在可暂停状态")
@@ -260,7 +270,8 @@ class ResearchManager:
         )
         self._branches[task_id].clear()
 
-    async def stop(self, task_id: str, *, reason: str = "") -> dict[str, Any]:
+    async def stop(self, task_id: str, *, reason: str = "", stream_id: str | None = None) -> dict[str, Any]:
+        await self._assert_stream_owner(task_id, stream_id)
         controller = self._controller(task_id)
         state = controller.state
         if state.status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.PAUSED}:
@@ -273,7 +284,8 @@ class ResearchManager:
         self._branches[task_id].clear()
         return self._status(controller)
 
-    async def add_context(self, task_id: str, context: str) -> dict[str, Any]:
+    async def add_context(self, task_id: str, context: str, *, stream_id: str | None = None) -> dict[str, Any]:
+        await self._assert_stream_owner(task_id, stream_id)
         controller = self._controller(task_id)
         if not isinstance(context, str) or not context.strip():
             raise ValueError("context 不能为空")
@@ -282,7 +294,15 @@ class ResearchManager:
             branch["pending_context"].append(context)
         return self._status(controller)
 
-    async def continue_task(self, task_id: str, *, credit_adjustment: float = 0.0, time_budget_seconds: int | None = None) -> dict[str, Any]:
+    async def continue_task(
+        self,
+        task_id: str,
+        *,
+        credit_adjustment: float = 0.0,
+        time_budget_seconds: int | None = None,
+        stream_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self._assert_stream_owner(task_id, stream_id)
         controller = self._controller(task_id)
         if time_budget_seconds is not None and (isinstance(time_budget_seconds, bool) or time_budget_seconds <= 0):
             raise ValueError("time_budget_seconds 必须为正整数")
@@ -584,11 +604,16 @@ class ResearchManager:
                 return
             await asyncio.gather(*jobs, return_exceptions=True)
 
-    async def status(self, task_id: str) -> dict[str, Any]:
+    async def status(self, task_id: str, *, stream_id: str | None = None) -> dict[str, Any]:
+        await self._assert_stream_owner(task_id, stream_id)
         return self._status(self._controller(task_id))
 
-    async def list_tasks(self) -> list[dict[str, Any]]:
-        return [self._status(controller) for controller in self._controllers.values()]
+    async def list_tasks(self, *, stream_id: str | None = None) -> list[dict[str, Any]]:
+        return [
+            self._status(controller)
+            for task_id, controller in self._controllers.items()
+            if stream_id is None or self._task_streams.get(task_id) == stream_id
+        ]
 
     def _status(self, controller: TaskController) -> dict[str, Any]:
         state = controller.state
@@ -599,7 +624,17 @@ class ResearchManager:
             if item["pending_context"]:
                 leaf["pending_context"] = list(item["pending_context"])
             leaves.append(leaf)
-        return {"task_id": state.task_id, "status": state.status.value, "round_id": state.active_round_id, "round_number": self._round_numbers.get(state.task_id, 1), "generation": state.generation, "active_leaves": leaves, "raw_context_released": state.raw_context_released}
+        created_at = self._task_created_at.get(state.task_id)
+        return {
+            "task_id": state.task_id,
+            "status": state.status.value,
+            "round_id": state.active_round_id,
+            "round_number": self._round_numbers.get(state.task_id, 1),
+            "generation": state.generation,
+            "active_leaves": leaves,
+            "raw_context_released": state.raw_context_released,
+            "created_at": _iso_timestamp(created_at) if created_at is not None else None,
+        }
 
     def _stored_time_budget(self, task_id: str) -> int | None:
         return None
@@ -609,6 +644,22 @@ class ResearchManager:
             return self._controllers[task_id]
         except KeyError as exc:
             raise LookupError(f"task {task_id} 不存在") from exc
+
+    async def _assert_stream_owner(self, task_id: str, stream_id: str | None) -> None:
+        if stream_id is None:
+            return
+        if not isinstance(stream_id, str) or not stream_id.strip():
+            raise PermissionError("stream_id 不能为空")
+        owner = self._task_streams.get(task_id)
+        if owner is None:
+            stored = await self.store.load_task(task_id)
+            owner = getattr(stored, "stream_id", None)
+            if owner is not None:
+                self._task_streams[task_id] = str(owner)
+            else:
+                raise LookupError(f"task {task_id} 不存在")
+        if owner != stream_id:
+            raise PermissionError("任务不属于当前 stream")
 
     def _track(self, task_id: str, coroutine: Any) -> None:
         task = asyncio.create_task(coroutine)

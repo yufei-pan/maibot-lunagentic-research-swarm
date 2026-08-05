@@ -13,8 +13,8 @@ class FakeResearchManager:
         self.calls.append(("start", (), dict(kwargs)))
         return {"task_id": "lrs_fake", "status": "FORMALIZING", "initial_credits": 100.0}
 
-    async def pause(self, task_id):
-        self.calls.append(("pause", (task_id,), {}))
+    async def pause(self, task_id, **kwargs):
+        self.calls.append(("pause", (task_id,), dict(kwargs)))
         return {"task_id": task_id, "status": "PAUSED", "round_id": "rnd-1"}
 
     async def continue_task(self, task_id, **kwargs):
@@ -25,17 +25,24 @@ class FakeResearchManager:
         self.calls.append(("stop", (task_id,), dict(kwargs)))
         return {"task_id": task_id, "status": "STOPPED", "round_id": "rnd-1"}
 
-    async def add_context(self, task_id, context):
-        self.calls.append(("add_context", (task_id, context), {}))
+    async def add_context(self, task_id, context, **kwargs):
+        self.calls.append(("add_context", (task_id, context), dict(kwargs)))
         return {"task_id": task_id, "status": "RUNNING", "round_id": "rnd-1"}
 
-    async def status(self, task_id):
-        self.calls.append(("status", (task_id,), {}))
-        return {"task_id": task_id, "status": "RUNNING", "round_id": "rnd-1"}
+    async def status(self, task_id, **kwargs):
+        self.calls.append(("status", (task_id,), dict(kwargs)))
+        return {
+            "task_id": task_id, "status": "RUNNING", "round_id": "rnd-1",
+            "active_leaves": [{"branch_id": "br-1", "credits": 1, "pending_context": ["secret"]}],
+        }
 
-    async def list_tasks(self):
-        self.calls.append(("list_tasks", (), {}))
-        return [{"task_id": "lrs_fake", "status": "RUNNING", "round_id": "rnd-1"}]
+    async def list_tasks(self, **kwargs):
+        self.calls.append(("list_tasks", (), dict(kwargs)))
+        return [{
+            "task_id": "lrs_fake", "status": "RUNNING", "round_id": "rnd-1",
+            "created_at": "2026-08-04T12:00:00Z",
+            "active_leaves": [{"branch_id": "br-1", "credits": 1, "pending_context": ["secret"]}],
+        }]
 
 
 @pytest.fixture
@@ -56,6 +63,16 @@ def test_runtime_planner_tool_names_are_plain(plugin_module) -> None:
         "stop_deep_research", "add_research_context", "get_research_status",
         "list_research_tasks",
     }
+
+
+def test_planner_schemas_do_not_allow_planner_to_select_stream(plugin_module) -> None:
+    component = next(
+        item for item in plugin_module.create_plugin().get_components()
+        if item["name"] == "start_deep_research" and item["type"] == "TOOL"
+    )
+    schema = component["metadata"]["parameters_raw"]
+    assert schema["additionalProperties"] is False
+    assert "stream_id" not in schema["properties"]
 
 
 @pytest.mark.asyncio
@@ -81,34 +98,39 @@ async def test_start_tool_forwards_stream_and_returns_immediately(fake_plugin) -
 @pytest.mark.asyncio
 async def test_mutating_tools_forward_controls_and_add_stable_fields(fake_plugin) -> None:
     plugin, manager = fake_plugin
-    paused = await plugin.pause_deep_research("lrs_fake")
+    paused = await plugin.pause_deep_research("lrs_fake", stream_id="s1")
     continued = await plugin.continue_deep_research(
-        "lrs_fake", time_budget_seconds=90, credit_adjustment=-2.5
+        "lrs_fake", time_budget_seconds=90, credit_adjustment=-2.5, stream_id="s1"
     )
-    stopped = await plugin.stop_deep_research("lrs_fake", reason="已满足")
-    supplied = await plugin.add_research_context("lrs_fake", information="补充条件")
+    stopped = await plugin.stop_deep_research("lrs_fake", reason="已满足", stream_id="s1")
+    supplied = await plugin.add_research_context("lrs_fake", information="补充条件", stream_id="s1")
 
     assert all(item["success"] for item in (paused, continued, stopped, supplied))
     assert paused["effective_time_budget_seconds"] is None
     assert continued["effective_time_budget_seconds"] == 90
     assert continued["effective_credits_or_adjustment"] == -2.5
     assert manager.calls == [
-        ("pause", ("lrs_fake",), {}),
-        ("continue", ("lrs_fake",), {"time_budget_seconds": 90, "credit_adjustment": -2.5}),
-        ("stop", ("lrs_fake",), {"reason": "已满足"}),
-        ("add_context", ("lrs_fake", "补充条件"), {}),
+        ("pause", ("lrs_fake",), {"stream_id": "s1"}),
+        ("continue", ("lrs_fake",), {"time_budget_seconds": 90, "credit_adjustment": -2.5, "stream_id": "s1"}),
+        ("stop", ("lrs_fake",), {"reason": "已满足", "stream_id": "s1"}),
+        ("add_context", ("lrs_fake", "补充条件"), {"stream_id": "s1"}),
     ]
 
 
 @pytest.mark.asyncio
 async def test_status_and_list_tools_return_stable_shapes(fake_plugin) -> None:
     plugin, manager = fake_plugin
-    status = await plugin.get_research_status("lrs_fake")
-    listed = await plugin.list_research_tasks(status="RUNNING", limit=20)
-    assert status == {"success": True, "task_id": "lrs_fake", "status": "RUNNING", "round_id": "rnd-1"}
+    status = await plugin.get_research_status("lrs_fake", stream_id="s1")
+    listed = await plugin.list_research_tasks(status="RUNNING", limit=20, stream_id="s1")
+    assert status == {
+        "success": True, "task_id": "lrs_fake", "status": "RUNNING", "round_id": "rnd-1",
+        "active_leaves": [{"branch_id": "br-1", "credits": 1}],
+    }
     assert listed["success"] is True
     assert listed["tasks"][0]["task_id"] == "lrs_fake"
     assert [call[0] for call in manager.calls] == ["status", "list_tasks"]
+    assert manager.calls[0][2] == {"stream_id": "s1"}
+    assert manager.calls[1][2] == {"stream_id": "s1"}
 
 
 @pytest.mark.asyncio
@@ -122,3 +144,30 @@ async def test_start_requires_host_stream_id_and_manager_errors_are_structured(f
     result = await plugin.start_deep_research(objective="调查", stream_id="s1")
     assert result["success"] is False
     assert result["error"]["code"] == "task_not_found"
+
+    missing_status = await plugin.get_research_status("lrs_fake")
+    assert missing_status["error"]["code"] == "stream_id_required"
+
+
+@pytest.mark.asyncio
+async def test_structured_manager_failure_and_strict_time_filtering(fake_plugin) -> None:
+    plugin, manager = fake_plugin
+
+    async def failed_continue(*args, **kwargs):
+        return {
+            "success": False,
+            "error": {"code": "task_finished_insufficient_funds", "message": "没有可用 credits"},
+            "task_id": args[0],
+        }
+
+    manager.continue_task = failed_continue
+    failed = await plugin.continue_deep_research("lrs_fake", stream_id="s1")
+    assert failed["success"] is False
+    assert failed["error"]["code"] == "task_finished_insufficient_funds"
+
+    before = await plugin.list_research_tasks(
+        created_before="2026-08-04T11:00:00Z", stream_id="s1"
+    )
+    assert before["tasks"] == []
+    invalid = await plugin.list_research_tasks(created_after="2026-08-04", stream_id="s1")
+    assert invalid["error"]["code"] == "invalid_argument"
