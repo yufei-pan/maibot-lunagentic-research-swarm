@@ -155,8 +155,16 @@ class CommandsSection(PluginConfigBase):
     __ui_label__ = "命令"
     enabled: bool = _ui_field(True, label="启用命令", hint="是否注册插件命令。")
     max_output_chars: int = _ui_field(12000, label="命令最大输出字符数", hint="命令输出的最大字符数。", ge=1000, le=50000)
-    maintenance_allowed_person_ids: list[str] = _ui_factory(factory=list, label="维护人员 ID", hint="允许执行维护命令的人员 ID 列表。")
-    allow_vector_rebuild: bool = _ui_field(True, label="允许向量重建", hint="是否允许维护命令重建向量。")
+    maintenance_allowed_user_ids: list[str] = _ui_factory(
+        factory=list,
+        label="维护人员用户 ID",
+        hint="允许执行维护命令的 Host user_id 列表（与命令 RPC 的 user_id 对齐，不是 person_id）。空列表表示不限制。",
+    )
+    allow_vector_rebuild: bool = _ui_field(
+        False,
+        label="允许向量重建",
+        hint="是否允许 `/swarm vectors rebuild`。默认关闭；开启后昂贵重建仍受维护白名单约束（空白名单=不限制）。",
+    )
 
 
 class WebSearchSection(PluginConfigBase):
@@ -231,6 +239,13 @@ def normalize_config(
         raise TypeError("config_data 必须为 Mapping 或 None")
 
     raw = dict(config_data)
+    # 兼容旧字段 maintenance_allowed_person_ids → maintenance_allowed_user_ids
+    commands_raw = dict(raw.get("commands") or {}) if isinstance(raw.get("commands"), Mapping) else {}
+    if "maintenance_allowed_person_ids" in commands_raw:
+        if "maintenance_allowed_user_ids" not in commands_raw:
+            commands_raw["maintenance_allowed_user_ids"] = commands_raw["maintenance_allowed_person_ids"]
+        del commands_raw["maintenance_allowed_person_ids"]
+        raw["commands"] = commands_raw
     raw_version = extract_plugin_config_version(raw)
     rebuilt = rebuild_plugin_config_data(default_data, raw)
     merged, merged_changed = merge_plugin_config_data(default_data, rebuilt)

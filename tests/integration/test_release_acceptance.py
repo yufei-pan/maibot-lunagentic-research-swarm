@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -208,20 +209,28 @@ async def test_release_flow_start_formalize_report_privacy_and_stats(runtime_har
 
 @pytest.mark.asyncio
 async def test_feedback_reminder_persists_for_completed_round(tmp_path: Path) -> None:
+    """Release gate：COMPLETED 经 TaskController 同事务调度 reminder（非手工 FeedbackService.schedule）。"""
+
+    from datetime import datetime, timezone
+
     from lunagentic_research_swarm.feedback import FeedbackService
+    from lunagentic_research_swarm.runtime.controller import TaskController
+    from lunagentic_research_swarm.runtime.events import FinalReportCompleted
+    from lunagentic_research_swarm.runtime.reducer import RuntimeState
     from lunagentic_research_swarm.storage.outbox import MaisakaOutbox
-    from types import SimpleNamespace
 
     store = SQLiteStateStore(tmp_path / "remind.sqlite3")
     await store.open()
     clock = FakeClock(1_000.0)
+    task_id = "lrs_release"
+    round_id = "rnd1"
     try:
         await store.transact(
             [
                 StoreCommand(
                     "insert_task",
                     {
-                        "task_id": "lrs_release",
+                        "task_id": task_id,
                         "stream_id": "s",
                         "current_round_number": 1,
                         "created_at": clock(),
@@ -231,11 +240,11 @@ async def test_feedback_reminder_persists_for_completed_round(tmp_path: Path) ->
                 StoreCommand(
                     "insert_round",
                     {
-                        "round_id": "rnd1",
-                        "task_id": "lrs_release",
+                        "round_id": round_id,
+                        "task_id": task_id,
                         "round_number": 1,
                         "generation": 0,
-                        "status": "COMPLETED",
+                        "status": "FINALIZING",
                         "time_budget_seconds": 120,
                         "credit_pool": 0.0,
                         "started_at": clock(),
@@ -243,19 +252,20 @@ async def test_feedback_reminder_persists_for_completed_round(tmp_path: Path) ->
                 ),
             ]
         )
-        maisaka = SimpleNamespace(trigger_calls=0)
 
-        class _Proactive:
+        class _Maisaka:
             async def trigger(self, *args, **kwargs):
                 del args, kwargs
-                maisaka.trigger_calls += 1
 
-        class _Context:
             async def append(self, *args, **kwargs):
                 del args, kwargs
 
-        maisaka.proactive = _Proactive()
-        maisaka.context = _Context()
+        class _Scheduler:
+            async def enqueue(self, effect: Any) -> bool:
+                del effect
+                return True
+
+        maisaka = _Maisaka()
         outbox = MaisakaOutbox(store, maisaka, clock=clock, poll_interval_seconds=0.01)
         service = FeedbackService(
             store,
@@ -265,11 +275,33 @@ async def test_feedback_reminder_persists_for_completed_round(tmp_path: Path) ->
             reminders_enabled=True,
             index_lessons=False,
         )
-        await service.schedule(task_id="lrs_release", round_id="rnd1", ended_at=clock())
+        controller = TaskController(
+            RuntimeState(
+                task_id,
+                TaskStatus.FINALIZING,
+                generation=0,
+                active_round_id=round_id,
+            ),
+            store=store,
+            scheduler=_Scheduler(),
+            feedback=service,
+        )
+        accepted = await controller.apply(
+            FinalReportCompleted(
+                "final_ok",
+                task_id,
+                round_id,
+                0,
+                occurred_at=datetime.fromtimestamp(float(clock()), tz=timezone.utc),
+                report_id="rpt_ok",
+            )
+        )
+        assert accepted
+        assert controller.state.status is TaskStatus.COMPLETED
         pending = await store.run_locked(
             lambda connection: connection.execute(
                 "SELECT status FROM feedback_reminders WHERE task_id = ?",
-                ("lrs_release",),
+                (task_id,),
             ).fetchone()
         )
         assert pending is not None

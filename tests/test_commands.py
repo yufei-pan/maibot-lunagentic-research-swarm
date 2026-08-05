@@ -253,7 +253,7 @@ class _FakeServices:
             commands=SimpleNamespace(
                 enabled=True,
                 max_output_chars=12000,
-                maintenance_allowed_person_ids=[],
+                maintenance_allowed_user_ids=[],
                 allow_vector_rebuild=True,
             ),
             agents={},
@@ -269,6 +269,23 @@ class _FakeServices:
             "maisaka_outbox": {"status": "healthy"},
             "feedback": {"status": "healthy", "reminders_enabled": True},
         }
+
+    async def refresh_vector_index_health(self) -> dict[str, Any]:
+        status = await self.vector_index.status()
+        if getattr(status, "last_error_code", None) or getattr(status, "failed_candidate", None) is not None:
+            self._status["vector_index"] = {
+                "status": "degraded",
+                "code": getattr(status, "last_error_code", None) or "vector_rebuild_failed",
+                "active_generation": getattr(status, "active_generation", None),
+            }
+        else:
+            self._status["vector_index"] = {
+                "status": "healthy",
+                "active_generation": getattr(status, "active_generation", None),
+                "idle": getattr(status, "idle", None),
+                "rebuilding": getattr(status, "rebuilding", False),
+            }
+        return dict(self._status["vector_index"])
 
     def health(self) -> dict[str, Any]:
         return {
@@ -443,6 +460,62 @@ async def test_swarm_health_mentions_fetch_and_sqlite(command_harness) -> None:
     text = command_harness.sent_text
     assert "sqlite" in text.lower() or "SQLite" in text
     assert "fetch" in text.lower() or "推荐" in text
+    assert "extension_providers" in text
+
+
+@pytest.mark.asyncio
+async def test_swarm_health_surfaces_invalid_extension_provider(command_harness) -> None:
+    command_harness.services.health = lambda: {
+        **command_harness.services._status,
+        "extension_providers": {
+            "agents": {"provider.bad": {"status": "invalid", "code": "extension_provider_invalid"}},
+            "procedures": {},
+        },
+        "root_agent": {"status": "healthy", "agent_id": "builtin.quick_thinker"},
+        "config_reload": {"status": "healthy"},
+        "recommended_fetch": {"status": "healthy", "detail": "fetch_url.fetch"},
+    }
+    await command_harness.invoke("/swarm health", stream_id="s")
+    text = command_harness.sent_text
+    assert "provider.bad" in text
+    assert "invalid" in text.lower() or "extension_provider_invalid" in text
+
+
+@pytest.mark.asyncio
+async def test_swarm_health_refreshes_stale_vector_snapshot(command_harness) -> None:
+    command_harness.services._status["vector_index"] = {"status": "healthy", "active_generation": 1}
+    command_harness.vector._status.last_error_code = "vector_rebuild_failed"
+    command_harness.vector._status.last_error_message = "boom"
+    await command_harness.invoke("/swarm health", stream_id="s")
+    text = command_harness.sent_text
+    assert "degraded" in text or "vector_rebuild_failed" in text
+    assert command_harness.services._status["vector_index"]["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_vector_rebuild_denies_user_outside_allowlist(command_harness) -> None:
+    command_harness.services._config.commands.maintenance_allowed_user_ids = ["maintainer-1"]
+    command_harness.services._config.commands.allow_vector_rebuild = True
+    result = await command_harness.invoke(
+        "/swarm vectors rebuild --force",
+        stream_id="s",
+        user_id="outsider",
+    )
+    assert result[0] is False
+    assert command_harness.vector.rebuild_calls == []
+    assert "白名单" in command_harness.sent_text
+
+
+@pytest.mark.asyncio
+async def test_vector_rebuild_allows_listed_user_id(command_harness) -> None:
+    command_harness.services._config.commands.maintenance_allowed_user_ids = ["maintainer-1"]
+    result = await command_harness.invoke(
+        "/swarm vectors rebuild --force",
+        stream_id="s",
+        user_id="maintainer-1",
+    )
+    assert result[0] is True
+    assert command_harness.vector.rebuild_calls == [True]
 
 
 @pytest.mark.asyncio

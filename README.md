@@ -58,6 +58,12 @@
 
 用户命令：`/swarm status|tasks|stats|agents|procedures|health|vectors status|vectors rebuild|feedback …`。
 
+维护命令（`/swarm vectors rebuild`）受 `[commands]` 约束：
+
+- `allow_vector_rebuild` 默认 **false**；设为 true 才允许手动重建。
+- `maintenance_allowed_user_ids` 填 Host 命令 RPC 的 **`user_id`**（平台用户 ID），**不是** MaiBot `person_id`。
+- **空列表 = 不限制**（任何聊天成员都可通过白名单检查）。生产环境请填入维护者 user_id，或保持 `allow_vector_rebuild = false`。
+
 ## 协议
 
 - 默认 **JSON envelope**；可按 agent 覆写为 **native tools**。

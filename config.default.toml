@@ -87,8 +87,11 @@ max_lesson_chars = 8000
 [commands]
 enabled = true
 max_output_chars = 12000
-maintenance_allowed_person_ids = []
-allow_vector_rebuild = true
+# 维护白名单：填 Host 命令 RPC 的 user_id（平台用户 ID），不是 MaiBot person_id。
+# 空列表 = 不限制（任何人可执行受白名单约束的维护命令）；建议生产环境填入维护者。
+maintenance_allowed_user_ids = []
+# 默认关闭昂贵向量重建；开启前请确认白名单或接受空白名单=开放。
+allow_vector_rebuild = false
 
 [web_search]
 enabled_engines = ["duckduckgo"]

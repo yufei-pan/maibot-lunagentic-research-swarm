@@ -863,6 +863,52 @@ class LRSServiceContainer:
             return {"status": "degraded", "code": "fetch_provider_invalid", "detail": procedure_id}
         return {"status": "recommended_missing", "code": "fetch_url_missing", "detail": procedure_id}
 
+    @staticmethod
+    def _vector_health_from_status(status: Any) -> dict[str, Any]:
+        """由 live VectorIndex.status() 构造 health 条目，避免永久冻结启动快照。"""
+
+        payload: dict[str, Any] = {
+            "idle": getattr(status, "idle", None),
+            "active_generation": getattr(status, "active_generation", None),
+            "dimension": getattr(status, "dimension", None),
+            "rebuilding": getattr(status, "rebuilding", None),
+        }
+        last_error_code = getattr(status, "last_error_code", None)
+        last_error_message = getattr(status, "last_error_message", None)
+        failed_candidate = getattr(status, "failed_candidate", None)
+        if last_error_code or failed_candidate is not None:
+            payload["status"] = "degraded"
+            payload["code"] = last_error_code or "vector_rebuild_failed"
+            if last_error_message:
+                payload["message"] = last_error_message
+            if failed_candidate is not None:
+                payload["failed_candidate"] = failed_candidate
+        elif getattr(status, "rebuilding", False):
+            payload["status"] = "degraded"
+            payload["code"] = "vector_index_rebuilding"
+        else:
+            payload["status"] = "healthy"
+        return payload
+
+    async def refresh_vector_index_health(self) -> dict[str, Any]:
+        """用 live VectorIndex.status() 刷新 `_status['vector_index']`。"""
+
+        self._ensure_running()
+        if self.vector_index is None:
+            current = dict(self._status.get("vector_index") or {"status": "unavailable", "code": "vector_index_unavailable"})
+            self._status["vector_index"] = current
+            return current
+        try:
+            status = await self.vector_index.status()
+            self._status["vector_index"] = self._vector_health_from_status(status)
+        except Exception as exc:
+            self._status["vector_index"] = {
+                "status": "degraded",
+                "code": getattr(exc, "code", None) or "vector_index_unavailable",
+                "message": getattr(exc, "message", None) or str(exc),
+            }
+        return dict(self._status["vector_index"])
+
     def health(self) -> dict[str, Any]:
         self._ensure_running()
         root_agent, root_selector = self._root_health()

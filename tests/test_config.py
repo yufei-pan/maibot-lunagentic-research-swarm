@@ -22,8 +22,21 @@ def test_config_defaults_match_approved_spec() -> None:
     assert config.protocol.max_correction_turns == 1
     assert not config.storage.store_agent_transcripts
     assert not config.storage.store_raw_procedure_payloads
+    assert config.commands.allow_vector_rebuild is False
+    assert config.commands.maintenance_allowed_user_ids == []
     assert "reasoning" not in LRSConfig.model_json_schema()["properties"]
 
+
+def test_normalize_migrates_legacy_maintenance_person_ids() -> None:
+    defaults = LRSConfig().model_dump(mode="python")
+    raw = {
+        "plugin": {"config_version": CURRENT_CONFIG_VERSION},
+        "commands": {"maintenance_allowed_person_ids": ["u1"]},
+    }
+    normalized, changed, _notes = normalize_config(raw, defaults)
+    assert normalized["commands"]["maintenance_allowed_user_ids"] == ["u1"]
+    assert "maintenance_allowed_person_ids" not in normalized["commands"]
+    assert changed is True
 
 def test_default_config_exposes_sdk_canonical_plugin_version() -> None:
     defaults = LRSConfig().model_dump(mode="python")

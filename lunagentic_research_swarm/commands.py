@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from typing import Any
 
 from maibot_sdk import Command
@@ -195,8 +196,8 @@ def format_task_stats(stats: Mapping[str, Any]) -> str:
         f"max_depth={stats.get('max_branch_depth', 0)}",
         f"compact/checkpoint/continue={stats.get('compact_count', 0)}/"
         f"{stats.get('checkpoint_count', 0)}/{stats.get('continue_count', 0)}",
-        f"procedure ok/err={stats.get('procedures_success', 0)}/{stats.get('procedures_error', 0)} "
-        f"errors={stats.get('error_count', 0)} duration_ms={stats.get('duration_ms_total', 0)}",
+        f"procedure 成功/失败={stats.get('procedures_success', 0)}/{stats.get('procedures_error', 0)} "
+        f"错误={stats.get('error_count', 0)} duration_ms={stats.get('duration_ms_total', 0)}",
     ]
     return "\n".join(lines)
 
@@ -227,7 +228,7 @@ def format_plugin_stats(stats: Mapping[str, Any]) -> str:
             continue
         lines.append(
             f"- procedure {name}: calls={bucket.get('calls', 0)} "
-            f"ok={bucket.get('success', 0)} err={bucket.get('error', 0)}"
+            f"成功={bucket.get('success', 0)} 失败={bucket.get('error', 0)}"
         )
     omitted = max(0, len(models) - 20) + max(0, len(agents) - 20) + max(0, len(procedures) - 20)
     if omitted:
@@ -255,6 +256,31 @@ def format_procedures(rows: Sequence[Mapping[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+_HEALTH_BAD_STATUSES = frozenset({"degraded", "failed", "invalid", "recommended_missing", "unavailable", "critical"})
+
+
+def collect_health_errors(payload: Mapping[str, Any]) -> list[str]:
+    """收集顶层与 extension_providers 嵌套中的不健康项，供 clip 错误脚注。"""
+
+    errors: list[str] = []
+    for key, value in payload.items():
+        if key == "extension_providers" and isinstance(value, Mapping):
+            for kind, kind_map in value.items():
+                if not isinstance(kind_map, Mapping):
+                    continue
+                for provider_id, status in sorted(kind_map.items(), key=lambda item: str(item[0])):
+                    if not isinstance(status, Mapping):
+                        continue
+                    if str(status.get("status") or "") in _HEALTH_BAD_STATUSES:
+                        code = status.get("code") or status.get("status")
+                        errors.append(f"extension_providers.{kind}.{provider_id}: {code}")
+            continue
+        if isinstance(value, Mapping) and str(value.get("status") or "") in _HEALTH_BAD_STATUSES:
+            code = value.get("code") or value.get("status")
+            errors.append(f"{key}: {code}")
+    return errors
+
+
 def format_health(payload: Mapping[str, Any]) -> str:
     lines = ["健康检查"]
     for key in (
@@ -270,6 +296,15 @@ def format_health(payload: Mapping[str, Any]) -> str:
     ):
         if key in payload:
             lines.append(f"- {key}: {_compact_status(payload.get(key))}")
+    providers = payload.get("extension_providers") or {}
+    if isinstance(providers, Mapping) and providers:
+        lines.append("- extension_providers:")
+        for kind in ("agents", "procedures"):
+            kind_map = providers.get(kind) or {}
+            if not isinstance(kind_map, Mapping) or not kind_map:
+                continue
+            for provider_id, status in sorted(kind_map.items(), key=lambda item: str(item[0])):
+                lines.append(f"  - {kind}/{provider_id}: {_compact_status(status)}")
     fetch = payload.get("recommended_fetch") or {}
     lines.append(f"- recommended_fetch: {_compact_status(fetch)}")
     queue = payload.get("queue") or {}
@@ -489,22 +524,37 @@ def _commands_enabled(plugin: Any) -> bool:
 def _allow_vector_rebuild(plugin: Any) -> bool:
     section = _commands_config(plugin)
     if section is None:
-        return True
-    return bool(getattr(section, "allow_vector_rebuild", True))
+        return False
+    return bool(getattr(section, "allow_vector_rebuild", False))
+
+
+def _maintenance_allowlist(plugin: Any) -> list[str]:
+    """维护白名单：优先 `maintenance_allowed_user_ids`（Host user_id），兼容旧字段名。"""
+
+    section = _commands_config(plugin)
+    if section is None:
+        return []
+    raw = getattr(section, "maintenance_allowed_user_ids", None)
+    if raw is None:
+        raw = getattr(section, "maintenance_allowed_person_ids", None)
+    return [str(item).strip() for item in list(raw or []) if str(item).strip()]
 
 
 def _maintenance_allowed(plugin: Any, kwargs: Mapping[str, Any]) -> bool:
-    section = _commands_config(plugin)
-    allowed = list(getattr(section, "maintenance_allowed_person_ids", []) or []) if section is not None else []
+    """空白名单 = 不限制；非空时与 Host 命令 RPC 的 `user_id` 对齐。"""
+
+    allowed = _maintenance_allowlist(plugin)
     if not allowed:
         return True
+    message = kwargs.get("message") if isinstance(kwargs.get("message"), Mapping) else {}
     candidates = [
-        kwargs.get("person_id"),
         kwargs.get("user_id"),
-        ((kwargs.get("message") or {}) if isinstance(kwargs.get("message"), Mapping) else {}).get("user_id"),
+        message.get("user_id") if isinstance(message, Mapping) else None,
+        kwargs.get("person_id"),
     ]
+    allowed_set = set(allowed)
     for value in candidates:
-        if isinstance(value, str) and value.strip() and value.strip() in allowed:
+        if isinstance(value, str) and value.strip() and value.strip() in allowed_set:
             return True
     return False
 
@@ -704,17 +754,16 @@ class SwarmCommandsMixin:
         if services is None or not hasattr(services, "health"):
             return await self._swarm_fail("基础服务尚未初始化", stream_id)
         try:
+            refresh = getattr(services, "refresh_vector_index_health", None)
+            if callable(refresh):
+                await refresh()
             payload = dict(services.health())
         except Exception as exc:
             return await self._swarm_fail(f"读取健康状态失败：{exc}", stream_id)
         payload["recommended_fetch"] = _recommended_fetch_status(services)
         payload["queue"] = _queue_snapshot(services)
         payload["reminder"] = _reminder_snapshot(services)
-        errors: list[str] = []
-        for key, value in payload.items():
-            if isinstance(value, Mapping) and str(value.get("status") or "") in {"degraded", "failed", "invalid", "recommended_missing"}:
-                code = value.get("code") or value.get("status")
-                errors.append(f"{key}: {code}")
+        errors = collect_health_errors(payload)
         text = format_health(payload)
         return await self._swarm_send(text, stream_id, errors=errors)
 
@@ -768,6 +817,10 @@ class SwarmCommandsMixin:
         force = _groups(kwargs).get("force") == "--force"
         try:
             result = await vector.rebuild(force=force)
+            refresh = getattr(services, "refresh_vector_index_health", None) if services is not None else None
+            if callable(refresh):
+                with suppress(Exception):
+                    await refresh()
             text, errors = format_vector_rebuild_result(result)
             ok = bool(getattr(result, "success", False))
             clipped = clip_command_output(text, _max_output_chars(self), error_lines=errors)
@@ -818,6 +871,7 @@ class SwarmCommandsMixin:
 __all__ = [
     "SwarmCommandsMixin",
     "clip_command_output",
+    "collect_health_errors",
     "format_agents",
     "format_health",
     "format_plugin_overview",
