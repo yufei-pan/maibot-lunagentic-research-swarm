@@ -936,8 +936,11 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         except (TypeError, ValueError) as exc:
             return _invalid(state, event, f"AgentCallRequested reservation 无效：{exc}")
         reserved_event_command = _lifecycle_event_command(event, status, status)
+        leaves = _state_leaves(state)
+        if event.branch_id in leaves:
+            leaves[event.branch_id] = credits_after_reservation
         return Transition(
-            state,
+            _replace_state(state, active_leaves=leaves),
             commands=(*reservation.commands, reserved_event_command),
             effects=(
                 _effect(
@@ -968,7 +971,12 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     if isinstance(event, AgentCallReserved):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING}:
             return _invalid(state, event, "AgentCallReserved 只能用于活跃 round")
-        return Transition(state)
+        # reserved_credits is the estimated charge; debit authoritative leaves so
+        # manager._sync_branch_credits cannot restore pre-reservation balances mid-call.
+        leaves = _state_leaves(state)
+        if event.branch_id in leaves:
+            leaves[event.branch_id] = leaves[event.branch_id] - float(event.reserved_credits)
+        return Transition(_replace_state(state, active_leaves=leaves))
 
     if isinstance(event, AgentCallCompleted):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING}:

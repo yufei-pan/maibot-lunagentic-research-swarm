@@ -37,6 +37,7 @@ class TaskController:
         self.feedback = feedback
         self._inbox: deque[RuntimeEvent] = deque()
         self._lock = asyncio.Lock()
+        self._apply_depth = 0
         self.stopped = False
 
     async def submit(self, event: RuntimeEvent) -> bool:
@@ -74,8 +75,22 @@ class TaskController:
         effects: Sequence[Any] | None = None,
         state_changes: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Atomically apply an event with manager-supplied durable details."""
+        """Atomically apply an event with manager-supplied durable details.
 
+        Re-entrant when already inside ``_apply`` on this task (e.g. prepare
+        hooked from ``scheduler.enqueue`` during formalization) so nested
+        reservation commits cannot deadlock the non-reentrant lock.
+        """
+
+        if self._apply_depth > 0:
+            if self.stopped:
+                return False
+            return await self._apply(
+                event,
+                extra_commands=extra_commands,
+                effects=effects,
+                state_changes=state_changes,
+            )
         async with self._lock:
             if self.stopped:
                 return False
@@ -96,6 +111,25 @@ class TaskController:
         return True
 
     async def _apply(
+        self,
+        event: RuntimeEvent,
+        *,
+        extra_commands: Sequence[StoreCommand] = (),
+        effects: Sequence[Any] | None = None,
+        state_changes: Mapping[str, Any] | None = None,
+    ) -> bool:
+        self._apply_depth += 1
+        try:
+            return await self._apply_body(
+                event,
+                extra_commands=extra_commands,
+                effects=effects,
+                state_changes=state_changes,
+            )
+        finally:
+            self._apply_depth -= 1
+
+    async def _apply_body(
         self,
         event: RuntimeEvent,
         *,

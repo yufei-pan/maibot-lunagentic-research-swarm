@@ -36,6 +36,7 @@ from lunagentic_research_swarm.runtime.controller import TaskController
 from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage, reserve_input
 from lunagentic_research_swarm.runtime.epochs import ReportCoordinator, ReportRecord
 from lunagentic_research_swarm.runtime.events import (
+    AgentCallReserved,
     AllInflightSettled,
     BranchFinalized,
     ChildMaterialized,
@@ -696,7 +697,11 @@ class ResearchManager:
         messages = tuple(dict(item) for item in branch.get("messages", ()))
         protocol = str(getattr(definition, "protocol", "json_envelope"))
         call_id = str(effect.payload.get("call_id") or new_call_id())
-        balance_before = float(branch.get("credits", 0.0))
+        # Authoritative balance lives on active_leaves; branch cache is status-only.
+        if branch_id in controller.state.active_leaves:
+            balance_before = float(controller.state.active_leaves[branch_id])
+        else:
+            balance_before = float(branch.get("credits", 0.0))
         estimated_charge, prompt_tokens, cache_hit, cache_miss, resolved = self._estimate_agent_reservation(
             snapshot=snapshot,
             selector=selector,
@@ -726,8 +731,24 @@ class ResearchManager:
             metadata={"event_type": "AgentCallReserved", "agent_id": agent_id},
             created_at=_now(),
         )
-        await self.store.transact(reservation.commands)
-        branch["credits"] = credits_after_reservation
+        # Reserve via controller transition so active_leaves and ledger stay aligned;
+        # side-channel store.transact alone left sync able to wipe mid-LLM debits.
+        accepted = await controller.apply(
+            AgentCallReserved(
+                _event_id(),
+                effect.task_id,
+                str(effect.round_id or ""),
+                effect.generation,
+                branch_id=branch_id,
+                call_id=call_id,
+                ledger_id=ledger_id,
+                reserved_credits=estimated_charge,
+            ),
+            extra_commands=reservation.commands,
+        )
+        if not accepted:
+            raise RuntimeError("agent credit reservation 未能提交")
+        branch["credits"] = float(controller.state.active_leaves.get(branch_id, credits_after_reservation))
         payload = dict(effect.payload)
         payload.update(
             {

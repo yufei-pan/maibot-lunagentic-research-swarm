@@ -63,6 +63,34 @@ async def test_prepare_agent_effect_reserves_research_credits_via_store(harness)
 
 
 @pytest.mark.asyncio
+async def test_prepare_reservation_survives_sync_branch_credits(harness) -> None:
+    """NEW-I1: mid-flight reservation must stay authoritative across leaf sync."""
+
+    manager, _, _, scheduler, *_ = harness
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+    task_id = result["task_id"]
+    agent_effect = next(effect for effect in reversed(scheduler.enqueued) if isinstance(effect, PerformAgentCall))
+    branch_id = str(agent_effect.payload.get("branch_id", ""))
+    controller = manager._controllers[task_id]
+    pre_reservation = float(controller.state.active_leaves[branch_id])
+
+    prepared = await manager.prepare_agent_effect(agent_effect)
+    reserved = float(prepared.payload["credits_after_reservation"])
+    assert reserved < pre_reservation
+    assert controller.state.active_leaves[branch_id] == pytest.approx(reserved)
+    assert manager._branches[task_id][branch_id]["credits"] == pytest.approx(reserved)
+
+    # Sibling/same-task handle_runtime_event always mirrors leaves → cache.
+    # Without updating active_leaves at reserve time this restores pre-reservation.
+    manager._sync_branch_credits(task_id, controller)
+
+    assert controller.state.active_leaves[branch_id] == pytest.approx(reserved)
+    assert manager._branches[task_id][branch_id]["credits"] == pytest.approx(reserved)
+    assert manager._branches[task_id][branch_id]["credits"] != pytest.approx(pre_reservation)
+
+
+@pytest.mark.asyncio
 async def test_runner_handles_deadline_pause_outbox_release_and_error_notify() -> None:
     class _Manager:
         def __init__(self) -> None:
