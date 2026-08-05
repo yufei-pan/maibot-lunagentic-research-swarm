@@ -226,6 +226,7 @@ class LRSServiceContainer:
             self._builtin_provider_loader(self.agent_registry, self.procedure_registry)
             self._discovery = self._new_discovery(self._refresh_interval_seconds)
             await self._refresh_external_extensions()
+            self._ensure_configured_root_available()
             self._record_physical_pinning_health()
             self._warn_for_low_root_budget()
             await self._start_runtime()
@@ -429,6 +430,11 @@ class LRSServiceContainer:
             if status.available
             else {"status": "degraded", "code": status.error_code or "physical_pinning_unsupported"}
         )
+
+    def _ensure_configured_root_available(self) -> None:
+        """在暴露 running runtime 前确认配置的 root 能形成有效 catalog snapshot。"""
+
+        self.agent_registry.snapshot(self._next_round_state.detached_agent_overrides())
 
     def _root_selector(self) -> str | None:
         state = self._next_round_state

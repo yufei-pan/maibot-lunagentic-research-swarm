@@ -13,6 +13,7 @@ import pytest
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, ON_MODEL_CONFIG_RELOAD
 from maibot_sdk.context import PluginContext, PluginPaths
 
+from lunagentic_research_swarm.agents.registry import RootAgentUnavailableError
 from lunagentic_research_swarm.config import LRSConfig
 from lunagentic_research_swarm.extensions.contracts import AgentDefinition, ProcedureDefinition
 from lunagentic_research_swarm.llm.physical_pinning import PhysicalPinningStatus
@@ -246,6 +247,8 @@ async def test_start_uses_strict_foundation_order_and_close_is_idempotent(plugin
         assert not agents.provider_ids
         assert not procedures.provider_ids
         events.append("builtin")
+        # start 要求配置 root 可形成有效 snapshot；此处装入最小可用 root。
+        agents.replace_provider("builtin", [agent_payload("builtin.quick_thinker")])
 
     context = make_context(tmp_path)
     store = FakeStore(events)
@@ -296,6 +299,29 @@ async def test_started_service_exposes_production_research_manager(plugin_module
     assert container.manager.scheduler is container.scheduler
     await container.close()
     assert container.manager is None
+
+
+@pytest.mark.asyncio
+async def test_start_fails_when_bundled_root_disabled_without_replacement(
+    plugin_module,
+    tmp_path: Path,
+) -> None:
+    """禁用默认 root 且未配置有效替代时，start 必须明确失败，不能进入 running。"""
+
+    config = config_with(agents={"builtin.quick_thinker": {"enabled": False}})
+    container, _, store, factory, events = build_container(plugin_module, tmp_path, config=config)
+
+    with pytest.raises(RootAgentUnavailableError, match="根智能体"):
+        await container.start()
+
+    assert container._state == "failed"
+    assert container.manager is None
+    assert container.scheduler is None
+    assert store.close_count == 1
+    assert "extensions.start" not in events
+    assert factory.instances[0].closed
+    with pytest.raises(RuntimeError, match="尚未初始化"):
+        container.health()
 
 
 @pytest.mark.asyncio

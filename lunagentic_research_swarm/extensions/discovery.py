@@ -198,9 +198,14 @@ class ExtensionDiscovery:
                 events.append(await self._refresh_procedures(provider_id, descriptor, refreshed_at))
 
             for provider_id in self._agents.provider_ids - visible_agents:
+                if provider_id == "builtin":
+                    # 本地装入的 builtin provider 不经由 Host API 发现，不能被扫描误删。
+                    continue
                 self._agents.remove_provider(provider_id)
                 events.append(self._record_health("agents", provider_id, refreshed_at))
             for provider_id in self._procedures.provider_ids - visible_procedures:
+                if provider_id == "builtin":
+                    continue
                 self._procedures.remove_provider(provider_id)
                 events.append(self._record_health("procedures", provider_id, refreshed_at))
             return ExtensionRefreshDelta(tuple(events))
