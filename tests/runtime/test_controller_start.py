@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -196,8 +197,14 @@ class FakeCatalog:
                 description=f"{agent_id} capability",
                 enabled=True,
                 can_be_root=agent_id == "root",
+                allowed_procedures=["*"],
             )
         )
+
+    def resolve_allowed_procedures(self, agent_id: str, procedures: Any) -> tuple[str, ...]:
+        del agent_id
+        ids = getattr(procedures, "ids", ()) or ()
+        return tuple(ids) if ids else ("*")
 
     @property
     def entries(self):
