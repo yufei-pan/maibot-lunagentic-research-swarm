@@ -107,7 +107,13 @@ class BundledProcedureProvider:
         )
         return [item.model_dump(mode="json") for item in definitions]
 
-    async def invoke(self, procedure_id: str, arguments: Mapping[str, Any] | None = None) -> ProcedureResult:
+    async def invoke(
+        self,
+        procedure_id: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        scoped_metadata: Mapping[str, Any] | None = None,
+    ) -> ProcedureResult:
         """按 procedure_id 分发到 handler map；未知 ID 返回 invalid_arguments。"""
 
         handler = self._handlers.get(procedure_id)
@@ -118,7 +124,16 @@ class BundledProcedureProvider:
                 error={"code": "invalid_arguments", "message": f"未知 Procedure：{procedure_id}"},
                 metadata={},
             )
-        return await handler(self.ctx, dict(arguments or {}))
+        args = dict(arguments or {})
+        # past_cases：未显式传 exclude_task_id 时，默认排除调用侧 scoped task_id。
+        if procedure_id == PAST_CASES_PROCEDURE_ID:
+            existing = args.get("exclude_task_id")
+            if not (isinstance(existing, str) and existing.strip()):
+                meta = scoped_metadata if isinstance(scoped_metadata, Mapping) else {}
+                task_id = meta.get("task_id")
+                if isinstance(task_id, str) and task_id.strip():
+                    args["exclude_task_id"] = task_id.strip()
+        return await handler(self.ctx, args)
 
     async def aclose(self) -> None:
         """关闭 provider 自建的 HTTP client（若有）。"""

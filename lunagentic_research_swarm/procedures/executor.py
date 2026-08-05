@@ -534,9 +534,13 @@ class ProcedureExecutor:
         context: Any | None = None,
         **kwargs: Any,
     ) -> ProcedureExecutionResult:
-        request_id = str(kwargs.pop("request_id", "")) or "core_" + _fingerprint(
-            {"procedure_id": procedure_id, "arguments": dict(arguments or {}), "context": _jsonable(context)}
-        )[:56]
+        request_id = (
+            str(kwargs.pop("request_id", ""))
+            or "core_"
+            + _fingerprint(
+                {"procedure_id": procedure_id, "arguments": dict(arguments or {}), "context": _jsonable(context)}
+            )[:56]
+        )
         started = time.perf_counter()
         result = await execute_core_procedure(
             procedure_id,
@@ -562,14 +566,18 @@ class ProcedureExecutor:
             await asyncio.gather(*(self._invoke_one(request, context, index) for index, request in enumerate(ordinary)))
         )
         result_id = "proc_result_" + _fingerprint([item.as_dict() for item in results])[:56]
-        event_id = context["event_id"] or "evt_proc_" + _fingerprint(
-            {
-                "task_id": context["task_id"],
-                "round_id": context["round_id"],
-                "call_id": context["call_id"],
-                "result_id": result_id,
-            }
-        )[:56]
+        event_id = (
+            context["event_id"]
+            or "evt_proc_"
+            + _fingerprint(
+                {
+                    "task_id": context["task_id"],
+                    "round_id": context["round_id"],
+                    "call_id": context["call_id"],
+                    "result_id": result_id,
+                }
+            )[:56]
+        )
         return ProcedureBatchCompleted(
             event_id=event_id,
             task_id=context["task_id"],
@@ -595,8 +603,12 @@ def bundled_procedure_invoker(provider: Any) -> LocalProcedureInvoker:
         scoped_metadata: Mapping[str, Any] | None = None,
         **_kwargs: Any,
     ) -> Any:
-        del version, request_id, scoped_metadata, _kwargs
-        result = await provider.invoke(procedure_id, arguments or {})
+        del version, request_id, _kwargs
+        result = await provider.invoke(
+            procedure_id,
+            arguments or {},
+            scoped_metadata=scoped_metadata,
+        )
         if isinstance(result, BaseModel):
             return result.model_dump(mode="json")
         return result

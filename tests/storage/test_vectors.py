@@ -450,6 +450,21 @@ async def test_empty_index_is_idle_until_first_source(vector_harness) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_on_empty_uninitialized_returns_empty_hits_not_rebuilding(vector_harness) -> None:
+    """从未建库 ≠ 重建中：search 应 success + hits=[]，code=empty。"""
+
+    status = await vector_harness.status()
+    assert status.uninitialized
+    assert not status.rebuilding
+    search = await vector_harness.search("任意查询")
+    assert search.success
+    assert search.code == "empty"
+    assert search.data is not None
+    assert search.data["hits"] == []
+    assert search.error is None
+
+
+@pytest.mark.asyncio
 async def test_empty_force_rebuild_does_not_create_failed_candidate(vector_harness) -> None:
     result = await vector_harness.rebuild(force=True)
     assert result.success

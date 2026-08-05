@@ -343,3 +343,91 @@ async def test_past_cases_provider_registers_definition() -> None:
     provider = BundledProcedureProvider(object())
     ids = {item["procedure_id"] for item in provider.describe()}
     assert "builtin.past_cases" in ids
+
+
+@pytest.mark.asyncio
+async def test_past_cases_empty_real_vector_index_is_success(tmp_path: Path) -> None:
+    """真实 VectorIndex 空语料：past_cases 须 success + cases=[]，非 vector_index_rebuilding。"""
+
+    from lunagentic_research_swarm.config import EmbeddingSection
+    from lunagentic_research_swarm.storage.vectors import VectorIndex
+
+    store = SQLiteStateStore(tmp_path / "state.sqlite3")
+    await store.open()
+
+    class _Embedder:
+        async def embed(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("空索引 search 不应触发 embed")
+
+    index = VectorIndex(
+        store,
+        _Embedder(),
+        EmbeddingSection(selector="task:embedding"),
+        tmp_path / "vectors" / "lancedb",
+    )
+    await index.start()
+    try:
+        ready = await index.ensure_ready()
+        assert ready.success
+        assert ready.code == "empty"
+        provider = BundledProcedureProvider(object(), store=store, vector_index=index)
+        result = await provider.invoke("builtin.past_cases", {"query": "anything"})
+        assert result.success
+        assert result.data is not None
+        assert result.data["cases"] == []
+        assert result.error is None
+    finally:
+        await index.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_past_cases_excludes_scoped_task_id_via_invoker(
+    past_case_harness: PastCaseHarness,
+) -> None:
+    """bundled_procedure_invoker 须转发 scoped_metadata.task_id 并默认排除当前任务。"""
+
+    from lunagentic_research_swarm.procedures.executor import bundled_procedure_invoker
+
+    current = await past_case_harness.seed_async("accepted", score=0.9)
+    other = await past_case_harness.seed_async(None, score=0.8)
+    invoke = bundled_procedure_invoker(past_case_harness.provider)
+    payload = await invoke(
+        procedure_id="builtin.past_cases",
+        arguments={"query": "formalized task", "limit": 10},
+        scoped_metadata={"task_id": current, "round_id": "r1"},
+    )
+    assert payload["success"] is True
+    case_ids = [item["task_id"] for item in payload["data"]["cases"]]
+    assert current not in case_ids
+    assert other in case_ids
+
+
+@pytest.mark.asyncio
+async def test_past_cases_accepted_contradicted_outcome_not_success_pattern(
+    past_case_harness: PastCaseHarness,
+) -> None:
+    """accepted + 证伪 outcome：outcome_correction，不得靠 +0.10 压过 rejected anti_pattern。"""
+
+    contradicted = await past_case_harness.seed_async(
+        "accepted",
+        score=0.5,
+        outcome="上线后被证明结论错误",
+        corrections=["结论应反过来"],
+    )
+    rejected = await past_case_harness.seed_async("rejected", score=0.9)
+    result = await past_case_harness.search("formalized task")
+    assert result.success
+    by_id = {item["task_id"]: item for item in result.data["cases"]}
+    bad = by_id[contradicted]
+    anti = by_id[rejected]
+    assert bad["validation_status"] == "outcome_correction"
+    assert bad["use_as"] == "outcome_correction"
+    assert bad["outcome_confirmed"] is False
+    assert bad["rerank_components"]["accepted_bonus"] == pytest.approx(0.0)
+    assert bad["rerank_components"]["outcome_confirmed_bonus"] == pytest.approx(0.0)
+    assert anti["validation_status"] == "rejected"
+    assert anti["use_as"] == "anti_pattern"
+    assert anti["rerank_score"] > bad["rerank_score"]
+    statuses = [item["validation_status"] for item in result.data["cases"]]
+    assert statuses.index("rejected") < statuses.index("outcome_correction")

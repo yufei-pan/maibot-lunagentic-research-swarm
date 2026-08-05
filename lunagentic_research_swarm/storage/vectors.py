@@ -394,13 +394,10 @@ class VectorIndex:
     async def search(self, query: str, *, limit: int = 10) -> VectorOpResult:
         status = await self.status()
         if status.rebuilding:
-            return VectorOpResult.fail(
-                LRSError(VECTOR_INDEX_REBUILDING, "向量索引正在重建，历史案例暂不可用")
-            )
+            return VectorOpResult.fail(LRSError(VECTOR_INDEX_REBUILDING, "向量索引正在重建，历史案例暂不可用"))
+        # 从未建库 / 空语料：可检索为空结果，不得伪装成「重建中」（否则 day-one 永久失败）。
         if status.active_generation is None or status.dimension is None or status.table_name is None:
-            return VectorOpResult.fail(
-                LRSError(VECTOR_INDEX_REBUILDING, "向量索引尚未初始化")
-            )
+            return VectorOpResult.ok(code="empty", data={"hits": []})
 
         try:
             selector = self._require_task_selector()
@@ -413,9 +410,7 @@ class VectorIndex:
             return VectorOpResult.fail(exc)
 
         query_vector = vectors[0]
-        fingerprint = compute_model_fingerprint(
-            selector.raw, actual_model, len(query_vector), self._schema_version
-        )
+        fingerprint = compute_model_fingerprint(selector.raw, actual_model, len(query_vector), self._schema_version)
         mismatch = self._detect_mismatch(
             status,
             selector_raw=selector.raw,
@@ -450,9 +445,7 @@ class VectorIndex:
         try:
             hits = await asyncio.to_thread(_search)
         except Exception as exc:
-            return VectorOpResult.fail(
-                VectorIndexUnavailable(f"LanceDB 检索失败：{exc}", {"table_name": table_name})
-            )
+            return VectorOpResult.fail(VectorIndexUnavailable(f"LanceDB 检索失败：{exc}", {"table_name": table_name}))
         return VectorOpResult.ok(data={"hits": hits})
 
     async def ensure_ready(self) -> VectorOpResult:
@@ -652,9 +645,7 @@ class VectorIndex:
             return VectorOpResult.fail(exc), None
 
         vector = vectors[0]
-        fingerprint = compute_model_fingerprint(
-            selector.raw, actual_model, len(vector), self._schema_version
-        )
+        fingerprint = compute_model_fingerprint(selector.raw, actual_model, len(vector), self._schema_version)
         mismatch = self._detect_mismatch(
             status,
             selector_raw=selector.raw,
@@ -710,9 +701,7 @@ class VectorIndex:
                 probe_vectors, probe_model = await self._embed_texts([sources[0].text], selector=selector)
             except EmbeddingGenerationMismatch as exc:
                 return VectorOpResult.fail(exc)
-            probe_fp = compute_model_fingerprint(
-                selector.raw, probe_model, len(probe_vectors[0]), self._schema_version
-            )
+            probe_fp = compute_model_fingerprint(selector.raw, probe_model, len(probe_vectors[0]), self._schema_version)
             if (
                 status.selector == selector.raw
                 and status.model_fingerprint == probe_fp
@@ -735,12 +724,8 @@ class VectorIndex:
 
     async def _fail_stranded_building(self) -> None:
         def _fail(connection: Any) -> list[str]:
-            rows = connection.execute(
-                "SELECT table_name FROM vector_generations WHERE status = 'building'"
-            ).fetchall()
-            connection.execute(
-                "UPDATE vector_generations SET status = 'failed' WHERE status = 'building'"
-            )
+            rows = connection.execute("SELECT table_name FROM vector_generations WHERE status = 'building'").fetchall()
+            connection.execute("UPDATE vector_generations SET status = 'failed' WHERE status = 'building'")
             return [str(row["table_name"]) for row in rows]
 
         table_names = await self._store.run_locked(_fail)
@@ -774,9 +759,7 @@ class VectorIndex:
 
         def _prepare(connection: Any) -> tuple[int, str]:
             generation = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(generation), 0) + 1 FROM vector_generations"
-                ).fetchone()[0]
+                connection.execute("SELECT COALESCE(MAX(generation), 0) + 1 FROM vector_generations").fetchone()[0]
             )
             table_name = _table_name_for(generation)
             _insert_generation(
@@ -813,9 +796,7 @@ class VectorIndex:
                 if actual_model is None:
                     actual_model = batch_model
                     dimension = len(vectors[0])
-                    fingerprint = compute_model_fingerprint(
-                        selector.raw, actual_model, dimension, self._schema_version
-                    )
+                    fingerprint = compute_model_fingerprint(selector.raw, actual_model, dimension, self._schema_version)
                 elif batch_model != actual_model:
                     raise EmbeddingGenerationMismatch(
                         "重建过程中 actual model 发生变化",
@@ -1039,12 +1020,7 @@ class VectorIndex:
                     {"table_dimension": dimension, "vector_dimension": len(vector)},
                 )
             # merge_insert 原子 upsert，避免 delete-then-add 在 add 失败时丢行
-            (
-                table.merge_insert("id")
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute([row])
-            )
+            (table.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute([row]))
 
         try:
             await asyncio.to_thread(_upsert)
@@ -1098,9 +1074,7 @@ class VectorIndex:
         return await self._store.run_locked(_load_indexable_sources)
 
     async def _resolve_source(self, source_kind: str, source_id: str) -> IndexableSource | None:
-        return await self._store.run_locked(
-            lambda connection: _load_single_source(connection, source_kind, source_id)
-        )
+        return await self._store.run_locked(lambda connection: _load_single_source(connection, source_kind, source_id))
 
     async def _insert_job(
         self,

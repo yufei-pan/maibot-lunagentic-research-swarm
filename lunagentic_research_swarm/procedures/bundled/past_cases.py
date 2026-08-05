@@ -6,19 +6,19 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
 from lunagentic_research_swarm.errors import (
+    EMBEDDING_GENERATION_MISMATCH,
     VECTOR_INDEX_REBUILDING,
     VECTOR_INDEX_UNAVAILABLE,
     VECTOR_REBUILD_FAILED,
 )
 from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition, ProcedureResult
+from lunagentic_research_swarm.storage.vectors import PHYSICAL_EMBEDDING_SELECTOR_UNSUPPORTED
 
 Handler = Callable[[Any, Mapping[str, Any]], Awaitable[ProcedureResult]]
 
 PAST_CASES_PROCEDURE_ID = "builtin.past_cases"
 
-RERANK_FORMULA = (
-    "similarity + accepted*0.15 + mixed*0.05 + outcome_confirmed*0.10 - rejected*0.20"
-)
+RERANK_FORMULA = "similarity + accepted*0.15 + mixed*0.05 + outcome_confirmed*0.10 - rejected*0.20"
 
 _ACCEPTED_BONUS = 0.15
 _MIXED_BONUS = 0.05
@@ -38,8 +38,27 @@ _VECTOR_FAIL_CODES = frozenset(
         VECTOR_INDEX_REBUILDING,
         VECTOR_INDEX_UNAVAILABLE,
         VECTOR_REBUILD_FAILED,
-        "embedding_generation_mismatch",
+        EMBEDDING_GENERATION_MISMATCH,
+        PHYSICAL_EMBEDDING_SELECTOR_UNSUPPORTED,
     }
+)
+
+# Interim heuristic until Task 7 feedback schema：outcome 文本含纠正/证伪措辞时，
+# 不得把 accepted/mixed 升为 success_pattern，也不得给 +0.10 confirmation bonus。
+_OUTCOME_CORRECTION_MARKERS = (
+    "错误",
+    "有误",
+    "纠正",
+    "更正",
+    "不对",
+    "反了",
+    "相反",
+    "incorrect",
+    "wrong",
+    "error",
+    "correct",
+    "contradict",
+    "mistake",
 )
 
 
@@ -53,6 +72,7 @@ def past_cases_procedure_definitions() -> list[ProcedureDefinition]:
         "description": (
             "按正式任务描述检索相似历史案例；显式区分 accepted/mixed/rejected/unreviewed"
             "与 outcome correction，透明返回 rerank 分量；不把无反馈案例视为已验证成功。"
+            "调用时会自动排除当前 scoped task_id（可用 exclude_task_id 覆盖）。"
         ),
         "arguments_schema": {
             "type": "object",
@@ -77,7 +97,6 @@ def past_cases_procedure_definitions() -> list[ProcedureDefinition]:
         "idempotent": True,
         "timeout_seconds": 60.0,
         "external_cost_kind": "none",
-        "enabled": True,
     }
     return [ProcedureDefinition.model_validate(payload)]
 
@@ -144,30 +163,51 @@ def _latest_feedback(feedback_rows: Sequence[Mapping[str, Any]]) -> Mapping[str,
     return None
 
 
+def _payload_of(feedback: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if feedback is None:
+        return {}
+    payload = feedback.get("payload")
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _has_correction_signal(payload: Mapping[str, Any]) -> bool:
+    """Interim：corrections 非空，或 outcome 文本含纠正/证伪措辞。"""
+
+    corrections = payload.get("corrections")
+    if isinstance(corrections, list) and any(str(item).strip() for item in corrections):
+        return True
+    outcome = payload.get("outcome")
+    if isinstance(outcome, str):
+        text = outcome.strip().lower()
+        if text and any(marker.lower() in text for marker in _OUTCOME_CORRECTION_MARKERS):
+            return True
+    return False
+
+
 def _validation_status(feedback: Mapping[str, Any] | None) -> str:
     if feedback is None:
         return "unreviewed"
     disposition = _normalize_disposition(feedback.get("disposition"))
+    payload = _payload_of(feedback)
+    # accepted/mixed 若被 outcome/corrections 证伪，降为 outcome_correction（非 success_pattern）。
+    if disposition in {"accepted", "mixed"} and _has_correction_signal(payload):
+        return "outcome_correction"
     if disposition in {"accepted", "mixed", "rejected"}:
         return disposition
-    payload = feedback.get("payload") if isinstance(feedback.get("payload"), Mapping) else {}
-    corrections = payload.get("corrections") if isinstance(payload, Mapping) else None
-    outcome = payload.get("outcome") if isinstance(payload, Mapping) else None
-    if (isinstance(corrections, list) and corrections) or outcome:
+    if _has_correction_signal(payload) or payload.get("outcome"):
         return "outcome_correction"
     return "unreviewed"
 
 
 def _outcome_confirmed(feedback: Mapping[str, Any] | None) -> bool:
+    """仅显式 ``outcome_confirmed=True`` 计确认；不得从任意 truthy outcome 文本推断。"""
+
     if feedback is None:
         return False
-    payload = feedback.get("payload") if isinstance(feedback.get("payload"), Mapping) else {}
-    if not isinstance(payload, Mapping):
+    if _validation_status(feedback) == "outcome_correction":
         return False
-    if payload.get("outcome_confirmed") is True:
-        return True
-    # 明确 outcome 且 accepted 视为 outcome_confirmed
-    return bool(payload.get("outcome")) and _normalize_disposition(feedback.get("disposition")) == "accepted"
+    payload = _payload_of(feedback)
+    return payload.get("outcome_confirmed") is True
 
 
 def _rerank_components(similarity: float, status: str, *, outcome_confirmed: bool) -> dict[str, float]:
@@ -268,16 +308,11 @@ async def _past_cases(ctx: Any, arguments: Mapping[str, Any]) -> ProcedureResult
                 "task_id": task_id,
                 "similarity": similarity,
                 "source_ids": [source_id] if source_id else [],
-                "hit_texts": [str(hit.get("text") or "")],
             }
         else:
-            if similarity > bucket["similarity"]:
-                bucket["similarity"] = similarity
+            bucket["similarity"] = max(bucket["similarity"], similarity)
             if source_id and source_id not in bucket["source_ids"]:
                 bucket["source_ids"].append(source_id)
-            text = str(hit.get("text") or "")
-            if text and text not in bucket["hit_texts"]:
-                bucket["hit_texts"].append(text)
 
     cases: list[dict[str, Any]] = []
     for task_id, bucket in by_task.items():
@@ -302,9 +337,9 @@ async def _past_cases(ctx: Any, arguments: Mapping[str, Any]) -> ProcedureResult
         if layer.formalized_task is not None:
             formalized = str(layer.formalized_task.text)
 
-        payload = feedback.get("payload") if feedback and isinstance(feedback.get("payload"), Mapping) else {}
-        corrections = list(payload.get("corrections") or []) if isinstance(payload, Mapping) else []
-        outcome = payload.get("outcome") if isinstance(payload, Mapping) else None
+        payload = _payload_of(feedback)
+        corrections = list(payload.get("corrections") or []) if isinstance(payload.get("corrections"), list) else []
+        outcome = payload.get("outcome")
 
         fingerprints: dict[str, Any] = {}
         # 报告 stats / 生命周期里若有指纹则透传
@@ -340,9 +375,7 @@ async def _past_cases(ctx: Any, arguments: Mapping[str, Any]) -> ProcedureResult
                     }
                     for row in layer.reports
                 ],
-                "feedback_disposition": (
-                    _normalize_disposition(feedback.get("disposition")) if feedback else None
-                ),
+                "feedback_disposition": (_normalize_disposition(feedback.get("disposition")) if feedback else None),
                 "corrections": corrections,
                 "outcome": outcome,
                 "outcome_confirmed": confirmed,
