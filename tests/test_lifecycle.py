@@ -286,6 +286,19 @@ async def test_start_uses_strict_foundation_order_and_close_is_idempotent(plugin
 
 
 @pytest.mark.asyncio
+async def test_started_service_exposes_production_research_manager(plugin_module, tmp_path: Path) -> None:
+    container, _, _, _, _ = build_container(plugin_module, tmp_path)
+
+    assert getattr(container, "manager", None) is None
+    await container.start()
+
+    assert container.manager is not None
+    assert container.manager.scheduler is container.scheduler
+    await container.close()
+    assert container.manager is None
+
+
+@pytest.mark.asyncio
 async def test_sqlite_failure_propagates_through_plugin_load(plugin_module, tmp_path: Path, monkeypatch) -> None:
     events: list[str] = []
     store = FakeStore(events, open_error=RuntimeError("字面 SQLite 打开失败"))

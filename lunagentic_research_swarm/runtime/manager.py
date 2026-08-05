@@ -8,13 +8,14 @@ summary-layer data only.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import time
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
+from lunagentic_research_swarm.llm.gateway import resolve_generation_selector
 from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
 from lunagentic_research_swarm.models import (
     BranchLifecycle,
@@ -23,28 +24,34 @@ from lunagentic_research_swarm.models import (
     ReportKind,
     TaskStatus,
     new_branch_id,
+    new_call_id,
     new_round_id,
     new_task_id,
 )
+from lunagentic_research_swarm.runtime.context import RuntimeHeader, StablePromptBuilder, release_raw_context
 from lunagentic_research_swarm.runtime.controller import TaskController
 from lunagentic_research_swarm.runtime.epochs import ReportCoordinator, ReportRecord
 from lunagentic_research_swarm.runtime.events import (
     AllInflightSettled,
+    BranchFinalized,
+    ChildMaterialized,
     ContinueRequested,
+    FinalReportCompleted,
+    FinalReportFailed,
     FormalizationFailed,
     FormalizationSucceeded,
     GraceExpired,
     PauseExpired,
     PauseRequested,
-    FinalReportCompleted,
-    FinalReportFailed,
     ReportCompleted,
     ReportDeadlineReached,
     StopRequested,
 )
 from lunagentic_research_swarm.runtime.reducer import (
+    NotifyToolWaiter,
     OpenReportEpoch,
     PerformAgentCall,
+    PerformBranchSummary,
     PerformFormalization,
     RuntimeState,
 )
@@ -79,6 +86,8 @@ class ResearchManager:
         grace_period_seconds: int = 60,
         report_coordinators: dict[str, Any] | None = None,
         report_coordinator_factory: Any | None = None,
+        agent_live_provider: Any | None = None,
+        runtime_limits: dict[str, Any] | None = None,
     ) -> None:
         self.ctx, self.store, self.summarizer, self.scheduler = ctx, store, summarizer, scheduler
         self._snapshot_provider = snapshot_provider
@@ -97,6 +106,12 @@ class ResearchManager:
         # the sole authority for durable RuntimeState transitions.
         self.report_coordinators: dict[str, Any] = report_coordinators if report_coordinators is not None else {}
         self._report_coordinator_factory = report_coordinator_factory or ReportCoordinator
+        self._agent_live_provider = agent_live_provider
+        self._runtime_limits = dict(runtime_limits or {})
+        self._round_snapshots: dict[str, Any] = {}
+        self._prompt_builders: dict[str, StablePromptBuilder] = {}
+        self._bot_profiles: dict[str, dict[str, Any]] = {}
+        self._shutting_down = False
 
     async def start(
         self,
@@ -107,6 +122,8 @@ class ResearchManager:
         effort_level: float = 1.0,
         planner_context: str | None = None,
     ) -> dict[str, Any]:
+        if self._shutting_down:
+            raise RuntimeError("研究运行时正在关闭")
         if not isinstance(objective, str) or not objective.strip():
             raise ValueError("objective 不能为空")
         if isinstance(time_budget_seconds, bool) or not isinstance(time_budget_seconds, int) or time_budget_seconds <= 0:
@@ -144,6 +161,7 @@ class ResearchManager:
         self._task_streams[task_id] = stream_id
         self._task_created_at[task_id] = created_at
         self._branches[task_id] = {}
+        self._round_snapshots[task_id] = snapshot
         await self.scheduler.enqueue(PerformFormalization(task_id, round_id, 0, payload={"stream_id": stream_id}))
         self._track(task_id, self._formalize(task_id, objective, stream_id, planner_context, credits, snapshot, time_budget_seconds))
         return {"task_id": task_id, "status": TaskStatus.FORMALIZING.value, "initial_credits": credits}
@@ -152,6 +170,7 @@ class ResearchManager:
         """Collect public context and immediately drop the raw bundle after use."""
         controller = self._controllers[task_id]
         raw_context = ""
+        prepared_branch_id: str | None = None
         try:
             recent = await self.ctx.message.get_recent(stream_id, self._recent_message_limit)
             readable = await self.ctx.message.build_readable(recent)
@@ -164,6 +183,54 @@ class ResearchManager:
                 raise RuntimeError(getattr(getattr(result, "error", None), "message", "formalization_failed"))
             formalized = FormalizedTask.create(result.text)
             branch_id, now = new_branch_id(), _now()
+            root_entry = snapshot.agent_catalog.get(snapshot.root_agent)
+            if root_entry is None:
+                raise RuntimeError("root agent 在 frozen round snapshot 中不存在")
+            profile = {key.rsplit(".", 1)[-1]: value for key, value in values}
+            self._bot_profiles[task_id] = dict(profile)
+            pricing = getattr(snapshot.price_catalog, "debug_snapshot", None)
+            pricing_context = pricing() if callable(pricing) else {"fingerprint": getattr(snapshot.price_catalog, "fingerprint", "")}
+            builder = StablePromptBuilder(
+                formalized_task=formalized,
+                swarm_identity="麦麦深度调查组 (Lunagentic Research Swarm)",
+                bot_profile=profile,
+                agent_catalog=getattr(snapshot.agent_catalog, "entries", ()),
+                procedure_catalog=getattr(snapshot.procedure_catalog, "entries", ()),
+                pricing=pricing_context,
+            )
+            root_context = builder.root_context(coordinator=snapshot.root_agent)
+            root_messages = builder.messages_for_call(
+                root_context,
+                RuntimeHeader(
+                    branch_id,
+                    1,
+                    str(getattr(root_entry.definition, "description", snapshot.root_agent)),
+                    time_budget_seconds,
+                    credits,
+                    1,
+                    0,
+                ),
+            )
+            self._prompt_builders[task_id] = builder
+            prepared_branch_id = branch_id
+            self._branches[task_id][branch_id] = {
+                "credits": credits,
+                "pending_context": [],
+                "agent_id": snapshot.root_agent,
+                "messages": root_messages,
+                "depth": 0,
+            }
+            self._register_report_coordinator(
+                task_id=task_id,
+                round_id=controller.state.active_round_id or "",
+                formalized_task=formalized,
+                root_branch_id=branch_id,
+                credits=credits,
+                catalog_fingerprint=snapshot.agent_catalog.fingerprint,
+                generation=controller.state.generation,
+                time_budget_seconds=time_budget_seconds,
+                root_messages=root_messages,
+            )
             commands = (
                 StoreCommand("insert_vector_job", {"job_id": f"vec_{uuid.uuid4().hex}", "source_kind": "formalized_task", "source_id": task_id, "generation": 0, "status": "PENDING", "created_at": now}),
                 StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": controller.state.active_round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": 0, "created_at": now}),
@@ -183,19 +250,13 @@ class ResearchManager:
                 state_changes={"active_leaves": {branch_id: credits}},
             )
             if not accepted:
+                self._branches[task_id].pop(branch_id, None)
+                self.report_coordinators.pop(task_id, None)
                 return
-            self._branches[task_id][branch_id] = {"credits": credits, "pending_context": []}
-            self._register_report_coordinator(
-                task_id=task_id,
-                round_id=controller.state.active_round_id or "",
-                formalized_task=formalized,
-                root_branch_id=branch_id,
-                credits=credits,
-                catalog_fingerprint=snapshot.agent_catalog.fingerprint,
-                generation=controller.state.generation,
-                time_budget_seconds=time_budget_seconds,
-            )
         except Exception as exc:
+            if prepared_branch_id is not None:
+                self._branches.get(task_id, {}).pop(prepared_branch_id, None)
+                self.report_coordinators.pop(task_id, None)
             await controller.apply(
                 FormalizationFailed(
                     _event_id(), task_id, controller.state.active_round_id or "", controller.state.generation,
@@ -316,6 +377,7 @@ class ResearchManager:
                 branch_id: list(branch["pending_context"])
                 for branch_id, branch in branches.items()
             }
+            previous_branches = {branch_id: dict(branch) for branch_id, branch in branches.items()}
             await self._submit(
                 controller,
                 ContinueRequested(
@@ -331,8 +393,14 @@ class ResearchManager:
             )
             branches.clear()
             branches.update(
-                {branch_id: {"credits": credits, "pending_context": pending_context.get(branch_id, [])}
-                 for branch_id, credits in controller.state.active_leaves.items()}
+                {
+                    branch_id: {
+                        **previous_branches.get(branch_id, {}),
+                        "credits": credits,
+                        "pending_context": pending_context.get(branch_id, []),
+                    }
+                    for branch_id, credits in controller.state.active_leaves.items()
+                }
             )
             self.scheduler.resume_task(task_id)
             return {**self._status(controller), "effective_time_budget_seconds": effective_time}
@@ -352,27 +420,102 @@ class ResearchManager:
         number, generation = self._round_numbers[task_id] + 1, state.generation + 1
         layer = await self.store.load_summary_layer(task_id)
         summary_context = {"summaries": list(layer.summaries), "reports": list(layer.reports), "feedback": list(layer.feedback), "supplied_context": list(layer.supplied_context)} if layer else {}
+        root_entry = snapshot.agent_catalog.get(snapshot.root_agent)
+        if root_entry is None or state.formalized_task is None:
+            return False
+        credits = state.credit_pool + adjustment
+        pricing = getattr(snapshot.price_catalog, "debug_snapshot", None)
+        pricing_context = pricing() if callable(pricing) else {
+            "fingerprint": getattr(snapshot.price_catalog, "fingerprint", "")
+        }
+        builder = StablePromptBuilder(
+            formalized_task=state.formalized_task,
+            swarm_identity="麦麦深度调查组 (Lunagentic Research Swarm)",
+            bot_profile=self._bot_profiles.get(task_id, {}),
+            agent_catalog=getattr(snapshot.agent_catalog, "entries", ()),
+            procedure_catalog=getattr(snapshot.procedure_catalog, "entries", ()),
+            pricing=pricing_context,
+        )
+        summary_layers = [
+            str(item.get("text", "")) if isinstance(item, dict) else str(item)
+            for key in ("summaries", "reports", "feedback", "supplied_context")
+            for item in summary_context.get(key, ())
+        ]
+        root_context = builder.restart_context(summary_layers=summary_layers, coordinator=snapshot.root_agent)
+        root_messages = builder.messages_for_call(
+            root_context,
+            RuntimeHeader(
+                branch_id,
+                1,
+                str(getattr(root_entry.definition, "description", snapshot.root_agent)),
+                time_budget_seconds,
+                credits,
+                1,
+                0,
+            ),
+        )
+        previous_branches = self._branches.get(task_id, {})
+        previous_snapshot = self._round_snapshots.get(task_id)
+        previous_builder = self._prompt_builders.get(task_id)
+        previous_coordinator = self.report_coordinators.pop(task_id, None)
+        self._round_snapshots[task_id] = snapshot
+        self._prompt_builders[task_id] = builder
+        self._branches[task_id] = {
+            branch_id: {
+                "credits": credits,
+                "pending_context": list(summary_context.get("supplied_context", [])),
+                "agent_id": snapshot.root_agent,
+                "messages": root_messages,
+                "depth": 0,
+            }
+        }
+        self._register_report_coordinator(
+            task_id=task_id,
+            round_id=round_id,
+            formalized_task=state.formalized_task,
+            root_branch_id=branch_id,
+            credits=credits,
+            catalog_fingerprint=snapshot.agent_catalog.fingerprint,
+            generation=generation,
+            time_budget_seconds=time_budget_seconds,
+            root_messages=root_messages,
+        )
         event = ContinueRequested(
             _event_id(), task_id, state.active_round_id or "", state.generation,
             adjustment=adjustment, active_leaves={}, next_round_id=round_id,
             next_generation=generation, round_number=number, time_budget_seconds=time_budget_seconds,
             grace_period_seconds=self._grace_period_seconds, catalog_fingerprint=snapshot.agent_catalog.fingerprint,
         )
-        credits = state.credit_pool + adjustment
-        accepted = await controller.apply(
-            event,
-            extra_commands=(
-                StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": generation, "created_at": now}),
-            ),
-            effects=(
-                PerformAgentCall(task_id, round_id, generation, payload={"root": True, "branch_id": branch_id, "formalized_text": state.formalized_task.text, "summary_layer": summary_context}),
-            ),
-            state_changes={"active_leaves": {branch_id: credits}, "raw_context_released": False},
-        )
+        try:
+            accepted = await controller.apply(
+                event,
+                extra_commands=(
+                    StoreCommand("insert_branch", {"branch_id": branch_id, "round_id": round_id, "agent_id": snapshot.root_agent, "lifecycle": BranchLifecycle.READY.value, "depth": 0, "credit_balance": credits, "generation": generation, "created_at": now}),
+                ),
+                effects=(
+                    PerformAgentCall(task_id, round_id, generation, payload={"root": True, "branch_id": branch_id, "formalized_text": state.formalized_task.text, "summary_layer": summary_context}),
+                ),
+                state_changes={"active_leaves": {branch_id: credits}, "raw_context_released": False},
+            )
+        except BaseException:
+            self._restore_round_ephemeral(
+                task_id,
+                previous_branches,
+                previous_snapshot,
+                previous_builder,
+                previous_coordinator,
+            )
+            raise
         if not accepted or controller.state.status is not TaskStatus.RUNNING:
+            self._restore_round_ephemeral(
+                task_id,
+                previous_branches,
+                previous_snapshot,
+                previous_builder,
+                previous_coordinator,
+            )
             return False
         self._round_numbers[task_id] = number
-        self._branches[task_id] = {branch_id: {"credits": credits, "pending_context": list(summary_context.get("supplied_context", []))}}
         return True
 
     async def handle_runtime_event(self, event: Any) -> None:
@@ -392,6 +535,173 @@ class ResearchManager:
         # next procedure/materialization phase after its transaction commits.
         await self._submit(controller, event)
         self._sync_branch_credits(event.task_id, controller)
+
+    async def prepare_agent_effect(self, effect: PerformAgentCall) -> PerformAgentCall:
+        """Fill a scheduled agent effect from its task's frozen round snapshot."""
+
+        controller = self._controllers.get(effect.task_id)
+        if controller is None or effect.round_id != controller.state.active_round_id or effect.generation != controller.state.generation:
+            raise LookupError("agent effect 不属于当前 task round/generation")
+        snapshot = self._round_snapshots[effect.task_id]
+        branch_id = str(effect.payload.get("branch_id", ""))
+        branch = self._branches[effect.task_id].get(branch_id)
+        if branch is None:
+            raise LookupError(f"branch {branch_id} 不存在")
+        agent_id = str(branch.get("agent_id") or snapshot.root_agent)
+        entry = snapshot.agent_catalog.get(agent_id)
+        if entry is None:
+            raise LookupError(f"agent {agent_id} 不存在")
+        definition = entry.definition
+        selector = resolve_generation_selector(definition.model_selector, snapshot.root_force_selector).raw
+        live_ids = tuple(
+            sorted(
+                item.definition.agent_id
+                for item in getattr(snapshot.agent_catalog, "entries", ())
+                if item is not None and self._agent_is_live(item.definition.agent_id, snapshot)
+            )
+        )
+        payload = dict(effect.payload)
+        payload.update(
+            {
+                "branch_id": branch_id,
+                "agent_id": agent_id,
+                "call_id": str(payload.get("call_id") or new_call_id()),
+                "selector": selector,
+                "protocol": str(getattr(definition, "protocol", "json_envelope")),
+                "messages": tuple(dict(item) for item in branch.get("messages", ())),
+                "credits_after_reservation": float(branch.get("credits", 0.0)),
+                "branch_depth": int(branch.get("depth", 0)),
+                "live_agent_ids": live_ids,
+                "max_delegations_per_turn": int(self._runtime_limits.get("max_delegations_per_turn", 8)),
+                "max_branch_depth": int(self._runtime_limits.get("max_branch_depth", 32)),
+                "max_agent_calls_per_task": int(self._runtime_limits.get("max_agent_calls_per_task", 256)),
+                "agent_calls_started": int(controller.state.agent_calls_started),
+            }
+        )
+        return replace(effect, payload=payload)
+
+    async def prepare_procedure_effect(self, effect: Any) -> Any:
+        """Attach the procedure catalog frozen for this task round."""
+
+        controller = self._controllers.get(effect.task_id)
+        if (
+            controller is None
+            or effect.round_id != controller.state.active_round_id
+            or effect.generation != controller.state.generation
+        ):
+            raise LookupError("procedure effect 不属于当前 task round/generation")
+        snapshot = self._round_snapshots.get(effect.task_id)
+        if snapshot is None:
+            raise LookupError("procedure effect 缺少 frozen round snapshot")
+        branch_id = str(effect.payload.get("branch_id", ""))
+        if branch_id and branch_id not in self._branches.get(effect.task_id, {}):
+            raise LookupError(f"branch {branch_id} 不存在")
+        payload = dict(effect.payload)
+        payload["procedure_catalog"] = snapshot.procedure_catalog
+        payload["procedure_catalog_fingerprint"] = str(
+            getattr(snapshot.procedure_catalog, "fingerprint", "")
+        )
+        return replace(effect, payload=payload)
+
+    def _agent_is_live(self, agent_id: str, snapshot: Any) -> bool:
+        if callable(self._agent_live_provider):
+            return bool(self._agent_live_provider(agent_id))
+        return snapshot.agent_catalog.get(agent_id) is not None
+
+    async def materialize_child_effect(self, effect: NotifyToolWaiter) -> None:
+        """Commit one child branch before making its first agent call runnable."""
+
+        controller = self._controllers.get(effect.task_id)
+        if controller is None or effect.round_id != controller.state.active_round_id or effect.generation != controller.state.generation:
+            return
+        payload = dict(effect.payload)
+        snapshot = self._round_snapshots[effect.task_id]
+        agent_id = str(payload.get("agent_id", ""))
+        if not self._agent_is_live(agent_id, snapshot):
+            failed = dict(payload)
+            failed.update({"reason": "agent_unavailable", "edge_finalization": True})
+            await self.scheduler.enqueue(
+                PerformBranchSummary(effect.task_id, effect.round_id, effect.generation, priority="barrier", payload=failed)
+            )
+            return
+        branch_id = str(payload["branch_id"])
+        parent_id = str(payload["parent_branch_id"])
+        credits = float(payload.get("credits", 0.0))
+        depth = int(payload.get("depth", 0))
+        await self._submit(
+            controller,
+            ChildMaterialized(
+                _event_id(), effect.task_id, str(effect.round_id or ""), effect.generation,
+                branch_id=branch_id, parent_branch_id=parent_id, agent_id=agent_id,
+                credits=credits, depth=depth, retire_parent=bool(payload.get("retire_parent", False)),
+                pool_return=float(payload.get("pool_return", 0.0)),
+            ),
+        )
+        messages = [dict(item) for item in payload.get("messages", ())]
+        self._branches[effect.task_id][branch_id] = {
+            "credits": credits, "pending_context": [], "agent_id": agent_id,
+            "messages": messages, "depth": depth,
+        }
+        if payload.get("retire_parent"):
+            self._branches[effect.task_id].pop(parent_id, None)
+        coordinator = self.report_coordinators.get(effect.task_id)
+        if coordinator is not None:
+            if payload.get("retire_parent") and parent_id in coordinator.branches:
+                coordinator.branches[parent_id].lifecycle = BranchLifecycle.FINALIZED
+                coordinator.branches[parent_id].messages.clear()
+            coordinator.branches[branch_id] = BranchRuntime(
+                branch_id, coordinator.formalized_task, snapshot.agent_catalog.fingerprint,
+                effect.generation, messages, credits, depth, parent_branch_id=parent_id,
+            )
+        await self.scheduler.enqueue(
+            PerformAgentCall(effect.task_id, effect.round_id, effect.generation, payload={"branch_id": branch_id})
+        )
+
+    async def handle_branch_summary_effect(self, effect: PerformBranchSummary) -> None:
+        """Finalize/checkpoint a branch through the report coordinator."""
+
+        controller = self._controllers.get(effect.task_id)
+        coordinator = self.report_coordinators.get(effect.task_id)
+        if (
+            controller is None
+            or coordinator is None
+            or effect.round_id != controller.state.active_round_id
+            or effect.generation != controller.state.generation
+        ):
+            return
+        payload = dict(effect.payload)
+        branch_id = str(payload.get("branch_id", ""))
+        if branch_id not in coordinator.branches:
+            snapshot = self._round_snapshots[effect.task_id]
+            coordinator.branches[branch_id] = BranchRuntime(
+                branch_id=branch_id,
+                task=coordinator.formalized_task,
+                catalog_fingerprint=snapshot.agent_catalog.fingerprint,
+                generation=effect.generation,
+                messages=[dict(item) for item in payload.get("messages", ())],
+                credits=float(payload.get("credits", 0.0)),
+                depth=int(payload.get("depth", 0)),
+                parent_branch_id=str(payload.get("parent_branch_id") or "") or None,
+            )
+        reason = str(payload.get("reason", "no_further_work"))
+        checkpoint = reason in {"checkpoint", "compact"}
+        await coordinator.on_branch_safe_point(
+            branch_id,
+            checkpoint=checkpoint,
+            terminal=not checkpoint,
+            delegations=tuple(payload.get("held_delegations", ())),
+        )
+        if checkpoint:
+            return
+        branch = coordinator.branches[branch_id]
+        release_raw_context(branch)
+        await self.handle_runtime_event(
+            BranchFinalized(
+                _event_id(), effect.task_id, str(effect.round_id or ""), effect.generation,
+                branch_id=branch_id, summary_id=branch.latest_checkpoint_id or "", reason=reason,
+            )
+        )
+        self._branches.get(effect.task_id, {}).pop(branch_id, None)
 
     async def handle_report_deadline(self, event: ReportDeadlineReached) -> None:
         """Durably enter REPORTING, then open the injected epoch coordinator.
@@ -511,6 +821,7 @@ class ResearchManager:
         catalog_fingerprint: str,
         generation: int,
         time_budget_seconds: int,
+        root_messages: list[dict[str, Any]] | None = None,
     ) -> None:
         if task_id in self.report_coordinators:
             return
@@ -519,7 +830,7 @@ class ResearchManager:
             task=formalized_task,
             catalog_fingerprint=catalog_fingerprint,
             generation=generation,
-            messages=[],
+            messages=[dict(item) for item in (root_messages or ())],
             credits=credits,
             depth=0,
         )
@@ -540,6 +851,30 @@ class ResearchManager:
             grace_period_seconds=self._grace_period_seconds,
             credit_pool=0.0,
         )
+
+    def _restore_round_ephemeral(
+        self,
+        task_id: str,
+        branches: dict[str, dict[str, Any]],
+        snapshot: Any | None,
+        builder: StablePromptBuilder | None,
+        coordinator: Any | None,
+    ) -> None:
+        """Roll back local routing state when a new-round barrier is rejected."""
+
+        self._branches[task_id] = branches
+        if snapshot is None:
+            self._round_snapshots.pop(task_id, None)
+        else:
+            self._round_snapshots[task_id] = snapshot
+        if builder is None:
+            self._prompt_builders.pop(task_id, None)
+        else:
+            self._prompt_builders[task_id] = builder
+        if coordinator is None:
+            self.report_coordinators.pop(task_id, None)
+        else:
+            self.report_coordinators[task_id] = coordinator
 
     async def handle_branch_safe_point(
         self,
@@ -603,6 +938,30 @@ class ResearchManager:
             if not jobs:
                 return
             await asyncio.gather(*jobs, return_exceptions=True)
+
+    async def shutdown(self) -> None:
+        """Cancel manager-owned coroutines before the scheduler/store close."""
+
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        for controller in self._controllers.values():
+            controller.stopped = True
+        tasks: set[asyncio.Task[Any]] = set()
+        for bucket in self._jobs.values():
+            tasks.update(task for task in bucket if not task.done())
+        tasks.update(task for task in self._pause_jobs.values() if not task.done())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._jobs.clear()
+        self._pause_jobs.clear()
+        self._branches.clear()
+        self.report_coordinators.clear()
+        self._round_snapshots.clear()
+        self._prompt_builders.clear()
+        self._bot_profiles.clear()
 
     async def status(self, task_id: str, *, stream_id: str | None = None) -> dict[str, Any]:
         await self._assert_stream_owner(task_id, stream_id)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence, Set
+from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -208,10 +208,18 @@ async def resolve_completed_turn(
 class TurnWorker:
     """只执行外部调用与协议解析；不修改 branch 或 store。"""
 
-    def __init__(self, llm: Any, procedures: Any, *, pricing: Any | None = None) -> None:
+    def __init__(
+        self,
+        llm: Any,
+        procedures: Any,
+        *,
+        pricing: Any | None = None,
+        procedure_factory: Callable[[Any], Any] | None = None,
+    ) -> None:
         self.llm = llm
         self.procedures = procedures
         self.pricing = pricing
+        self.procedure_factory = procedure_factory
 
     async def perform_agent_call(self, effect: PerformAgentCall) -> AgentCallCompleted | AgentCallFailed:
         payload = effect.payload
@@ -296,7 +304,11 @@ class TurnWorker:
         )
 
     async def perform_procedure_batch(self, effect: PerformProcedureBatch) -> ProcedureBatchCompleted:
-        completed = await self.procedures.invoke_many(effect)
+        procedures = self.procedures
+        catalog = effect.payload.get("procedure_catalog")
+        if catalog is not None and self.procedure_factory is not None:
+            procedures = self.procedure_factory(catalog)
+        completed = await procedures.invoke_many(effect)
         if not isinstance(completed, ProcedureBatchCompleted):
             raise TypeError("Procedure executor 必须返回 ProcedureBatchCompleted")
         payload = effect.payload

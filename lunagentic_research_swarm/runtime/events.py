@@ -255,6 +255,18 @@ class ProcedureBatchCompleted(Event):
 
 @_register
 @dataclass(frozen=True, slots=True)
+class ChildMaterialized(Event):
+    branch_id: str = ""
+    parent_branch_id: str = ""
+    agent_id: str = ""
+    credits: float = 0.0
+    depth: int = 0
+    retire_parent: bool = False
+    pool_return: float = 0.0
+
+
+@_register
+@dataclass(frozen=True, slots=True)
 class SummaryCompleted(Event):
     branch_id: str = ""
     summary_id: str = ""
@@ -395,7 +407,7 @@ class PersistenceFailed(Event):
 
 RuntimeEvent: TypeAlias = (
     TaskCreated | FormalizationSucceeded | FormalizationFailed | AgentCallRequested | AgentCallReserved | AgentCallCompleted
-    | AgentCallFailed | ProcedureBatchCompleted | SummaryCompleted | SummaryFailed | BranchCheckpointed | BranchFinalized
+    | AgentCallFailed | ProcedureBatchCompleted | ChildMaterialized | SummaryCompleted | SummaryFailed | BranchCheckpointed | BranchFinalized
     | ReportDeadlineReached | GraceExpired | ReportCompleted | FinalReportCompleted | FinalReportFailed | AllInflightSettled
     | PauseRequested | PauseExpired | PauseExpiryReached | ContinueRequested | StopRequested | ContextSupplied | FeedbackSubmitted | OutboxDelivered | PersistenceFailed
 )

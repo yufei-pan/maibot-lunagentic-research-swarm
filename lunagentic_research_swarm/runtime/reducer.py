@@ -18,7 +18,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar, TypeAlias
 
 from lunagentic_research_swarm.errors import INVALID_STATE, STORAGE_COMMIT_FAILED, LRSError
-from lunagentic_research_swarm.models import FormalizedTask, TaskSnapshot, TaskStatus
+from lunagentic_research_swarm.models import FormalizedTask, TaskStatus
 from lunagentic_research_swarm.llm.protocol import ProtocolError, build_correction_message
 from lunagentic_research_swarm.runtime.credits import (
     allocate_children,
@@ -34,6 +34,7 @@ from lunagentic_research_swarm.runtime.events import (
     AllInflightSettled,
     BranchCheckpointed,
     BranchFinalized,
+    ChildMaterialized,
     ContinueRequested,
     FinalReportCompleted,
     FinalReportFailed,
@@ -463,8 +464,10 @@ def _delegation_effects(
         if reason is None or reason == "agent_unavailable":
             allocatable.append((str(index), float(requested_credits)))
 
-    allocations = allocate_children(credits_after, allocatable).allocations
+    allocation = allocate_children(credits_after, allocatable)
+    allocations = allocation.allocations
     calls_after_reservation = agent_calls_started + reserved_calls
+    first_live_index = next((index for index, *_rest, reason in normalized if reason is None), None)
     effects: list[Effect] = []
     for index, agent_id, assignment, _requested_credits, reason in normalized:
         child_branch_id = f"{event.branch_id}:{index + 1}"
@@ -515,6 +518,8 @@ def _delegation_effects(
                     "max_branch_depth": max_depth,
                     "max_agent_calls_per_task": max_calls,
                     "agent_calls_started": calls_after_reservation,
+                    "retire_parent": index == first_live_index,
+                    "pool_return": allocation.returned_to_pool if index == first_live_index else 0.0,
                 },
             )
         )
@@ -1265,7 +1270,73 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             ),
         )
 
-    if isinstance(event, (SummaryCompleted, SummaryFailed, BranchCheckpointed, BranchFinalized)):
+    if isinstance(event, ChildMaterialized):
+        if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING}:
+            return _invalid(state, event, "ChildMaterialized 只能用于活跃 round")
+        if not event.branch_id or not event.parent_branch_id or not event.agent_id:
+            return _invalid(state, event, "ChildMaterialized identity 不能为空")
+        if event.depth < 0 or event.credits < 0 or event.pool_return < 0:
+            return _invalid(state, event, "ChildMaterialized depth/credits 无效")
+        leaves = _state_leaves(state)
+        pool = _state_credit_pool(state)
+        if event.retire_parent:
+            leaves.pop(event.parent_branch_id, None)
+            pool += float(event.pool_return)
+        leaves[event.branch_id] = float(event.credits)
+        commands: list[StoreCommand] = [
+            _command(
+                "insert_branch",
+                {
+                    "branch_id": event.branch_id,
+                    "round_id": event.round_id,
+                    "parent_branch_id": event.parent_branch_id,
+                    "agent_id": event.agent_id,
+                    "lifecycle": "READY",
+                    "depth": event.depth,
+                    "credit_balance": event.credits,
+                    "generation": event.generation,
+                    "created_at": event.occurred_at.timestamp(),
+                },
+            )
+        ]
+        if event.retire_parent:
+            commands.append(
+                _command(
+                    "settle_delegating_parent",
+                    {
+                        "round_id": event.round_id,
+                        "branch_id": event.parent_branch_id,
+                        "pool_return": event.pool_return,
+                        "lifecycle": "FINALIZED",
+                        "finalized_at": event.occurred_at.timestamp(),
+                    },
+                )
+            )
+        return Transition(_replace_state(state, active_leaves=leaves, credit_pool=pool), commands=tuple(commands))
+
+    if isinstance(event, BranchFinalized):
+        if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.FINALIZING}:
+            return _invalid(state, event, "BranchFinalized 只能用于活跃 round")
+        leaves = _state_leaves(state)
+        balance = float(leaves.pop(event.branch_id, 0.0))
+        pool = _state_credit_pool(state) + balance
+        return Transition(
+            _replace_state(state, active_leaves=leaves, credit_pool=pool),
+            commands=(
+                _command(
+                    "settle_branch",
+                    {
+                        "round_id": event.round_id,
+                        "branch_id": event.branch_id,
+                        "credit_balance": balance,
+                        "lifecycle": "FINALIZED",
+                        "finalized_at": event.occurred_at.timestamp(),
+                    },
+                ),
+            ),
+        )
+
+    if isinstance(event, (SummaryCompleted, SummaryFailed, BranchCheckpointed)):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.FINALIZING}:
             return _invalid(state, event, "summary/branch event 只能用于活跃 round")
         if isinstance(event, BranchCheckpointed):

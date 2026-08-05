@@ -27,7 +27,6 @@ from lunagentic_research_swarm.runtime.reducer import (
 )
 from lunagentic_research_swarm.runtime.turns import TurnLimits, TurnWorker, resolve_completed_turn
 
-
 NOW = datetime(2026, 8, 3, tzinfo=timezone.utc)
 
 
@@ -700,3 +699,24 @@ async def test_procedure_worker_preserves_materialization_snapshot_for_reducer_b
     assert event.max_branch_depth == 9
     assert event.max_agent_calls_per_task == 11
     assert event.agent_calls_started == 3
+
+
+@pytest.mark.asyncio
+async def test_procedure_worker_uses_effect_round_catalog_factory() -> None:
+    catalog = object()
+    seen: list[object] = []
+
+    def factory(value: object) -> CompletedProcedures:
+        seen.append(value)
+        return CompletedProcedures()
+
+    effect = PerformProcedureBatch(
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        payload={"branch_id": "branch-1", "call_id": "call-1", "procedure_catalog": catalog},
+    )
+
+    await TurnWorker(object(), CompletedProcedures(), procedure_factory=factory).perform_procedure_batch(effect)
+
+    assert seen == [catalog]

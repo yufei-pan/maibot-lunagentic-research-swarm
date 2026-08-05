@@ -20,12 +20,23 @@ from lunagentic_research_swarm.agents.registry import (
 from lunagentic_research_swarm.config import AgentOverride, LRSConfig, ProcedureOverride
 from lunagentic_research_swarm.extensions.contracts import ExtensionRefreshDelta
 from lunagentic_research_swarm.extensions.discovery import ExtensionDiscovery
-from lunagentic_research_swarm.llm.gateway import HostModelSnapshotReader, ModelSelector, resolve_generation_selector
+from lunagentic_research_swarm.llm.gateway import (
+    HostModelSnapshotReader,
+    LLMGateway,
+    ModelSelector,
+    resolve_generation_selector,
+)
 from lunagentic_research_swarm.llm.physical_pinning import PhysicalPinningAdapter, PhysicalPinningStatus
 from lunagentic_research_swarm.llm.pricing import PriceCatalog
+from lunagentic_research_swarm.llm.summarizer import SummarizerService
+from lunagentic_research_swarm.procedures.executor import ProcedureExecutor
 from lunagentic_research_swarm.procedures.registry import ProcedureCatalogSnapshot, ProcedureRegistry
-from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
+from lunagentic_research_swarm.runtime.effect_runner import RuntimeEffectRunner
+from lunagentic_research_swarm.runtime.manager import ResearchManager
+from lunagentic_research_swarm.runtime.scheduler import FairScheduler
+from lunagentic_research_swarm.runtime.turns import TurnWorker
 from lunagentic_research_swarm.storage.outbox import MaisakaOutbox
+from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
 
 StoreFactory = Callable[[Path], Any]
 DiscoveryFactory = Callable[..., Any]
@@ -112,8 +123,12 @@ class LRSServiceContainer:
         builtin_provider_loader: BuiltinProviderLoader = _empty_builtin_provider_loader,
     ) -> None:
         self._ctx = ctx
+        self._config = config.model_copy(deep=True)
         self._store = store_factory(Path(ctx.paths.data_dir) / "lrs-state.sqlite3")
         self.outbox: MaisakaOutbox | None = None
+        self.manager: ResearchManager | None = None
+        self.scheduler: FairScheduler | None = None
+        self._effect_runner: RuntimeEffectRunner | None = None
         self._outbox_poll_seconds = float(config.reporting.outbox_poll_seconds)
         self._discovery_factory = discovery_factory
         self._host_snapshot_loader = host_snapshot_loader
@@ -207,6 +222,7 @@ class LRSServiceContainer:
             await self._refresh_external_extensions()
             self._record_physical_pinning_health()
             self._warn_for_low_root_budget()
+            await self._start_runtime()
             self._discovery.start()
             self._state = "running"
         except BaseException:
@@ -219,12 +235,25 @@ class LRSServiceContainer:
         """释放启动阶段已经创建的资源而不遮蔽原始异常。"""
 
         resources: tuple[tuple[str, Any | None], ...] = (
+            ("runtime_scheduler", self.scheduler),
             ("extension_discovery", self._discovery),
             ("maisaka_outbox", self.outbox),
             ("sqlite", self._store),
         )
         self._discovery = None
         self.outbox = None
+        manager = self.manager
+        self.manager = None
+        self.scheduler = None
+        self._effect_runner = None
+        if manager is not None:
+            try:
+                await manager.shutdown()
+            except BaseException as exc:
+                self._ctx.logger.error(
+                    "LRS 启动失败后的 manager 清理异常：resource=runtime_manager；error_type=%s",
+                    type(exc).__name__,
+                )
         for resource_name, resource in resources:
             if resource is None:
                 continue
@@ -237,6 +266,61 @@ class LRSServiceContainer:
                     resource_name,
                     type(exc).__name__,
                 )
+
+    async def _start_runtime(self) -> None:
+        """Compose the production worker cycle after catalogs/pricing exist."""
+
+        assert self.price_catalog is not None
+        config = self._config
+        gateway = LLMGateway(self._ctx, physical_pinning=self._physical_pinning)
+        summarizer_selector = resolve_generation_selector(
+            config.summarizer.selector,
+            config.llm.force_selector,
+        ).raw
+        summarizer = SummarizerService(
+            gateway,
+            selector=summarizer_selector,
+            temperature=float(config.summarizer.temperature),
+            max_tokens=int(config.summarizer.max_tokens),
+        )
+        procedure_catalog = self.procedure_registry.snapshot(
+            self._next_round_state.detached_procedure_overrides()
+        )
+        procedures = ProcedureExecutor(procedure_catalog, ctx=self._ctx, summarizer=summarizer)
+
+        def procedure_factory(catalog: Any) -> ProcedureExecutor:
+            return ProcedureExecutor(catalog, ctx=self._ctx, summarizer=summarizer)
+
+        turn_worker = TurnWorker(
+            gateway,
+            procedures,
+            pricing=self.price_catalog,
+            procedure_factory=procedure_factory,
+        )
+        runner = RuntimeEffectRunner(turn_worker)
+        scheduler = FairScheduler(
+            global_llm=int(config.scheduler.max_global_llm_concurrency),
+            per_task_llm=int(config.scheduler.max_task_llm_concurrency),
+            per_task_procedure=int(config.scheduler.max_task_procedure_concurrency),
+            worker=runner,
+        )
+        manager = ResearchManager(
+            ctx=self._ctx,
+            store=self._store,
+            summarizer=summarizer,
+            scheduler=scheduler,
+            snapshot_provider=self.snapshot_next_round,
+            recent_message_limit=20,
+            pause_timeout_seconds=int(config.timing.pause_timeout_seconds),
+            grace_period_seconds=int(config.timing.grace_period_seconds),
+            agent_live_provider=self.agent_registry.is_live,
+            runtime_limits=self._safety_limits,
+        )
+        runner.bind_manager(manager)
+        self._effect_runner = runner
+        self.scheduler = scheduler
+        self.manager = manager
+        await scheduler.start()
 
     def _load_initial_price_catalog(self) -> None:
         loader = self._host_snapshot_loader
@@ -592,25 +676,40 @@ class LRSServiceContainer:
             if self._state == "closed":
                 return
             self._state = "closing"
-            discovery_error: BaseException | None = None
+            close_error: BaseException | None = None
+            if self.manager is not None:
+                try:
+                    await self.manager.shutdown()
+                except BaseException as exc:
+                    close_error = exc
+                self.manager = None
+            if self.scheduler is not None:
+                try:
+                    await self.scheduler.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+                self.scheduler = None
+                self._effect_runner = None
             if self._discovery is not None:
                 try:
                     await self._discovery.close()
                 except BaseException as exc:
-                    discovery_error = exc
+                    if close_error is None:
+                        close_error = exc
             if self.outbox is not None:
                 try:
                     await self.outbox.close()
                 except BaseException as exc:
-                    if discovery_error is None:
-                        discovery_error = exc
+                    if close_error is None:
+                        close_error = exc
             try:
                 await self._store.close()
             except BaseException as store_error:
                 self._state = "closed"
-                if discovery_error is not None:
-                    raise discovery_error from store_error
+                if close_error is not None:
+                    raise close_error from store_error
                 raise
             self._state = "closed"
-            if discovery_error is not None:
-                raise discovery_error
+            if close_error is not None:
+                raise close_error

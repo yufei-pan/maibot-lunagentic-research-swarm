@@ -7,7 +7,9 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -102,6 +104,7 @@ class SQLiteStateStore:
         self._path = Path(path)
         self._connection: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
+        self._executor: ThreadPoolExecutor | None = None
         self._command_handlers: Mapping[str, Callable[[sqlite3.Connection, Mapping[str, Any]], None]] = (
             MappingProxyType(
                 {
@@ -128,17 +131,25 @@ class SQLiteStateStore:
                     "update_round_generation": self._update_round_generation,
                     "update_round_continuation": self._update_round_continuation,
                     "update_branch_balance": self._update_branch_balance,
+                    "settle_branch": self._settle_branch,
+                    "settle_delegating_parent": self._settle_delegating_parent,
                 }
             )
         )
 
     async def _call(self, function: Callable[..., Any], *args: Any) -> Any:
         async with self._lock:
-            operation = asyncio.create_task(asyncio.to_thread(function, *args))
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lrs-sqlite")
+            loop = asyncio.get_running_loop()
+            operation = loop.run_in_executor(self._executor, partial(function, *args))
+            await asyncio.sleep(0)
             cancellation: asyncio.CancelledError | None = None
             while not operation.done():
                 try:
-                    await asyncio.shield(operation)
+                    await asyncio.wait_for(asyncio.shield(operation), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
                 except asyncio.CancelledError as exc:
                     # worker 无法被取消；必须继续持锁直到它退出，避免同一连接并发使用。
                     if cancellation is None:
@@ -153,6 +164,11 @@ class SQLiteStateStore:
 
     async def close(self) -> None:
         await self._call(self._close_sync)
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            # 不在 event loop 中等待 executor worker；close 已经先通过
+            # store lock 完成连接关闭，剩余 worker 只需异步收尾。
+            executor.shutdown(wait=False, cancel_futures=True)
 
     async def transact(self, commands: Sequence[StoreCommand]) -> None:
         await self._call(self._transact_sync, tuple(commands))
@@ -766,6 +782,37 @@ class SQLiteStateStore:
             (values["credit_balance"], values["lifecycle"], values["branch_id"]),
         )
         _require_single_target(cursor, target_kind="Branch", target_id=values["branch_id"])
+
+    @staticmethod
+    def _settle_branch(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        cursor = connection.execute(
+            "UPDATE branches SET credit_balance = ?, lifecycle = ?, finalized_at = ? WHERE branch_id = ?",
+            (
+                values["credit_balance"],
+                values["lifecycle"],
+                values.get("finalized_at"),
+                values["branch_id"],
+            ),
+        )
+        _require_single_target(cursor, target_kind="Branch", target_id=values["branch_id"])
+        cursor = connection.execute(
+            "UPDATE investigation_rounds SET credit_pool = credit_pool + ? WHERE round_id = ?",
+            (values["credit_balance"], values["round_id"]),
+        )
+        _require_single_target(cursor, target_kind="Round", target_id=values["round_id"])
+
+    @staticmethod
+    def _settle_delegating_parent(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        cursor = connection.execute(
+            "UPDATE branches SET credit_balance = 0, lifecycle = ?, finalized_at = ? WHERE branch_id = ?",
+            (values["lifecycle"], values.get("finalized_at"), values["branch_id"]),
+        )
+        _require_single_target(cursor, target_kind="Branch", target_id=values["branch_id"])
+        cursor = connection.execute(
+            "UPDATE investigation_rounds SET credit_pool = credit_pool + ? WHERE round_id = ?",
+            (values["pool_return"], values["round_id"]),
+        )
+        _require_single_target(cursor, target_kind="Round", target_id=values["round_id"])
 
     @staticmethod
     def _row_to_round(row: sqlite3.Row) -> StoredRound:

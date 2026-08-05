@@ -253,6 +253,12 @@ async def test_continue_without_leaves_starts_new_generation_from_summary_layer_
     assert "跨 round 资料" in serialized
     assert "debug" not in serialized
     assert "transcript" not in serialized
+    prepared = await manager.prepare_agent_effect(root_effect)
+    assert prepared.payload["selector"] == "model:root"
+    assert prepared.payload["agent_id"] == "root"
+    assert prepared.payload["messages"][1]["content"] == "形式化后的调查任务"
+    assert "跨 round 资料" in repr(prepared.payload["messages"])
+    assert manager.report_coordinators[task_id].round_id == result["round_id"]
 
 
 @pytest.mark.asyncio

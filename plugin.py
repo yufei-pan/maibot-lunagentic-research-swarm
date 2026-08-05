@@ -58,9 +58,9 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
         assert isinstance(config, LRSConfig)
         services = LRSServiceContainer(self.ctx, config)
         self._services = services
-        self._manager = getattr(services, "manager", None)
         try:
             await services.start()
+            self._manager = services.manager
         except BaseException:
             try:
                 await services.close()

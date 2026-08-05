@@ -143,9 +143,14 @@ class FakeConfigAPI:
 class FakeScheduler:
     def __init__(self) -> None:
         self.enqueued = []
+        self.on_enqueue = None
 
     async def enqueue(self, effect) -> bool:
         self.enqueued.append(effect)
+        if self.on_enqueue is not None:
+            result = self.on_enqueue(effect)
+            if hasattr(result, "__await__"):
+                await result
         return True
 
     def task_inflight_count(self, task_id: str) -> int:
@@ -172,9 +177,22 @@ class FakeCatalog:
     fingerprint = "catalog-fingerprint"
 
     def get(self, agent_id: str):
-        if agent_id != "root":
+        if agent_id not in {"root", "child"}:
             return None
-        return SimpleNamespace(definition=SimpleNamespace(model_selector="model:root", enabled=True, can_be_root=True))
+        return SimpleNamespace(
+            definition=SimpleNamespace(
+                agent_id=agent_id,
+                model_selector=f"model:{agent_id}",
+                protocol="json_envelope",
+                description=f"{agent_id} capability",
+                enabled=True,
+                can_be_root=agent_id == "root",
+            )
+        )
+
+    @property
+    def entries(self):
+        return (self.get("root"), self.get("child"))
 
 
 @pytest.fixture
@@ -311,3 +329,181 @@ async def test_start_rejects_invalid_inputs_before_persistence(harness, kwargs) 
     with pytest.raises(ValueError):
         await manager.start(**kwargs)
     assert store.commands == []
+
+
+@pytest.mark.asyncio
+async def test_manager_prepares_root_agent_effect_from_frozen_round_snapshot(harness) -> None:
+    manager, _, _, scheduler, *_ = harness
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+
+    prepared = await manager.prepare_agent_effect(scheduler.enqueued[-1])
+
+    assert prepared.payload["selector"] == "model:root"
+    assert prepared.payload["protocol"] == "json_envelope"
+    assert prepared.payload["agent_id"] == "root"
+    assert prepared.payload["messages"][1]["content"] == "形式化后的调查任务"
+    assert prepared.payload["live_agent_ids"] == ("child", "root")
+
+
+@pytest.mark.asyncio
+async def test_manager_prepares_procedure_effect_from_frozen_round_snapshot(harness) -> None:
+    from lunagentic_research_swarm.runtime.reducer import PerformProcedureBatch
+
+    manager, _, _, _, *_ = harness
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+    status = await manager.status(result["task_id"])
+    branch_id = status["active_leaves"][0]["branch_id"]
+    effect = PerformProcedureBatch(
+        result["task_id"],
+        status["round_id"],
+        status["generation"],
+        payload={"branch_id": branch_id, "messages": ()},
+    )
+
+    prepared = await manager.prepare_procedure_effect(effect)
+
+    assert prepared.payload["procedure_catalog"] is manager._round_snapshots[result["task_id"]].procedure_catalog
+
+
+@pytest.mark.asyncio
+async def test_formalization_prepares_routing_state_before_immediate_agent_dispatch(harness) -> None:
+    from lunagentic_research_swarm.runtime.reducer import PerformAgentCall
+
+    manager, _, _, scheduler, *_ = harness
+    errors = []
+
+    async def inspect_agent(effect):
+        if isinstance(effect, PerformAgentCall):
+            try:
+                await manager.prepare_agent_effect(effect)
+            except Exception as exc:  # pragma: no cover - assertion below records the expected RED path
+                errors.append(exc)
+
+    scheduler.on_enqueue = inspect_agent
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+
+    assert (await manager.status(result["task_id"]))["status"] == "RUNNING"
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_restart_prepares_routing_state_before_immediate_agent_dispatch(harness) -> None:
+    from lunagentic_research_swarm.runtime.reducer import PerformAgentCall
+
+    manager, _, _, scheduler, *_ = harness
+    errors = []
+
+    async def inspect_agent(effect):
+        if isinstance(effect, PerformAgentCall):
+            try:
+                await manager.prepare_agent_effect(effect)
+            except Exception as exc:  # pragma: no cover - assertion below records the expected RED path
+                errors.append(exc)
+
+    scheduler.on_enqueue = inspect_agent
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+    await manager.stop(result["task_id"], stream_id="s")
+
+    continued = await manager.continue_task(result["task_id"], credit_adjustment=1.0, stream_id="s")
+
+    assert continued["status"] == "RUNNING"
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_manager_shutdown_cancels_formalization_and_pause_background_tasks(harness) -> None:
+    manager, store, summarizer, _, *_ = harness
+    summarizer.block()
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    task_id = result["task_id"]
+    await asyncio.sleep(0)
+    assert manager._jobs[task_id]
+
+    await manager.shutdown()
+    command_count = len(store.commands)
+    summarizer.gate.set()
+    await asyncio.sleep(0)
+
+    assert manager._jobs == {}
+    assert manager._pause_jobs == {}
+    assert len(store.commands) == command_count
+
+
+@pytest.mark.asyncio
+async def test_manager_shutdown_cancels_pause_expiry_task(harness) -> None:
+    manager, _, _, _, *_ = harness
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+    await manager.pause(result["task_id"], stream_id="s")
+    assert manager._pause_jobs
+
+    await manager.shutdown()
+
+    assert manager._pause_jobs == {}
+
+
+@pytest.mark.asyncio
+async def test_materialize_child_commits_before_enqueuing_agent(harness) -> None:
+    from lunagentic_research_swarm.runtime.reducer import NotifyToolWaiter, PerformAgentCall
+
+    manager, store, _, scheduler, *_ = harness
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+    status = await manager.status(result["task_id"])
+    parent_id = status["active_leaves"][0]["branch_id"]
+    scheduler.enqueued.clear()
+    effect = NotifyToolWaiter(
+        result["task_id"],
+        status["round_id"],
+        status["generation"],
+        payload={
+            "action": "materialize_child",
+            "branch_id": f"{parent_id}:1",
+            "parent_branch_id": parent_id,
+            "agent_id": "child",
+            "assignment": "核对证据",
+            "credits": 25.0,
+            "depth": 1,
+            "messages": ({"role": "user", "content": "assignment: 核对证据"},),
+            "retire_parent": True,
+        },
+    )
+
+    await manager.materialize_child_effect(effect)
+
+    branch_inserts = [command for command in store.commands if command.kind == "insert_branch"]
+    assert branch_inserts[-1].values["branch_id"] == f"{parent_id}:1"
+    assert isinstance(scheduler.enqueued[-1], PerformAgentCall)
+    assert scheduler.enqueued[-1].payload["branch_id"] == f"{parent_id}:1"
+    assert (await manager.status(result["task_id"]))["active_leaves"] == [
+        {"branch_id": f"{parent_id}:1", "credits": 25.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_branch_summary_effect_finalizes_coordinator_branch_and_releases_messages(harness) -> None:
+    from lunagentic_research_swarm.models import BranchLifecycle
+    from lunagentic_research_swarm.runtime.reducer import PerformBranchSummary
+
+    manager, _, _, _, *_ = harness
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+    status = await manager.status(result["task_id"])
+    branch_id = status["active_leaves"][0]["branch_id"]
+
+    await manager.handle_branch_summary_effect(
+        PerformBranchSummary(
+            result["task_id"],
+            status["round_id"],
+            status["generation"],
+            payload={"branch_id": branch_id, "reason": "no_further_work"},
+        )
+    )
+
+    branch = manager.report_coordinators[result["task_id"]].branches[branch_id]
+    assert branch.lifecycle is BranchLifecycle.FINALIZED
+    assert branch.messages == []
