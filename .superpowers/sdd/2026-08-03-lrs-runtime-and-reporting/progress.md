@@ -33,4 +33,4 @@ Task 9: fix round 2/5 (1 addressed, 0 open — stable mutating failure envelope 
 Task 9: complete (commits a8b5730..fa9231a, review clean; full suite 391 passed)
 Task 10: fix round 1/5 (production effect runner, frozen manager adapters, integration harness, service composition; design commit 43c7ff5; full suite 413 passed)
 Task 10: fix round 2/5 (round procedure catalog propagation, manager shutdown, formalize/restart routing races, reverse close error preservation; full suite 419 passed)
-Task 10: complete (commits fa9231a..; design 43c7ff5; 2fa2258 effect runner, 1e2f431 service composition, 46e0229 E2E harness,  composition plan; full suite 419 passed)
+Task 10: complete (commits fa9231a..27c490a; design 43c7ff5; 2fa2258 effect runner, 1e2f431 service composition, 46e0229 E2E harness, 27c490a composition plan; full suite 419 passed)
