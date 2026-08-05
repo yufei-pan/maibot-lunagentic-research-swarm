@@ -8,8 +8,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from lunagentic_research_swarm.errors import STORAGE_COMMIT_FAILED
+from lunagentic_research_swarm.feedback import REMINDER_TERMINAL_STATUSES
 from lunagentic_research_swarm.models import TaskStatus
-from lunagentic_research_swarm.runtime.events import RuntimeEvent
+from lunagentic_research_swarm.runtime.events import ContinueRequested, RuntimeEvent
 from lunagentic_research_swarm.runtime.reducer import _replace_state, _state_round_id, reduce_event
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
 
@@ -25,6 +26,7 @@ class TaskController:
         scheduler: Any | None = None,
         executor: Any | None = None,
         health: Any = None,
+        feedback: Any | None = None,
     ) -> None:
         self.state = state
         self.store = store
@@ -32,6 +34,7 @@ class TaskController:
         if self.scheduler is None:
             raise TypeError("TaskController 需要 scheduler/executor")
         self.health = health
+        self.feedback = feedback
         self._inbox: deque[RuntimeEvent] = deque()
         self._lock = asyncio.Lock()
         self.stopped = False
@@ -106,6 +109,8 @@ class TaskController:
             return False
         try:
             commands = transition.commands if transition.error is not None else (*transition.commands, *extra_commands)
+            if transition.error is None:
+                commands = (*commands, *self._feedback_commands(event, transition.next_state))
             await self.store.transact(commands)
         except Exception as exc:
             await self._fail_after_storage_error(event, exc)
@@ -124,6 +129,35 @@ class TaskController:
         for effect in selected_effects:
             await self.scheduler.enqueue(effect)
         return True
+
+    def _feedback_commands(self, event: RuntimeEvent, next_state: Any) -> tuple[StoreCommand, ...]:
+        """终态同事务插入 reminder；continue/new round 取消 pending。"""
+
+        feedback = self.feedback
+        if feedback is None:
+            return ()
+        builder = getattr(feedback, "commands_for_status_transition", None)
+        if not callable(builder):
+            return ()
+        new_status = getattr(getattr(next_state, "status", None), "value", None) or str(
+            getattr(next_state, "status", "")
+        )
+        cancel_round_id: str | None = None
+        if isinstance(event, ContinueRequested):
+            cancel_round_id = str(event.round_id)
+        elif new_status not in REMINDER_TERMINAL_STATUSES:
+            return ()
+        round_id = _state_round_id(next_state) or event.round_id
+        ended_at = float(event.occurred_at.timestamp())
+        return tuple(
+            builder(
+                task_id=event.task_id,
+                round_id=str(round_id),
+                new_status=str(new_status),
+                ended_at=ended_at,
+                cancel_round_id=cancel_round_id,
+            )
+        )
 
     async def _fail_after_storage_error(self, event: RuntimeEvent, exc: Exception) -> None:
         self.state = _replace_state(

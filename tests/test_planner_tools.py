@@ -61,7 +61,7 @@ def test_runtime_planner_tool_names_are_plain(plugin_module) -> None:
     assert names == {
         "start_deep_research", "pause_deep_research", "continue_deep_research",
         "stop_deep_research", "add_research_context", "get_research_status",
-        "list_research_tasks",
+        "list_research_tasks", "submit_research_feedback",
     }
 
 

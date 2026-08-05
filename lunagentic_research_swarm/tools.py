@@ -75,6 +75,49 @@ LIST_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+FEEDBACK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "string", "minLength": 1, "description": "调查任务 ID。"},
+        "round_number": {"type": "integer", "minimum": 1, "description": "可选 round 编号；默认当前 round。"},
+        "disposition": {
+            "type": "string",
+            "enum": ["accepted", "mixed", "rejected", "superseded"],
+            "description": "反馈处置：接受/部分正确/拒绝/显式取代旧反馈。",
+        },
+        "rating": {"type": "integer", "minimum": 1, "maximum": 5, "description": "可选评分 1..5。"},
+        "useful_findings": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "有用的结论或证据。",
+        },
+        "incorrect_findings": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "错误的结论或证据。",
+        },
+        "missing_information": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "缺失信息。",
+        },
+        "decision": {"type": "string", "description": "Maisaka/用户最终采用的决定。"},
+        "outcome": {"type": "string", "description": "后续实际结果。"},
+        "corrections": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "明确纠正。",
+        },
+        "notes": {"type": "string", "description": "补充说明。"},
+        "supersedes_feedback_id": {
+            "type": "string",
+            "description": "仅 disposition=superseded 时必填，引用同 Task 已有 feedback。",
+        },
+    },
+    "required": ["task_id", "disposition"],
+    "additionalProperties": False,
+}
+
 PUBLIC_TASK_FIELDS = (
     "task_id", "status", "round_id", "round_number", "generation", "active_leaves",
     "raw_context_released", "created_at", "initial_credits", "effective_time_budget_seconds",
@@ -262,7 +305,7 @@ def manager_error(
 
 
 __all__ = [
-    "CONTEXT_SCHEMA", "CONTINUE_SCHEMA", "LIST_SCHEMA", "START_SCHEMA", "STOP_SCHEMA", "TASK_SCHEMA",
+    "CONTEXT_SCHEMA", "CONTINUE_SCHEMA", "FEEDBACK_SCHEMA", "LIST_SCHEMA", "START_SCHEMA", "STOP_SCHEMA", "TASK_SCHEMA",
     "failure_result", "invoke_manager", "manager_error", "mutation_failure_result", "parse_iso_timestamp", "public_task_dto",
     "success_result", "validate_adjustment", "validate_effort", "validate_iso_timestamp", "validate_nonblank",
     "validate_status", "validate_time_budget",

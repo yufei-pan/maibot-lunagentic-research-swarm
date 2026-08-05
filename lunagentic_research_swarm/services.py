@@ -22,6 +22,7 @@ from lunagentic_research_swarm.config import AgentOverride, LRSConfig, Procedure
 from lunagentic_research_swarm.errors import LRSError
 from lunagentic_research_swarm.extensions.contracts import ExtensionRefreshDelta
 from lunagentic_research_swarm.extensions.discovery import ExtensionDiscovery
+from lunagentic_research_swarm.feedback import FeedbackService
 from lunagentic_research_swarm.llm.gateway import (
     HostModelSnapshotReader,
     LLMGateway,
@@ -151,6 +152,7 @@ class LRSServiceContainer:
         self._config = config.model_copy(deep=True)
         self._store = store_factory(Path(ctx.paths.data_dir) / "lrs-state.sqlite3")
         self.outbox: MaisakaOutbox | None = None
+        self.feedback: FeedbackService | None = None
         self.vector_index: VectorIndex | None = None
         self.manager: ResearchManager | None = None
         self.scheduler: FairScheduler | None = None
@@ -284,6 +286,22 @@ class LRSServiceContainer:
                 }
             else:
                 self._status["maisaka_outbox"] = {"status": "degraded", "code": "maisaka_unavailable"}
+            self.feedback = FeedbackService(
+                self._store,
+                vector_index=self.vector_index,
+                outbox=self.outbox,
+                feedback_wait_seconds=int(self._config.timing.feedback_wait_seconds),
+                reminders_enabled=bool(self._config.feedback.reminders_enabled),
+                index_lessons=bool(self._config.feedback.index_lessons),
+                max_lesson_chars=int(self._config.feedback.max_lesson_chars),
+                poll_interval_seconds=self._outbox_poll_seconds,
+            )
+            await self.feedback.start()
+            self._status["feedback"] = {
+                "status": "healthy",
+                "reminders_enabled": bool(self._config.feedback.reminders_enabled),
+                "index_lessons": bool(self._config.feedback.index_lessons),
+            }
             interrupted = await self._store.mark_active_rounds_interrupted(time.time())
             self._status["legacy_rounds"] = {
                 "status": "healthy",
@@ -352,11 +370,13 @@ class LRSServiceContainer:
         resources: tuple[tuple[str, Any | None], ...] = (
             ("runtime_scheduler", self.scheduler),
             ("extension_discovery", self._discovery),
+            ("feedback", self.feedback),
             ("vector_index", self.vector_index),
             ("maisaka_outbox", self.outbox),
             ("sqlite", self._store),
         )
         self._discovery = None
+        self.feedback = None
         self.vector_index = None
         self.outbox = None
         manager = self.manager
@@ -453,6 +473,7 @@ class LRSServiceContainer:
             grace_period_seconds=int(config.timing.grace_period_seconds),
             agent_live_provider=self.agent_registry.is_live,
             runtime_limits=self._safety_limits,
+            feedback_service=self.feedback,
         )
         runner.bind_manager(manager)
         self._effect_runner = runner
@@ -848,12 +869,20 @@ class LRSServiceContainer:
                 except BaseException as exc:
                     if close_error is None:
                         close_error = exc
+            if self.feedback is not None:
+                try:
+                    await self.feedback.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+                self.feedback = None
             if self.outbox is not None:
                 try:
                     await self.outbox.close()
                 except BaseException as exc:
                     if close_error is None:
                         close_error = exc
+                self.outbox = None
             if self.vector_index is not None:
                 try:
                     await self.vector_index.close()

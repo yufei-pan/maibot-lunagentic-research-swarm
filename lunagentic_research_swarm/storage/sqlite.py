@@ -120,6 +120,7 @@ class SQLiteStateStore:
                     "insert_extension_fingerprint": self._insert_extension_fingerprint,
                     "insert_feedback_event": self._insert_feedback_event,
                     "insert_feedback_reminder": self._insert_feedback_reminder,
+                    "cancel_pending_feedback_reminders": self._cancel_pending_feedback_reminders,
                     "insert_outbox": self._insert_outbox,
                     "complete_outbox_append": self._complete_outbox_append,
                     "mark_outbox_delivered": self._mark_outbox_delivered,
@@ -606,6 +607,17 @@ class SQLiteStateStore:
                 values["status"],
                 values.get("triggered_at"),
             ),
+        )
+
+    @staticmethod
+    def _cancel_pending_feedback_reminders(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        connection.execute(
+            """
+            UPDATE feedback_reminders
+            SET status = 'cancelled'
+            WHERE round_id = ? AND status = 'pending'
+            """,
+            (values["round_id"],),
         )
 
     @staticmethod

@@ -13,10 +13,12 @@ if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
 from lunagentic_research_swarm.config import LRSConfig, normalize_config  # noqa: E402
+from lunagentic_research_swarm.feedback import validate_feedback_arguments  # noqa: E402
 from lunagentic_research_swarm.services import LRSServiceContainer  # noqa: E402
 from lunagentic_research_swarm.tools import (  # noqa: E402
     CONTEXT_SCHEMA,
     CONTINUE_SCHEMA,
+    FEEDBACK_SCHEMA,
     LIST_SCHEMA,
     START_SCHEMA,
     STOP_SCHEMA,
@@ -352,6 +354,79 @@ class LunagenticResearchSwarmPlugin(MaiBotPlugin):
             "success": True,
             "tasks": [public_task_dto(item) for item in tasks[:limit] if isinstance(item, Mapping)],
             "limit": limit,
+        }
+
+    @Tool(
+        "submit_research_feedback",
+        description="提交对深度调查结果的质量反馈、纠正与实际 outcome；事件追加写入并生成可检索 lesson。",
+        parameters=FEEDBACK_SCHEMA,
+        core_tool=True,
+        visibility="visible",
+    )
+    async def submit_research_feedback(
+        self,
+        task_id: str,
+        disposition: str,
+        round_number: int | None = None,
+        rating: int | None = None,
+        useful_findings: list[str] | None = None,
+        incorrect_findings: list[str] | None = None,
+        missing_information: list[str] | None = None,
+        decision: str | None = None,
+        outcome: str | None = None,
+        corrections: list[str] | None = None,
+        notes: str | None = None,
+        supersedes_feedback_id: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        payload = {
+            "task_id": task_id,
+            "disposition": disposition,
+            "round_number": round_number,
+            "rating": rating,
+            "useful_findings": useful_findings,
+            "incorrect_findings": incorrect_findings,
+            "missing_information": missing_information,
+            "decision": decision,
+            "outcome": outcome,
+            "corrections": corrections,
+            "notes": notes,
+            "supersedes_feedback_id": supersedes_feedback_id,
+        }
+        if (message := validate_feedback_arguments(payload)) is not None:
+            return failure_result("invalid_argument", message, task_id=task_id if isinstance(task_id, str) else None)
+        services = self._services
+        feedback = getattr(services, "feedback", None) if services is not None else None
+        if feedback is None:
+            return failure_result("feedback_unavailable", "反馈服务尚未初始化", task_id=task_id)
+        try:
+            result = await feedback.submit(
+                task_id=task_id,
+                disposition=disposition,
+                round_number=round_number,
+                rating=rating,
+                useful_findings=useful_findings,
+                incorrect_findings=incorrect_findings,
+                missing_information=missing_information,
+                decision=decision,
+                outcome=outcome,
+                corrections=corrections,
+                notes=notes,
+                supersedes_feedback_id=supersedes_feedback_id,
+            )
+        except LookupError as exc:
+            return failure_result("task_not_found", str(exc)[:256], task_id=task_id)
+        except ValueError as exc:
+            return failure_result("invalid_argument", str(exc)[:256], task_id=task_id)
+        except Exception:
+            return failure_result("feedback_error", "反馈提交失败", task_id=task_id)
+        return {
+            "success": True,
+            "feedback_id": result.feedback_id,
+            "lesson_id": result.lesson_id,
+            "disposition": result.disposition,
+            "task_id": task_id,
+            "round_id": result.round_id,
         }
 
     def _default_time_budget_seconds(self) -> int:

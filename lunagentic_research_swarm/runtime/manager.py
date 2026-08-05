@@ -88,6 +88,7 @@ class ResearchManager:
         report_coordinator_factory: Any | None = None,
         agent_live_provider: Any | None = None,
         runtime_limits: dict[str, Any] | None = None,
+        feedback_service: Any | None = None,
     ) -> None:
         self.ctx, self.store, self.summarizer, self.scheduler = ctx, store, summarizer, scheduler
         self._snapshot_provider = snapshot_provider
@@ -111,6 +112,7 @@ class ResearchManager:
         self._round_snapshots: dict[str, Any] = {}
         self._prompt_builders: dict[str, StablePromptBuilder] = {}
         self._bot_profiles: dict[str, dict[str, Any]] = {}
+        self._feedback_service = feedback_service
         self._shutting_down = False
 
     async def start(
@@ -144,7 +146,12 @@ class ResearchManager:
 
         task_id, round_id, created_at = new_task_id(), new_round_id(), _now()
         state = RuntimeState(task_id, TaskStatus.FORMALIZING, generation=0, active_round_id=round_id)
-        controller = TaskController(state, store=self.store, scheduler=self.scheduler)
+        controller = TaskController(
+            state,
+            store=self.store,
+            scheduler=self.scheduler,
+            feedback=self._feedback_service,
+        )
         initial = (
             StoreCommand("insert_task", {"task_id": task_id, "stream_id": stream_id, "current_round_number": 1, "created_at": created_at}),
             StoreCommand("insert_round", {
