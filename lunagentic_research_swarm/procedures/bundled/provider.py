@@ -17,6 +17,11 @@ from lunagentic_research_swarm.procedures.bundled.memory import (
     MEMORY_HANDLERS,
     memory_procedure_definitions,
 )
+from lunagentic_research_swarm.procedures.bundled.past_cases import (
+    PAST_CASES_PROCEDURE_ID,
+    make_past_cases_handler,
+    past_cases_procedure_definitions,
+)
 from lunagentic_research_swarm.procedures.bundled.provenance import (
     PROVENANCE_HANDLERS,
     provenance_procedure_definitions,
@@ -39,8 +44,12 @@ class BundledProcedureProvider:
         web_search: WebSearchService | None = None,
         web_search_config: WebSearchSection | None = None,
         http_client: Any | None = None,
+        store: Any | None = None,
+        vector_index: Any | None = None,
     ) -> None:
         self.ctx = ctx
+        self._store = store
+        self._vector_index = vector_index
         self._owns_http = False
         if web_search is not None:
             self._web_search = web_search
@@ -53,14 +62,38 @@ class BundledProcedureProvider:
             else:
                 self._http = http_client
             self._web_search = WebSearchService(section, self._http)
+        self._past_cases_handler = make_past_cases_handler(store=store, vector_index=vector_index)
         self._handlers = dict(MEMORY_HANDLERS)
         self._handlers.update(ANALYSIS_HANDLERS)
         self._handlers.update(PROVENANCE_HANDLERS)
         self._handlers[WEB_SEARCH_PROCEDURE_ID] = make_web_search_handler(self._web_search)
+        self._handlers[PAST_CASES_PROCEDURE_ID] = self._past_cases_handler
 
     @property
     def web_search(self) -> WebSearchService:
         return self._web_search
+
+    @property
+    def store(self) -> Any | None:
+        return self._store
+
+    @property
+    def vector_index(self) -> Any | None:
+        return self._vector_index
+
+    def bind_case_index(self, *, store: Any | None = None, vector_index: Any | None = None) -> None:
+        """启动后绑定 SQLite / VectorIndex（向量层可能晚于 builtin provider 就绪）。"""
+
+        if store is not None:
+            self._store = store
+        if vector_index is not None:
+            self._vector_index = vector_index
+        deps = getattr(self._past_cases_handler, "_past_cases_deps", None)
+        if isinstance(deps, dict):
+            if store is not None:
+                deps["store"] = store
+            if vector_index is not None:
+                deps["vector_index"] = vector_index
 
     def describe(self) -> list[dict[str, Any]]:
         """返回可交给 ProcedureRegistry.replace_provider 的 model_dump payload。"""
@@ -70,6 +103,7 @@ class BundledProcedureProvider:
             + analysis_procedure_definitions()
             + provenance_procedure_definitions()
             + web_search_procedure_definitions(self._web_search)
+            + past_cases_procedure_definitions()
         )
         return [item.model_dump(mode="json") for item in definitions]
 

@@ -326,10 +326,16 @@ class LRSServiceContainer:
         if isinstance(loaded, BundledProcedureProvider):
             if loaded.ctx is None:
                 loaded.ctx = self._ctx
+            loaded.bind_case_index(store=self._store, vector_index=self.vector_index)
             self._bundled_procedure_provider = loaded
             return
         # 自定义 loader 未返回 provider 时仍创建 durable 实例，供 executor 本地 invoker 使用。
-        provider = BundledProcedureProvider(self._ctx, web_search_config=web_search_config)
+        provider = BundledProcedureProvider(
+            self._ctx,
+            web_search_config=web_search_config,
+            store=self._store,
+            vector_index=self.vector_index,
+        )
         if "builtin" not in self.procedure_registry.provider_ids:
             self.procedure_registry.replace_provider("builtin", provider.describe())
         self._bundled_procedure_provider = provider
