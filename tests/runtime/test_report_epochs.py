@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,8 @@ class FakeStore:
 
 class FakeSummarizer:
     def __init__(self) -> None:
+        self.task_failure: SimpleNamespace | None = None
+        self.branch_failure: SimpleNamespace | None = None
         self.gate = asyncio.Event()
         self.gate.set()
         self.task_requests = []
@@ -34,11 +37,15 @@ class FakeSummarizer:
     async def finalize_branch(self, request):
         self.branch_requests.append(request)
         await self.gate.wait()
+        if self.branch_failure is not None:
+            return SummaryResult(False, "", "fake", None, self.branch_failure)
         return SummaryResult(True, f"branch:{request.branch_history[-1]['content']}", "fake", None, None)
 
     async def finalize_task(self, request):
         self.task_requests.append(request)
         await self.gate.wait()
+        if self.task_failure is not None:
+            return SummaryResult(False, "", "fake", None, self.task_failure)
         return SummaryResult(True, "task synthesis", "fake", None, None)
 
 
@@ -147,3 +154,43 @@ async def test_synthesis_uses_coverage_snapshot_taken_before_later_terminal_summ
     assert report.kind is ReportKind.INTERMEDIATE
     assert [item.summary_id for item in report.coverage.items] == [checkpoint_id]
     assert report_harness.coordinator.reports[-1].kind is ReportKind.FINAL
+
+
+@pytest.mark.asyncio
+async def test_final_synthesis_failure_record_preserves_safe_error_fields(report_harness: ReportHarness) -> None:
+    branch = report_harness.branch("A")
+    report_harness.coordinator.branches["B"] = BranchRuntime(
+        branch_id="B", task=branch.task, catalog_fingerprint="catalog", generation=0,
+        messages=[{"role": "assistant", "content": "B stable"}], credits=1.0, depth=1,
+    )
+    report_harness.summarizer.task_failure = SimpleNamespace(
+        code="provider_unavailable", message="summary provider unavailable"
+    )
+
+    await report_harness.coordinator.on_branch_safe_point("A", terminal=True)
+    await report_harness.coordinator.on_branch_safe_point("B", terminal=True)
+    await report_harness.coordinator.wait_for_synthesis()
+
+    record = report_harness.coordinator.reports[-1]
+    assert record.kind is ReportKind.FINAL
+    assert record.status == "FAILED"
+    assert record.error_code == "provider_unavailable"
+    assert record.error_message == "summary provider unavailable"
+    assert "任务文本必须逐字保持" not in record.error_message
+    persisted = [dict(command.values) for command in report_harness.store.commands if command.kind == "insert_report"]
+    assert persisted[-1]["status"] == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_failed_branch_summary_is_durable_and_final_coverage_degrades(report_harness: ReportHarness) -> None:
+    report_harness.summarizer.branch_failure = SimpleNamespace(
+        code="provider_unavailable", message="branch summary unavailable"
+    )
+
+    await report_harness.coordinator.on_branch_safe_point("A", terminal=True)
+    await report_harness.coordinator.wait_for_synthesis()
+
+    summaries = [dict(command.values) for command in report_harness.store.commands if command.kind == "insert_summary"]
+    assert summaries[-1]["status"] == "FAILED"
+    assert summaries[-1]["error_code"] == "provider_unavailable"
+    assert report_harness.coordinator.reports[-1].status == "DEGRADED"

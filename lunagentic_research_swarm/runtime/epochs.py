@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -33,6 +34,23 @@ def _new_id(prefix: str) -> str:
 
 def _history_copy(messages: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
     return tuple(dict(message) for message in messages)
+
+
+def _safe_synthesis_error(
+    error: Any,
+    *,
+    formalized_task: FormalizedTask,
+    coverage: CoverageSet,
+) -> tuple[str, str]:
+    """Extract bounded lifecycle metadata without echoing report inputs."""
+
+    raw_code = str(getattr(error, "code", "") or "")
+    code = raw_code if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", raw_code) else "report_synthesis_failed"
+    raw_message = str(getattr(error, "message", "") or "")
+    sensitive = (formalized_task.text, *(item.text or "" for item in coverage.items))
+    if not raw_message or any(token and token in raw_message for token in sensitive):
+        return code, "报告总结器不可用。"
+    return code, raw_message[:512]
 
 
 @dataclass(slots=True)
@@ -75,6 +93,11 @@ class ReportRecord:
     status: str
     created_at: float
     coverage: CoverageSet
+    # Error details are kept separate from the rendered report body.  The body
+    # may contain user/task evidence, while these fields are safe lifecycle
+    # metadata for the controller callback.
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 # Public name from the runtime contract.  The immutable implementation lives
@@ -295,9 +318,12 @@ class ReportCoordinator:
         if not coverage.items:
             body = "当前尚无可用分支摘要；调查仍在进行。" if frozen_kind is ReportKind.INTERMEDIATE else "没有可用的终结摘要。"
             status = "DEGRADED"
+            error_code = "report_coverage_unavailable"
+            error_message = "最终报告没有可用的终结摘要。" if frozen_kind is ReportKind.FINAL else "报告 coverage 暂不可用。"
         elif len(coverage.items) == 1:
             body = coverage.items[0].text or ""
             status = "SUCCEEDED"
+            error_code = error_message = None
         else:
             request = TaskFinalizationRequest(
                 formalized_task=self.formalized_task,
@@ -309,8 +335,13 @@ class ReportCoordinator:
             result = await self.summarizer.finalize_task(request)
             if result.success and result.text.strip():
                 body, status = result.text, "SUCCEEDED"
+                error_code = error_message = None
             else:
                 body, status = "报告总结器不可用；以下为已提交 coverage。", "FAILED"
+                error = getattr(result, "error", None)
+                error_code, error_message = _safe_synthesis_error(
+                    error, formalized_task=self.formalized_task, coverage=coverage,
+                )
                 if frozen_kind is ReportKind.FINAL:
                     body = "最终报告总结器不可用；以下为已提交终结 coverage。"
         created_at = float(self.clock())
@@ -345,7 +376,10 @@ class ReportCoordinator:
             }),
         )
         await self.store.transact(commands)
-        record = ReportRecord(report_id, report_epoch.epoch, frozen_kind, text, status, created_at, coverage)
+        record = ReportRecord(
+            report_id, report_epoch.epoch, frozen_kind, text, status, created_at, coverage,
+            error_code, error_message,
+        )
         self.reports.append(record)
         report_epoch.synthesis_finished = True
         self.deadline_at = created_at + self.time_budget_seconds

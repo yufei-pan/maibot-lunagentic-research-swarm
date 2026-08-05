@@ -36,6 +36,7 @@ from lunagentic_research_swarm.runtime.events import (
     PauseExpired,
     PauseRequested,
     FinalReportCompleted,
+    FinalReportFailed,
     ReportCompleted,
     ReportDeadlineReached,
     StopRequested,
@@ -458,9 +459,19 @@ class ResearchManager:
                 state = controller.state
             if state.status not in {TaskStatus.REPORTING, TaskStatus.FINALIZING}:
                 return
-            event = FinalReportCompleted(
-                _event_id(), task_id, state.active_round_id or "", state.generation, report_id=record.report_id
-            )
+            if record.status == "SUCCEEDED":
+                event = FinalReportCompleted(
+                    _event_id(), task_id, state.active_round_id or "", state.generation, report_id=record.report_id
+                )
+            else:
+                # Never derive an error from the rendered report text: it may
+                # contain formalized task/coverage prompt data.  The
+                # coordinator carries only provider/error metadata separately.
+                event = FinalReportFailed(
+                    _event_id(), task_id, state.active_round_id or "", state.generation,
+                    error_code=getattr(record, "error_code", None) or "final_report_failed",
+                    error_message=getattr(record, "error_message", None) or "最终报告生成失败。",
+                )
         else:
             if state.status is not TaskStatus.REPORTING:
                 return

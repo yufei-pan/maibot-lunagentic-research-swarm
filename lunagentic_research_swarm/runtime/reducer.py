@@ -876,8 +876,8 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         )
 
     if isinstance(event, FinalReportFailed):
-        if status is not TaskStatus.FINALIZING:
-            return _invalid(state, event, "FinalReportFailed 只能用于 FINALIZING")
+        if status not in {TaskStatus.FINALIZING, TaskStatus.REPORTING}:
+            return _invalid(state, event, "FinalReportFailed 只能用于活跃报告 round")
         return _transition_status(
             state,
             event,
