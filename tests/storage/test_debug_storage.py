@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition
 from lunagentic_research_swarm.llm.gateway import GenerationResult
 from lunagentic_research_swarm.llm.pricing import TokenUsage
 from lunagentic_research_swarm.llm.protocol import ProcedureRequest
@@ -19,8 +20,6 @@ from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformP
 from lunagentic_research_swarm.runtime.turns import TurnWorker
 from lunagentic_research_swarm.storage.debug import DebugStore
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
-from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition
-
 
 class _FakeLLM:
     async def generate(self, request: Any) -> GenerationResult:
@@ -53,15 +52,16 @@ class _FakeAPI:
 
 
 class _FakeVector:
+    """签名对齐真实 ``VectorIndex.enqueue(*, source_kind, source_id)``。"""
+
     def __init__(self) -> None:
-        self.texts: list[str] = []
+        self.calls: list[dict[str, str]] = []
 
     def contains(self, needle: str) -> bool:
-        return any(needle in text for text in self.texts)
+        return any(needle in f"{c['source_kind']}:{c['source_id']}" for c in self.calls)
 
-    async def enqueue(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
-        text = kwargs.get("text") or (args[1] if len(args) > 1 else "")
-        self.texts.append(str(text))
+    async def enqueue(self, *, source_kind: str, source_id: str) -> SimpleNamespace:
+        self.calls.append({"source_kind": str(source_kind), "source_id": str(source_id)})
         return SimpleNamespace(success=True, status="indexed")
 
 
@@ -222,7 +222,12 @@ class DebugHarness:
         )
         assert "raw-agent-secret" not in encoded
         assert "raw-procedure-secret" not in encoded
-        await self.vector.enqueue("formalized_task", "lrs_debug", text="formalized only")
+        # Turn 路径不得向向量索引投递 debug raw；假对象签名与生产一致。
+        assert self.vector.calls == []
+        await self.vector.enqueue(source_kind="formalized_task", source_id="lrs_debug")
+        assert self.vector.calls == [{"source_kind": "formalized_task", "source_id": "lrs_debug"}]
+        assert not self.vector_text_contains("raw-agent-secret")
+        assert not self.vector_text_contains("raw-procedure-secret")
 
     def _record_failure(self, payload: dict[str, Any]) -> None:
         self._authority_errors.append(dict(payload))
@@ -279,6 +284,27 @@ async def test_debug_write_failure_does_not_block_authority_and_records_minimal_
 ) -> None:
     store = SQLiteStateStore(tmp_path / "state.sqlite3")
     await store.open()
+    await store.transact(
+        [
+            StoreCommand(
+                "insert_task",
+                {"task_id": "lrs_fail", "stream_id": "s", "created_at": 1.0},
+            ),
+            StoreCommand(
+                "insert_round",
+                {
+                    "round_id": "rnd_fail",
+                    "task_id": "lrs_fail",
+                    "round_number": 1,
+                    "generation": 1,
+                    "status": "RUNNING",
+                    "time_budget_seconds": 60,
+                    "credit_pool": 10.0,
+                    "started_at": 1.0,
+                },
+            ),
+        ]
+    )
     failures: list[dict[str, Any]] = []
 
     class BrokenDebug(DebugStore):
@@ -319,5 +345,44 @@ async def test_debug_write_failure_does_not_block_authority_and_records_minimal_
     assert failures
     assert all(item.get("code") == "debug_storage_failed" for item in failures)
     assert all("raw-agent-secret" not in json.dumps(item, ensure_ascii=False) for item in failures)
+    # 权威侧：fingerprint 落库，且后续权威写事务仍可成功。
+    fingerprints = await store.run_locked(
+        lambda connection: connection.execute(
+            "SELECT provider_plugin_id, extension_kind, fingerprint, availability, error_json "
+            "FROM extension_fingerprints"
+        ).fetchall()
+    )
+    assert fingerprints
+    assert any(
+        str(row["fingerprint"]) == "debug_storage_failed"
+        and str(row["extension_kind"]) == "debug_storage"
+        and str(row["availability"]) == "error"
+        and "raw-agent-secret" not in str(row["error_json"] or "")
+        for row in fingerprints
+    )
+    await store.transact(
+        [
+            StoreCommand(
+                "insert_lifecycle_event",
+                {
+                    "event_id": "e_authority",
+                    "task_id": "lrs_fail",
+                    "round_id": "rnd_fail",
+                    "event_type": "ContinueRequested",
+                    "from_status": "RUNNING",
+                    "to_status": "RUNNING",
+                    "metadata_json": "{}",
+                    "created_at": 2.0,
+                },
+            )
+        ]
+    )
+    events = await store.run_locked(
+        lambda connection: connection.execute(
+            "SELECT event_id FROM lifecycle_events WHERE event_id = ?",
+            ("e_authority",),
+        ).fetchall()
+    )
+    assert len(events) == 1
     await debug.close()
     await store.close()

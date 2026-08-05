@@ -498,6 +498,8 @@ class LRSServiceContainer:
             agent_live_provider=self.agent_registry.is_live,
             runtime_limits=self._safety_limits,
             feedback_service=self.feedback,
+            statistics=self.statistics,
+            summarizer_selector=summarizer_selector,
         )
         runner.bind_manager(manager)
         self._effect_runner = runner

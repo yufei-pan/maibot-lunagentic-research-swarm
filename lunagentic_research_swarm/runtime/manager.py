@@ -47,6 +47,7 @@ from lunagentic_research_swarm.runtime.events import (
     ReportDeadlineReached,
     StopRequested,
 )
+from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage
 from lunagentic_research_swarm.runtime.reducer import (
     NotifyToolWaiter,
     OpenReportEpoch,
@@ -89,6 +90,8 @@ class ResearchManager:
         agent_live_provider: Any | None = None,
         runtime_limits: dict[str, Any] | None = None,
         feedback_service: Any | None = None,
+        statistics: Any | None = None,
+        summarizer_selector: str = "task:mid_memory",
     ) -> None:
         self.ctx, self.store, self.summarizer, self.scheduler = ctx, store, summarizer, scheduler
         self._snapshot_provider = snapshot_provider
@@ -113,8 +116,10 @@ class ResearchManager:
         self._prompt_builders: dict[str, StablePromptBuilder] = {}
         self._bot_profiles: dict[str, dict[str, Any]] = {}
         self._feedback_service = feedback_service
+        self.statistics = statistics
+        self._summarizer_selector = str(summarizer_selector or "task:mid_memory")
         self._shutting_down = False
-
+   
     async def start(
         self,
         *,
@@ -188,6 +193,18 @@ class ResearchManager:
             result = await self.summarizer.formalize_task(FormalizationRequest(raw_context=raw_context, chat_messages=readable))
             if not result.success or not result.text.strip():
                 raise RuntimeError(getattr(getattr(result, "error", None), "message", "formalization_failed"))
+            meter_commands = meter_summarizer_usage(
+                role="formalizer",
+                task_id=task_id,
+                round_id=controller.state.active_round_id or "",
+                selector=self._summarizer_selector,
+                catalog=getattr(snapshot, "price_catalog", None),
+                model_name=str(getattr(result, "model_name", "") or ""),
+                usage=getattr(result, "usage", None),
+                created_at=_now(),
+            )
+            if meter_commands:
+                await self.store.transact(meter_commands)
             formalized = FormalizedTask.create(result.text)
             branch_id, now = new_branch_id(), _now()
             root_entry = snapshot.agent_catalog.get(snapshot.root_agent)
@@ -857,6 +874,9 @@ class ResearchManager:
             time_budget_seconds=time_budget_seconds,
             grace_period_seconds=self._grace_period_seconds,
             credit_pool=0.0,
+            statistics=self.statistics,
+            price_catalog=getattr(self._round_snapshots.get(task_id), "price_catalog", None),
+            summarizer_selector=self._summarizer_selector,
         )
 
     def _restore_round_ephemeral(

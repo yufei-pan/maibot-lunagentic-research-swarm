@@ -315,8 +315,8 @@ def _token_fields(
     return values
 
 
-def _role_is_research(role: str) -> bool:
-    return role.casefold() not in {
+SUMMARIZER_ROLES = frozenset(
+    {
         "summarizer",
         "summary",
         "formalizer",
@@ -325,6 +325,85 @@ def _role_is_research(role: str) -> bool:
         "branch_summarizer",
         "task_summarizer",
     }
+)
+
+
+def is_summarizer_role(role: str) -> bool:
+    """总结器 / 形式化等非研究角色；写 usage 但不扣研究余额。"""
+
+    return str(role or "").casefold() in SUMMARIZER_ROLES
+
+
+def is_research_role(role: str) -> bool:
+    return not is_summarizer_role(role)
+
+
+def _role_is_research(role: str) -> bool:
+    return is_research_role(role)
+
+
+def meter_summarizer_usage(
+    *,
+    role: str,
+    task_id: str,
+    round_id: str,
+    branch_id: str | None = None,
+    call_id: str | None = None,
+    selector: str = "",
+    catalog: PriceCatalog | None = None,
+    model_name: str = "",
+    usage: TokenUsage | Mapping[str, Any] | None = None,
+    duration_ms: int = 0,
+    created_at: float | datetime = 0.0,
+) -> tuple[StoreCommand, ...]:
+    """生产路径：总结器 ``reserve_input`` + ``reconcile_usage``（无 research ledger）。
+
+    无 usage 时不写入。``role`` 必须是 :data:`SUMMARIZER_ROLES` 之一。
+    """
+
+    if not is_summarizer_role(role):
+        raise ValueError(f"meter_summarizer_usage 需要总结器 role，收到 {role!r}")
+    if usage is None:
+        return ()
+    model = str(model_name or "")
+    estimated_charge = 0.0
+    if catalog is not None and model:
+        try:
+            prompt, completion, hit, miss = _token_fields(usage)
+            charged = catalog.charge_actual(
+                actual_model_name=model,
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                cache_hit_tokens=hit,
+                cache_miss_tokens=miss,
+            )
+            estimated_charge = charged.credits
+        except (TypeError, ValueError):
+            estimated_charge = 0.0
+    call_key = call_id or f"sum_{uuid.uuid4().hex}"
+    reservation = reserve_input(
+        estimated_charge,
+        task_id=task_id,
+        round_id=round_id,
+        branch_id=branch_id,
+        call_id=call_key,
+        role=role,
+        selector=selector,
+        estimated_model_name=model or None,
+        catalog=catalog,
+        estimated_usage=usage if isinstance(usage, (TokenUsage, Mapping)) else None,
+        duration_ms=duration_ms,
+        created_at=created_at,
+    )
+    reconciliation = reconcile_usage(
+        reservation,
+        catalog=catalog,
+        actual_model_name=model or None,
+        usage=usage,
+        success=True,
+        created_at=created_at,
+    )
+    return (*reservation.commands, *reconciliation.commands)
 
 
 def reserve_input(
