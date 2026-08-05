@@ -26,3 +26,5 @@ Task 7: fix round 1/3 (3 addressed, 0 open — terminal-final race, frozen cover
 Task 7: fix round 2/3 (3 addressed, 0 open — final epoch after in-flight synthesis, default runtime bridge, stale epoch guards; commits e0d3acb..458aa95)
 Task 7: fix round 3/3 (1 addressed, 0 open — failed final synthesis error completion and bounded metadata; commits 458aa95..b045676)
 Task 7: complete (commits 2a6ff4e..b045676, review clean; full suite 378 passed)
+Task 8: fix round 1/5 (2 addressed, 0 open — startup resource cleanup and safe outbox error persistence; commits 2c323fb..a8b5730)
+Task 8: complete (commits b045676..a8b5730, review clean; full suite 383 passed)
