@@ -134,6 +134,31 @@ def test_organize_provenance_rejects_duplicate_claim_ids() -> None:
     assert "claim_id" in result.error.message
 
 
+def test_organize_provenance_rejects_duplicate_source_ids() -> None:
+    result = organize_provenance(
+        claims=[{"claim_id": "c1", "text": "x", "source_ids": ["s1"]}],
+        sources=[
+            {
+                "source_id": "s1",
+                "url": "https://example.com/a",
+                "source_type": "web",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "snippet": "a",
+            },
+            {
+                "source_id": "s1",
+                "url": "https://example.com/b",
+                "source_type": "web",
+                "timestamp": "2026-01-02T00:00:00Z",
+                "snippet": "b",
+            },
+        ],
+    )
+    assert not result.success
+    assert result.error.code == "invalid_arguments"
+    assert "source_id" in result.error.message
+
+
 @pytest.mark.asyncio
 async def test_provider_exposes_provenance_procedures() -> None:
     provider = BundledProcedureProvider(SimpleNamespace())

@@ -113,6 +113,14 @@ def test_statistics_quantiles_n_bounds() -> None:
     assert statistics("quantiles", [1.0, 2.0], n=101).error.code == "invalid_arguments"
 
 
+def test_statistics_rejects_non_finite_computed_quantiles() -> None:
+    # 有限输入仍可能外推为 inf；须结构化 invalid_arguments，而非 ValidationError
+    result = statistics("quantiles", [-1e308, 1e308], n=100)
+    assert not result.success
+    assert result.error.code == "invalid_arguments"
+    assert "有限" in result.error.message
+
+
 def test_convert_units_length_and_temperature() -> None:
     meters = convert_units(1.0, "km", "m")
     assert meters.success
@@ -135,6 +143,18 @@ def test_convert_units_rejects_unknown_and_cross_dimension() -> None:
     cross = convert_units(1.0, "m", "kg")
     assert not cross.success
     assert cross.error.code == "incompatible_units"
+
+
+def test_convert_units_rejects_non_finite_result() -> None:
+    # 有限输入换算溢出 → 结构化失败，不抛 ValidationError
+    overflow = convert_units(1e308, "TB", "B")
+    assert not overflow.success
+    assert overflow.error.code == "invalid_arguments"
+    assert "有限" in overflow.error.message
+
+    temp = convert_units(1e308, "C", "F")
+    assert not temp.success
+    assert temp.error.code == "invalid_arguments"
 
 
 @pytest.mark.asyncio

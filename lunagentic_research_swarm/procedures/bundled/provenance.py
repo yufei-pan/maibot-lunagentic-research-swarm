@@ -177,6 +177,8 @@ def organize_provenance(
         source_id = raw.get("source_id")
         if not isinstance(source_id, str) or not source_id:
             return _failure("invalid_arguments", "source_id 必须为非空字符串")
+        if source_id in known_ids:
+            return _failure("invalid_arguments", f"重复的 source_id：{source_id}")
         url_raw = raw.get("url", "")
         if url_raw is None:
             url_raw = ""

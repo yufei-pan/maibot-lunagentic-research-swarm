@@ -84,3 +84,19 @@ PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
   tests/procedures/test_provenance.py -v
 ```
 Result: **31 passed**.
+
+## Review-2 Important Fix Notes
+
+**Findings addressed:**
+
+1. **Non-finite statistics results** — After `mean`/`median`/`stdev`/`pstdev`/`min`/`max`/`quantiles`, `_stats_result_finite` rejects non-finite scalars or list members with `invalid_arguments` (e.g. `quantiles([-1e308, 1e308], n=100)`), avoiding `ProcedureResult` ValidationError → `provider_call_failed`.
+2. **Unit-conversion overflow** — Factor and temperature paths check `math.isfinite(result)` before `_success`; overflow (e.g. `1e308 TB→B`, extreme `C→F`) returns structured `invalid_arguments`.
+3. **Duplicate `source_id`s** — `organize_provenance` rejects repeated `source_id` with `invalid_arguments` before building `known_ids` / `source_rows`, matching the claim_id guard.
+
+**Evidence:**
+```bash
+PYTHONPATH=.:../maibot-plugin-sdk .venv/bin/pytest \
+  tests/procedures/test_analysis.py \
+  tests/procedures/test_provenance.py -v
+```
+Result: **34 passed**.

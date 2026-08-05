@@ -230,7 +230,25 @@ def statistics(operation: str, values: Sequence[Any], n: int | None = None) -> P
     except stats_lib.StatisticsError as exc:
         return _failure("invalid_arguments", str(exc))
 
+    if not _stats_result_finite(value):
+        return _failure("invalid_arguments", "统计结果必须为有限数值")
+
     return _success({"operation": operation, "value": value})
+
+
+def _stats_result_finite(value: Any) -> bool:
+    """标量或列表结果均须可表示为有限 float。"""
+
+    if isinstance(value, (list, tuple)):
+        return all(
+            isinstance(item, int | float)
+            and not isinstance(item, bool)
+            and math.isfinite(float(item))
+            for item in value
+        )
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    return math.isfinite(float(value))
 
 
 def _temperature_convert(value: float, from_unit: str, to_unit: str) -> float:
@@ -274,6 +292,8 @@ def convert_units(value: float | int, from_unit: str, to_unit: str) -> Procedure
         if from_unit not in _TEMPERATURE_UNITS or to_unit not in _TEMPERATURE_UNITS:
             return _failure("incompatible_units", "温度单位不能与其他维度混用")
         result = _temperature_convert(number, from_unit, to_unit)
+        if not math.isfinite(result):
+            return _failure("invalid_arguments", "换算结果必须为有限数值")
         return _success(
             {
                 "value": result,
@@ -293,6 +313,8 @@ def convert_units(value: float | int, from_unit: str, to_unit: str) -> Procedure
         return _failure("incompatible_units", f"不能跨维度换算：{from_dim[0]} → {to_dim[0]}")
     table = from_dim[1]
     result = number * table[from_unit] / table[to_unit]
+    if not math.isfinite(result):
+        return _failure("invalid_arguments", "换算结果必须为有限数值")
     return _success(
         {
             "value": result,
