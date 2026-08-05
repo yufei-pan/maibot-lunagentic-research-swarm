@@ -111,6 +111,7 @@ def _load_builtin_providers(
     procedures: ProcedureRegistry,
     *,
     ctx: Any | None = None,
+    web_search_config: Any | None = None,
 ) -> BundledProcedureProvider:
     """通过与第三方相同的 replace_provider 路径装入内置默认智能体与 Procedures。
 
@@ -120,7 +121,7 @@ def _load_builtin_providers(
 
     from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
 
-    provider = BundledProcedureProvider(ctx)
+    provider = BundledProcedureProvider(ctx, web_search_config=web_search_config)
     agents.replace_provider(
         "builtin",
         [definition.model_dump(mode="json") for definition in bundled_agent_definitions()],
@@ -258,18 +259,27 @@ class LRSServiceContainer:
         """装入内置 agents/procedures，并保留带真实 ctx 的 durable procedure provider。"""
 
         loader = self._builtin_provider_loader
+        web_search_config = self._config.web_search
         try:
-            loaded = loader(self.agent_registry, self.procedure_registry, ctx=self._ctx)
+            loaded = loader(
+                self.agent_registry,
+                self.procedure_registry,
+                ctx=self._ctx,
+                web_search_config=web_search_config,
+            )
         except TypeError:
-            # 测试用两参数 loader 不接受 ctx。
-            loaded = loader(self.agent_registry, self.procedure_registry)
+            try:
+                loaded = loader(self.agent_registry, self.procedure_registry, ctx=self._ctx)
+            except TypeError:
+                # 测试用两参数 loader 不接受 ctx。
+                loaded = loader(self.agent_registry, self.procedure_registry)
         if isinstance(loaded, BundledProcedureProvider):
             if loaded.ctx is None:
                 loaded.ctx = self._ctx
             self._bundled_procedure_provider = loaded
             return
         # 自定义 loader 未返回 provider 时仍创建 durable 实例，供 executor 本地 invoker 使用。
-        provider = BundledProcedureProvider(self._ctx)
+        provider = BundledProcedureProvider(self._ctx, web_search_config=web_search_config)
         if "builtin" not in self.procedure_registry.provider_ids:
             self.procedure_registry.replace_provider("builtin", provider.describe())
         self._bundled_procedure_provider = provider
@@ -606,6 +616,13 @@ class LRSServiceContainer:
             self.agent_registry.set_root_agent(replacement.root_agent)
             self._next_round_state = replacement
             self._safety_limits = detached_limits
+            self._config = config.model_copy(deep=True)
+            if self._bundled_procedure_provider is not None:
+                self._bundled_procedure_provider.web_search.replace_config(self._config.web_search)
+                self.procedure_registry.replace_provider(
+                    "builtin",
+                    self._bundled_procedure_provider.describe(),
+                )
             self._status["config_reload"] = {
                 "status": "healthy",
                 "code": "live_limits_updated",
@@ -768,6 +785,13 @@ class LRSServiceContainer:
                 except BaseException as exc:
                     if close_error is None:
                         close_error = exc
+            if self._bundled_procedure_provider is not None:
+                try:
+                    await self._bundled_procedure_provider.aclose()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+                self._bundled_procedure_provider = None
             try:
                 await self._store.close()
             except BaseException as store_error:

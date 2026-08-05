@@ -30,6 +30,11 @@
       "type": "python_package",
       "name": "httpx",
       "version_spec": ">=0.28.0"
+    },
+    {
+      "type": "python_package",
+      "name": "ddgs",
+      "version_spec": ">=9.14.4"
     }
   ],
   "capabilities": [

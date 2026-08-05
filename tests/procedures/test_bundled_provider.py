@@ -12,7 +12,6 @@ from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedu
 from lunagentic_research_swarm.procedures.registry import ProcedureRegistry
 from lunagentic_research_swarm.services import _load_builtin_providers
 
-
 _EXPECTED_MEMORY_IDS = {
     "builtin.chat_streams",
     "builtin.message_recent",
@@ -21,6 +20,7 @@ _EXPECTED_MEMORY_IDS = {
     "builtin.person_lookup",
     "builtin.knowledge_search",
 }
+_EXPECTED_WEB_SEARCH_ID = "builtin.web_search"
 
 
 class _Knowledge:
@@ -35,10 +35,16 @@ def _provider() -> BundledProcedureProvider:
 def test_describe_returns_six_valid_memory_procedures() -> None:
     payloads = _provider().describe()
     definitions = validate_procedure_batch("builtin", payloads)
-    assert {item.procedure_id for item in definitions} == _EXPECTED_MEMORY_IDS
+    ids = {item.procedure_id for item in definitions}
+    assert _EXPECTED_MEMORY_IDS <= ids
+    assert _EXPECTED_WEB_SEARCH_ID in ids
+    memory = [item for item in definitions if item.procedure_id in _EXPECTED_MEMORY_IDS]
+    web = next(item for item in definitions if item.procedure_id == _EXPECTED_WEB_SEARCH_ID)
     assert all(item.idempotent is True for item in definitions)
-    assert all(item.timeout_seconds == 30.0 for item in definitions)
-    assert all(item.external_cost_kind == "none" for item in definitions)
+    assert all(item.timeout_seconds == 30.0 for item in memory)
+    assert all(item.external_cost_kind == "none" for item in memory)
+    assert web.external_cost_kind == "provider_metered"
+    assert web.idempotent is True
     assert all(item.enabled is True for item in definitions)
 
 
