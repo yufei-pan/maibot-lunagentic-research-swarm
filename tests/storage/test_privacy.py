@@ -59,6 +59,14 @@ EXPECTED_COLUMNS = {
         "job_id", "source_kind", "source_id", "generation", "status",
         "attempt_count", "error_code", "error_json", "created_at", "updated_at",
     ),
+    "vector_generations": (
+        "generation", "selector", "actual_model_name", "model_fingerprint", "dimension",
+        "table_name", "schema_version", "status", "created_at", "activated_at", "retired_at",
+    ),
+    "vector_documents": (
+        "source_kind", "source_id", "generation", "actual_model_name",
+        "model_fingerprint", "dimension", "indexed_at",
+    ),
     "schema_migrations": ("version", "name", "applied_at"),
 }
 
@@ -69,6 +77,7 @@ EXPECTED_INDEXES = {
     "idx_summaries_branch_kind_created",
     "idx_vector_jobs_status",
     "idx_outbox_status_next_attempt",
+    "one_active_vector_generation",
 }
 
 

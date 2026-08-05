@@ -238,4 +238,41 @@ MIGRATIONS: Sequence[Migration] = (
             "CREATE INDEX idx_outbox_status_next_attempt ON maisaka_outbox(status, next_attempt_at)",
         ),
     ),
+    Migration(
+        version=2,
+        name="vector_generations",
+        statements=(
+            """
+            CREATE TABLE vector_generations (
+              generation INTEGER PRIMARY KEY,
+              selector TEXT NOT NULL,
+              actual_model_name TEXT,
+              model_fingerprint TEXT NOT NULL,
+              dimension INTEGER,
+              table_name TEXT NOT NULL UNIQUE,
+              schema_version INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              created_at REAL NOT NULL,
+              activated_at REAL,
+              retired_at REAL
+            )
+            """,
+            """
+            CREATE TABLE vector_documents (
+              source_kind TEXT NOT NULL,
+              source_id TEXT NOT NULL,
+              generation INTEGER NOT NULL REFERENCES vector_generations(generation),
+              actual_model_name TEXT,
+              model_fingerprint TEXT NOT NULL,
+              dimension INTEGER NOT NULL,
+              indexed_at REAL NOT NULL,
+              PRIMARY KEY(source_kind, source_id, generation)
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX one_active_vector_generation
+            ON vector_generations(status) WHERE status = 'active'
+            """,
+        ),
+    ),
 )

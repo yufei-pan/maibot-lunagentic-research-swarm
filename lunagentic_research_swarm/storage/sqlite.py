@@ -236,6 +236,14 @@ class SQLiteStateStore:
             "next_attempt_at": next_attempt_at, "last_error": error, "lease_until": lease_until,
         })])
 
+    async def run_locked(self, function: Callable[[sqlite3.Connection], Any]) -> Any:
+        """在 store 串行锁内对权威连接执行同步回调（供派生索引元数据读写）。"""
+
+        def _runner() -> Any:
+            return function(self._require_connection())
+
+        return await self._call(_runner)
+
     def _open_sync(self) -> None:
         if self._connection is not None:
             return

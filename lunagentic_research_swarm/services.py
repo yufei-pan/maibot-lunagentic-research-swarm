@@ -41,6 +41,7 @@ from lunagentic_research_swarm.runtime.scheduler import FairScheduler
 from lunagentic_research_swarm.runtime.turns import TurnWorker
 from lunagentic_research_swarm.storage.outbox import MaisakaOutbox
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
+from lunagentic_research_swarm.storage.vectors import VectorIndex
 
 StoreFactory = Callable[[Path], Any]
 DiscoveryFactory = Callable[..., Any]
@@ -148,6 +149,7 @@ class LRSServiceContainer:
         self._config = config.model_copy(deep=True)
         self._store = store_factory(Path(ctx.paths.data_dir) / "lrs-state.sqlite3")
         self.outbox: MaisakaOutbox | None = None
+        self.vector_index: VectorIndex | None = None
         self.manager: ResearchManager | None = None
         self.scheduler: FairScheduler | None = None
         self._effect_runner: RuntimeEffectRunner | None = None
@@ -171,6 +173,7 @@ class LRSServiceContainer:
         self._last_extension_persistence_error: Exception | None = None
         self._status: dict[str, dict[str, Any]] = {
             "sqlite": {"status": "pending"},
+            "vector_index": {"status": "pending"},
             "initial_price_snapshot": {"status": "pending"},
             "physical_pinning": {"status": "pending"},
             "extension_fingerprint_store": {"status": "pending"},
@@ -220,6 +223,25 @@ class LRSServiceContainer:
             self._ctx.paths.runtime_dir.mkdir(parents=True, exist_ok=True)
             await self._store.open()
             self._status["sqlite"] = {"status": "healthy"}
+            llm = getattr(self._ctx, "llm", None)
+            if llm is not None:
+                self.vector_index = VectorIndex(
+                    self._store,
+                    llm,
+                    self._config.embedding,
+                    Path(self._ctx.paths.data_dir) / "vectors" / "lancedb",
+                )
+                await self.vector_index.start()
+                vector_status = await self.vector_index.status()
+                self._status["vector_index"] = {
+                    "status": "healthy",
+                    "idle": vector_status.idle,
+                    "active_generation": vector_status.active_generation,
+                    "dimension": vector_status.dimension,
+                    "rebuilding": vector_status.rebuilding,
+                }
+            else:
+                self._status["vector_index"] = {"status": "degraded", "code": "llm_unavailable"}
             maisaka = getattr(self._ctx, "maisaka", None)
             if maisaka is not None:
                 self.outbox = MaisakaOutbox(
@@ -296,10 +318,12 @@ class LRSServiceContainer:
         resources: tuple[tuple[str, Any | None], ...] = (
             ("runtime_scheduler", self.scheduler),
             ("extension_discovery", self._discovery),
+            ("vector_index", self.vector_index),
             ("maisaka_outbox", self.outbox),
             ("sqlite", self._store),
         )
         self._discovery = None
+        self.vector_index = None
         self.outbox = None
         manager = self.manager
         self.manager = None
@@ -751,6 +775,7 @@ class LRSServiceContainer:
         root_agent, root_selector = self._root_health()
         return {
             "sqlite": dict(self._status["sqlite"]),
+            "vector_index": dict(self._status.get("vector_index", {"status": "unknown"})),
             "maisaka_outbox": dict(self._status.get("maisaka_outbox", {"status": "unknown"})),
             "legacy_rounds": dict(self._status["legacy_rounds"]),
             "initial_price_snapshot": dict(self._status["initial_price_snapshot"]),
@@ -795,6 +820,13 @@ class LRSServiceContainer:
                 except BaseException as exc:
                     if close_error is None:
                         close_error = exc
+            if self.vector_index is not None:
+                try:
+                    await self.vector_index.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+                self.vector_index = None
             if self._bundled_procedure_provider is not None:
                 try:
                     await self._bundled_procedure_provider.aclose()

@@ -28,6 +28,12 @@ class ModelSelector:
             raise LRSError("invalid_selector", f"无效模型 selector：{raw_selector}")
         return cls(scheme=scheme, name=name, raw=raw_selector)  # type: ignore[arg-type]
 
+    @property
+    def task_name(self) -> str:
+        """task: selector 的 Host task_name；model: 仅返回名称，不表示可物理 pin。"""
+
+        return self.name
+
 
 def resolve_generation_selector(configured_selector: str, force_selector: str = "") -> ModelSelector:
     """非空 force selector 统一覆盖生成式 LLM；embedding 调用方不使用本函数。"""
