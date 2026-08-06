@@ -67,6 +67,16 @@ class FakeLLMGateway:
     def enqueue(self, *responses: FakeLLMResponse | Exception) -> None:
         self.responses.extend(responses)
 
+    def queue_json(self, payload: dict[str, Any], **kwargs: Any) -> None:
+        """Enqueue a JSON-envelope style FakeLLMResponse (payload serialized by generate)."""
+
+        self.enqueue(FakeLLMResponse(payload=dict(payload), **kwargs))
+
+    def queue_text(self, text: str, **kwargs: Any) -> None:
+        """Enqueue a plain-text FakeLLMResponse (no payload / tool_calls)."""
+
+        self.enqueue(FakeLLMResponse(text=str(text), **kwargs))
+
     def block(self) -> None:
         self.gate.clear()
 

@@ -1222,6 +1222,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                         "max_branch_depth": event.max_branch_depth,
                         "max_agent_calls_per_task": event.max_agent_calls_per_task,
                         "agent_calls_started": event.agent_calls_started,
+                        "protocol": event.protocol or "json_envelope",
                     },
                 ),
             ),

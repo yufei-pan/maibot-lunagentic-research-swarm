@@ -438,6 +438,50 @@ class LRSServiceContainer:
             return {}
         return {"builtin.invoke_procedure": bundled_procedure_invoker(provider)}
 
+    def _bind_contractor_runtime(self, *, gateway: Any, price_catalog: Any) -> None:
+        """把 LLM / 价格目录 / agent 解析注入 builtin.contractor。"""
+
+        provider = self._bundled_procedure_provider
+        if provider is None:
+            return
+        from lunagentic_research_swarm.procedures.bundled.contractor import ContractorDeps
+
+        def resolve_agent(agent_id: str) -> Any:
+            snapshot = self.agent_registry.snapshot(self._next_round_state.detached_agent_overrides())
+            entry = snapshot.get(agent_id)
+            return None if entry is None else entry.definition
+
+        def resolve_procedure_catalog(agent_id: str) -> list[dict[str, Any]]:
+            agent_snap = self.agent_registry.snapshot(self._next_round_state.detached_agent_overrides())
+            proc_snap = self.procedure_registry.snapshot(self._next_round_state.detached_procedure_overrides())
+            allowed = agent_snap.resolve_allowed_procedures(agent_id, proc_snap)
+            items: list[dict[str, Any]] = []
+            for procedure_id in allowed:
+                if procedure_id == "builtin.contractor":
+                    continue
+                entry = proc_snap.get(procedure_id)
+                if entry is None:
+                    continue
+                definition = entry.definition
+                items.append(
+                    {
+                        "procedure_id": procedure_id,
+                        "display_name": str(getattr(definition, "display_name", "") or ""),
+                        "description": str(getattr(definition, "description", "") or ""),
+                    }
+                )
+            return items
+
+        provider.bind_contractor_deps(
+            ContractorDeps(
+                llm=gateway,
+                prices=price_catalog,
+                resolve_agent=resolve_agent,
+                invoke_nested_procedure=None,
+                resolve_procedure_catalog=resolve_procedure_catalog,
+            )
+        )
+
     async def _cleanup_start_failure(self) -> None:
         """释放启动阶段已经创建的资源而不遮蔽原始异常。"""
 
@@ -535,6 +579,7 @@ class LRSServiceContainer:
             procedure_factory=procedure_factory,
             debug_store=self.debug_store,
         )
+        self._bind_contractor_runtime(gateway=gateway, price_catalog=self.price_catalog)
         runner = RuntimeEffectRunner(turn_worker)
         scheduler = FairScheduler(
             global_llm=int(config.scheduler.max_global_llm_concurrency),

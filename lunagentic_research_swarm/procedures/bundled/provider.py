@@ -75,6 +75,7 @@ class BundledProcedureProvider:
         self._handlers[WEB_SEARCH_PROCEDURE_ID] = make_web_search_handler(self._web_search)
         self._handlers[PAST_CASES_PROCEDURE_ID] = self._past_cases_handler
         self._handlers[CONTRACTOR_PROCEDURE_ID] = self._contractor_handler
+        self._contractor_deps = None
 
     @property
     def web_search(self) -> WebSearchService:
@@ -101,6 +102,16 @@ class BundledProcedureProvider:
                 deps["store"] = store
             if vector_index is not None:
                 deps["vector_index"] = vector_index
+
+    def bind_contractor_deps(self, deps: Any) -> None:
+        """注入承包商运行时依赖（LLM / 价格 / agent 解析）；启动 runtime 后调用。"""
+
+        from lunagentic_research_swarm.procedures.bundled.contractor import ContractorDeps, make_contractor_handler
+
+        bound = deps if isinstance(deps, ContractorDeps) else ContractorDeps(**dict(deps or {}))
+        self._contractor_deps = bound
+        self._contractor_handler = make_contractor_handler(bound)
+        self._handlers[CONTRACTOR_PROCEDURE_ID] = self._contractor_handler
 
     def describe(self) -> list[dict[str, Any]]:
         """返回可交给 ProcedureRegistry.replace_provider 的 model_dump payload。"""
@@ -133,14 +144,16 @@ class BundledProcedureProvider:
                 metadata={},
             )
         args = dict(arguments or {})
+        meta = scoped_metadata if isinstance(scoped_metadata, Mapping) else {}
         # past_cases：未显式传 exclude_task_id 时，默认排除调用侧 scoped task_id。
         if procedure_id == PAST_CASES_PROCEDURE_ID:
             existing = args.get("exclude_task_id")
             if not (isinstance(existing, str) and existing.strip()):
-                meta = scoped_metadata if isinstance(scoped_metadata, Mapping) else {}
                 task_id = meta.get("task_id")
                 if isinstance(task_id, str) and task_id.strip():
                     args["exclude_task_id"] = task_id.strip()
+        if procedure_id == CONTRACTOR_PROCEDURE_ID:
+            return await handler(self.ctx, args, scoped_metadata=meta)
         return await handler(self.ctx, args)
 
     async def aclose(self) -> None:

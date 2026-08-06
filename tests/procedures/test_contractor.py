@@ -1,22 +1,35 @@
-"""builtin.contractor：定义默认值、目录注册、禁用覆写与 stub 行为。"""
+"""builtin.contractor：定义默认值、目录注册、禁用覆写与 outsider 循环。"""
 
 from __future__ import annotations
 
+import json
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
 from lunagentic_research_swarm.config import ProcedureOverride
 from lunagentic_research_swarm.procedures.bundled.contractor import (
     CONTRACTOR_PROCEDURE_ID,
+    ContractorDeps,
     contractor_procedure_definitions,
+    make_contractor_handler,
+    run_contractor,
 )
 from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
 from lunagentic_research_swarm.procedures.registry import ProcedureRegistry
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 _CONFIG_DEFAULT = _PLUGIN_ROOT / "config.default.toml"
+_TESTS_ROOT = Path(__file__).resolve().parents[1]
+if str(_TESTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TESTS_ROOT))
+
+from fakes import FakeLLMGateway, FakeLLMResponse  # noqa: E402
 
 _EXPECTED_BUNDLED_PROCEDURE_IDS = (
     "builtin.chat_streams",
@@ -97,3 +110,177 @@ def test_config_default_toml_lists_all_bundled_procedure_toggles() -> None:
     contractor_block = text.split('[procedures."builtin.contractor"]', 1)[1]
     assert "enabled = true" in contractor_block.split("[", 1)[0]
     assert "timeout_seconds = 0" in contractor_block.split("[", 1)[0]
+
+
+@dataclass
+class _FakePrices:
+    """Deterministic charge_actual for contractor metering tests."""
+
+    per_turn: float = 0.5
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def charge_actual(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(dict(kwargs))
+        return SimpleNamespace(credits=float(self.per_turn))
+
+
+@dataclass
+class ContractorHarness:
+    llm: FakeLLMGateway
+    prices: _FakePrices
+    deps: ContractorDeps
+    agents: dict[str, Any]
+
+    @classmethod
+    def create(cls) -> ContractorHarness:
+        agents = {item.agent_id: item for item in bundled_agent_definitions()}
+        llm = FakeLLMGateway()
+        prices = _FakePrices()
+        deps = ContractorDeps(
+            llm=llm,
+            prices=prices,
+            resolve_agent=lambda agent_id: agents.get(agent_id),
+            invoke_nested_procedure=None,
+        )
+        return cls(llm=llm, prices=prices, deps=deps, agents=agents)
+
+    async def invoke(
+        self,
+        *,
+        agent_id: str,
+        question: str,
+        caller_protocol: str = "json_envelope",
+        credit_budget: float = 10.0,
+        caller_agent_id: str = "builtin.quick_thinker",
+        **arguments: Any,
+    ) -> Any:
+        handler = make_contractor_handler(self.deps)
+        scoped = {
+            "credit_budget": float(credit_budget),
+            "caller_protocol": caller_protocol,
+            "caller_agent_id": caller_agent_id,
+            # Markers that must never leak into outsider messages:
+            "formalized_task": "FORMALIZED_TASK_MARKER",
+            "parent_transcript": "parent transcript marker",
+        }
+        return await handler(
+            None,
+            {"agent_id": agent_id, "question": question, **arguments},
+            scoped_metadata=scoped,
+        )
+
+
+@pytest.fixture
+def contractor_harness() -> ContractorHarness:
+    return ContractorHarness.create()
+
+
+@pytest.mark.asyncio
+async def test_contractor_returns_explicit_json_return(contractor_harness: ContractorHarness) -> None:
+    contractor_harness.llm.queue_json({"return": "答案"})
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="1+1?",
+        caller_protocol="json_envelope",
+        credit_budget=10.0,
+    )
+    assert result.success is True
+    assert result.data["result"] == "答案"
+    assert result.metadata["termination_reason"] == "returned"
+    assert float(result.research_credits_charged) == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_contractor_last_text_return_without_tool_call(contractor_harness: ContractorHarness) -> None:
+    contractor_harness.llm.queue_text("仅正文结论")
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="总结",
+        caller_protocol="json_envelope",
+        credit_budget=10.0,
+    )
+    assert result.success is True
+    assert "仅正文结论" in str(result.data)
+    assert result.metadata["termination_reason"] == "returned"
+
+
+@pytest.mark.asyncio
+async def test_contractor_fresh_context_excludes_parent_task(contractor_harness: ContractorHarness) -> None:
+    contractor_harness.llm.queue_json({"return": "ok"})
+    await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="旁路问题",
+        caller_protocol="json_envelope",
+        credit_budget=1.0,
+    )
+    sent = contractor_harness.llm.calls[0]["messages"]
+    blob = json.dumps(sent, ensure_ascii=False)
+    assert "旁路问题" in blob
+    assert "FORMALIZED_TASK_MARKER" not in blob
+    assert "parent transcript marker" not in blob
+
+
+@pytest.mark.asyncio
+async def test_contractor_native_contractor_return(contractor_harness: ContractorHarness) -> None:
+    contractor_harness.llm.enqueue(
+        FakeLLMResponse(
+            text="",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "contractor_return",
+                        "arguments": json.dumps({"result": "原生返回"}, ensure_ascii=False),
+                    },
+                }
+            ],
+        )
+    )
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="原生？",
+        caller_protocol="native_tools",
+        credit_budget=5.0,
+    )
+    assert result.success is True
+    assert result.data["result"] == "原生返回"
+    assert result.metadata["termination_reason"] == "returned"
+    tools = contractor_harness.llm.calls[0].get("tools")
+    assert tools is not None
+    names = {item["function"]["name"] for item in tools}
+    assert "contractor_return" in names
+
+
+@pytest.mark.asyncio
+async def test_contractor_nested_procedures_rejected_into_transcript(
+    contractor_harness: ContractorHarness,
+) -> None:
+    contractor_harness.llm.queue_json(
+        {"report": "先查一下", "procedures": [{"procedure_id": "builtin.web_search", "arguments": {"query": "x"}}]}
+    )
+    contractor_harness.llm.queue_json({"return": "在拒绝后给出答案"})
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="需要工具吗",
+        caller_protocol="json_envelope",
+        credit_budget=10.0,
+    )
+    assert result.success is True
+    assert result.data["result"] == "在拒绝后给出答案"
+    assert len(contractor_harness.llm.calls) == 2
+    second_blob = json.dumps(contractor_harness.llm.calls[1]["messages"], ensure_ascii=False)
+    assert "builtin.web_search" in second_blob
+    assert "不允许" in second_blob or "拒绝" in second_blob or "不可" in second_blob
+
+
+@pytest.mark.asyncio
+async def test_run_contractor_missing_agent_fails(contractor_harness: ContractorHarness) -> None:
+    result = await run_contractor(
+        arguments={"agent_id": "missing.agent", "question": "q"},
+        scoped_metadata={"credit_budget": 1.0, "caller_protocol": "json_envelope"},
+        deps=contractor_harness.deps,
+    )
+    assert result.success is False
+    assert result.error is not None
+    assert result.error["code"] in {"invalid_arguments", "agent_unavailable"}

@@ -361,6 +361,9 @@ class ProcedureExecutor:
             allowed = frozenset(str(item) for item in allowed_raw)
         else:
             allowed = frozenset()
+        protocol = str(value("protocol", "json_envelope") or "json_envelope")
+        if protocol not in {"json_envelope", "native_tools"}:
+            protocol = "json_envelope"
         return {
             "task_id": str(task_id or "task-unknown"),
             "round_id": str(round_id or "round-unknown"),
@@ -371,6 +374,7 @@ class ProcedureExecutor:
             "event_id": str(value("event_id", "") or ""),
             "generation": int(value("generation", getattr(effect, "generation", 0)) or 0),
             "allowed_procedures": allowed,
+            "protocol": protocol,
         }
 
     @classmethod
@@ -408,12 +412,18 @@ class ProcedureExecutor:
     @staticmethod
     def _metadata(context: Mapping[str, Any]) -> dict[str, Any]:
         # 这是唯一发送给 provider 的上下文；不放 messages、其它 branch 或 raw payload。
+        agent_id = str(context.get("agent_id") or "")
+        protocol = str(context.get("protocol") or "json_envelope")
+        if protocol not in {"json_envelope", "native_tools"}:
+            protocol = "json_envelope"
         return {
             "task_id": context["task_id"],
             "round_id": context["round_id"],
             "branch_id": context["branch_id"],
             "turn_id": context["turn_id"],
-            "agent_id": context["agent_id"],
+            "agent_id": agent_id,
+            "caller_agent_id": agent_id,
+            "caller_protocol": protocol,
         }
 
     async def _api_call(

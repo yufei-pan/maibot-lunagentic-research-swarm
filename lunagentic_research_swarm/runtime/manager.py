@@ -1270,6 +1270,10 @@ class ResearchManager:
                 agent_id,
                 snapshot.procedure_catalog,
             )
+            if not payload.get("protocol"):
+                entry = snapshot.agent_catalog.get(agent_id)
+                if entry is not None:
+                    payload["protocol"] = str(getattr(entry.definition, "protocol", "json_envelope") or "json_envelope")
         formalized = controller.state.formalized_task
         if formalized is not None:
             payload["formalized_task"] = formalized.text
