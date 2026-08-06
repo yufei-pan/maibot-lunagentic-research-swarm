@@ -13,9 +13,17 @@ from lunagentic_research_swarm.errors import LRSError, PROTOCOL_INVALID
 
 
 class ProcedureRequest(BaseModel):
+    """一次 Procedure 请求。
+
+    ``procedure_id`` 是唯一的身份字段，与 spec §15.1 的 definition 字段同名。
+    ``call_id`` 是可选的、由智能体自己生成的关联 ID：本 turn 内多次调用同一个
+    Procedure 时可用它把结果对回请求。它只做透传，不参与路由，也不做去重。
+    """
+
     model_config = ConfigDict(extra="forbid", strict=True)
 
     procedure_id: str
+    call_id: str | None = Field(default=None, max_length=128)
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -84,10 +92,9 @@ def _decode_complete_json_string_once(text: str) -> tuple[str, bool]:
     return _normalize_outer_text(decoded), True
 
 
-def _extract_first_balanced_object(text: str) -> str | None:
-    start = text.find("{")
-    if start < 0:
-        return None
+def _scan_balanced_object(text: str, start: int) -> int | None:
+    """返回从 ``start`` 处 ``{`` 开始的括号平衡 object 的结束下标（含）。"""
+
     stack: list[str] = []
     in_string = False
     escaped = False
@@ -112,8 +119,30 @@ def _extract_first_balanced_object(text: str) -> str | None:
             if (opening, character) not in {("{", "}"), ("[", "]")}:
                 return None
             if not stack:
-                return text[start : index + 1]
+                return index
     return None
+
+
+def _extract_unique_balanced_object(text: str) -> str | None:
+    """提取唯一的顶层 object。
+
+    spec §9.2 只允许“从无歧义包装文字中提取唯一顶层对象”，明确禁止“在多个对象
+    中选择”。因此发现第二个顶层 object 时必须失败，而不是静默取第一个。
+    """
+
+    start = text.find("{")
+    if start < 0:
+        return None
+    end = _scan_balanced_object(text, start)
+    if end is None:
+        return None
+    # 后续文字里再出现一个括号平衡的 object 就是歧义输入；不平衡的 `{` 只是散文。
+    cursor = text.find("{", end + 1)
+    while cursor >= 0:
+        if _scan_balanced_object(text, cursor) is not None:
+            return None
+        cursor = text.find("{", cursor + 1)
+    return text[start : end + 1]
 
 
 def _remove_trailing_commas(text: str) -> str:
@@ -166,25 +195,40 @@ def _validate_envelope(payload: Any) -> SwarmTurnEnvelope:
         raise _validation_error(exc) from exc
 
 
-def parse_json_envelope(raw: str) -> SwarmTurnEnvelope:
-    """仅用列明的确定性变换修复文本，并严格验证唯一 envelope。"""
+def parse_json_envelope_with_repairs(raw: str) -> tuple[SwarmTurnEnvelope, tuple[str, ...]]:
+    """严格验证唯一 envelope，并返回实际应用过的有限修复规则名。
+
+    规则名对应 spec §9.2 允许的确定性变换，供调用方记录 ``protocol_repaired``。
+    """
 
     if not isinstance(raw, str):
         raise ProtocolError("智能体返回必须是 JSON 文本", [{"pointer": "/", "message": "必须为字符串"}])
+    applied: list[str] = []
     text = _normalize_outer_text(raw)
+    if text != raw:
+        applied.append("strip_bom_whitespace")
     text, fence_removed = _strip_one_json_fence(text)
+    if fence_removed:
+        applied.append("strip_markdown_fence")
     text, decoded = _decode_complete_json_string_once(text)
     if decoded:
+        applied.append("decode_json_string")
         text = _normalize_outer_text(text)
         if not fence_removed:
-            text, _ = _strip_one_json_fence(text)
-    object_text = _extract_first_balanced_object(text)
+            text, inner_fence = _strip_one_json_fence(text)
+            if inner_fence:
+                applied.append("strip_markdown_fence")
+    object_text = _extract_unique_balanced_object(text)
     if object_text is None:
         raise ProtocolError(
-            "无法找到完整的 swarm turn JSON object",
-            [{"pointer": "/", "message": "需要一个括号平衡的 JSON object"}],
+            "无法找到唯一完整的 swarm turn JSON object",
+            [{"pointer": "/", "message": "需要恰好一个括号平衡的顶层 JSON object"}],
         )
+    if object_text != text:
+        applied.append("extract_wrapped_object")
     repaired = _remove_trailing_commas(object_text)
+    if repaired != object_text:
+        applied.append("remove_trailing_comma")
     try:
         payload = _strict_json_loads(repaired)
     except json.JSONDecodeError as exc:
@@ -197,7 +241,14 @@ def parse_json_envelope(raw: str) -> SwarmTurnEnvelope:
             "swarm turn JSON 含非有限数值",
             [{"pointer": "/", "message": str(exc)}],
         ) from exc
-    return _validate_envelope(payload)
+    return _validate_envelope(payload), tuple(dict.fromkeys(applied))
+
+
+def parse_json_envelope(raw: str) -> SwarmTurnEnvelope:
+    """仅用列明的确定性变换修复文本，并严格验证唯一 envelope。"""
+
+    envelope, _repairs = parse_json_envelope_with_repairs(raw)
+    return envelope
 
 
 SWARM_TURN_TOOLS: list[dict[str, Any]] = [
@@ -219,10 +270,10 @@ def _native_error(message: str, *, pointer: str = "/tool_calls") -> ProtocolErro
     )
 
 
-def parse_native_tool_result(
+def parse_native_tool_result_with_repairs(
     response: str,
     tool_calls: Sequence[Mapping[str, Any]] | None,
-) -> SwarmTurnEnvelope:
+) -> tuple[SwarmTurnEnvelope, tuple[str, ...]]:
     """解析唯一 synthetic tool；assistant 正文只可补充 arguments report。"""
 
     if not isinstance(response, str):
@@ -240,9 +291,10 @@ def parse_native_tool_result(
     if "arguments" not in function:
         raise _native_error("缺少 arguments", pointer="/tool_calls/0/function/arguments")
     arguments = function["arguments"]
+    repairs: tuple[str, ...] = ()
     if isinstance(arguments, str):
         try:
-            envelope = parse_json_envelope(arguments)
+            envelope, repairs = parse_json_envelope_with_repairs(arguments)
         except ProtocolError as exc:
             raise _native_error(str(exc), pointer="/tool_calls/0/function/arguments") from exc
     elif isinstance(arguments, Mapping):
@@ -264,10 +316,18 @@ def parse_native_tool_result(
 
     supplement = response.strip()
     if envelope.report or not supplement:
-        return envelope
+        return envelope, repairs
     merged = envelope.model_dump(mode="python")
     merged["report"] = supplement
-    return _validate_envelope(merged)
+    return _validate_envelope(merged), (*repairs, "merge_assistant_text_report")
+
+
+def parse_native_tool_result(
+    response: str,
+    tool_calls: Sequence[Mapping[str, Any]] | None,
+) -> SwarmTurnEnvelope:
+    envelope, _repairs = parse_native_tool_result_with_repairs(response, tool_calls)
+    return envelope
 
 
 def build_correction_message(error: ProtocolError) -> dict[str, str]:
@@ -311,5 +371,7 @@ __all__ = [
     "SwarmTurnEnvelope",
     "build_correction_message",
     "parse_json_envelope",
+    "parse_json_envelope_with_repairs",
     "parse_native_tool_result",
+    "parse_native_tool_result_with_repairs",
 ]

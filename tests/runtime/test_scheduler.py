@@ -333,5 +333,6 @@ async def test_stats_do_not_expose_worker_exception_payload() -> None:
 
     snapshot = scheduler.stats()
     assert secret not in repr(snapshot)
-    assert snapshot["errors"] == ({"kind": "RuntimeError"},)
+    # 只保留结构性身份，便于定位失败的 effect；异常正文可能引用 prompt，不进遥测。
+    assert snapshot["errors"] == ({"kind": "RuntimeError", "effect": "agent", "task_id": "A"},)
     await scheduler.close()

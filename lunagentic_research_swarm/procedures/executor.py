@@ -14,6 +14,7 @@ import json
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import replace as dataclasses_replace
 from types import MappingProxyType
 from typing import Any
 
@@ -141,6 +142,7 @@ class ProcedureExecutionResult:
     api_version: str = "1"
     attempts: int = 1
     duration_ms: int = 0
+    call_id: str = ""
 
     @property
     def procedure_result(self) -> ProcedureResult:
@@ -174,6 +176,7 @@ class ProcedureExecutionResult:
             "api_version": self.api_version,
             "attempts": self.attempts,
             "duration_ms": self.duration_ms,
+            "call_id": self.call_id,
         }
 
 
@@ -226,6 +229,8 @@ def procedure_result_summary(item: ProcedureExecutionResult) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "procedure_id": item.procedure_id,
         "request_id": item.request_id,
+        # 智能体自带的关联 ID（若有），便于把结果对回它自己的请求。
+        **({"call_id": item.call_id} if item.call_id else {}),
         "success": bool(getattr(result, "success", False)),
         "provider_plugin_id": item.provider_plugin_id,
         "duration_ms": int(item.duration_ms),
@@ -668,32 +673,6 @@ class ProcedureExecutor:
                 except Exception:
                     pass
 
-    async def invoke_core(
-        self,
-        procedure_id: str,
-        arguments: Mapping[str, Any] | None = None,
-        *,
-        context: Any | None = None,
-        **kwargs: Any,
-    ) -> ProcedureExecutionResult:
-        request_id = (
-            str(kwargs.pop("request_id", ""))
-            or "core_"
-            + _fingerprint(
-                {"procedure_id": procedure_id, "arguments": dict(arguments or {}), "context": _jsonable(context)}
-            )[:56]
-        )
-        started = time.perf_counter()
-        result = await execute_core_procedure(
-            procedure_id,
-            arguments,
-            summarizer=self.summarizer,
-            context=context,
-            **kwargs,
-        )
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        return ProcedureExecutionResult(procedure_id, request_id, result, "core", "", "1", 1, duration_ms)
-
     async def invoke_many(
         self,
         effect: Any,
@@ -708,10 +687,21 @@ class ProcedureExecutor:
         results = list(
             await asyncio.gather(*(self._invoke_one(request, context, index) for index, request in enumerate(ordinary)))
         )
+        # 把智能体自带的可选 call_id 透传回结果，供它把结果对回自己的请求。
+        results = [
+            dataclasses_replace(item, call_id=str(_request_value(request, "call_id", "") or ""))
+            for item, request in zip(results, ordinary)
+        ]
         parent_messages = tuple(dict(item) for item in payload.get("messages", ()) if isinstance(item, Mapping))
+        # spec §8.2/§9.1：本 turn 的 envelope `report` 是该智能体的工作输出（明确
+        # 不含 provider reasoning），必须进入可变 history，子分支才能继承父节点的
+        # 输出，分支总结/compact 也才有内容可总结。
+        report = str(payload.get("report", "") or "").strip()
+        if report:
+            parent_messages = (*parent_messages, {"role": "assistant", "content": report})
         # 普通结果先进入可变 history，再 compact，使子分支继承 procedure 输出。
         parent_messages, _summaries = fold_procedure_results_into_messages(parent_messages, results)
-        if controls.compact and not controls.terminate:
+        if controls.compact:
             compact_result = await self._execute_compact(context=context, payload=payload, messages=parent_messages)
             results.append(compact_result)
             data = getattr(compact_result.result, "data", None)

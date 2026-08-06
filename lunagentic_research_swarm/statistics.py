@@ -141,7 +141,7 @@ def compute_task_stats(connection: sqlite3.Connection, task_id: str) -> dict[str
         (task_id,),
     ).fetchall()
     procedures_success = procedures_error = 0
-    compact_count = checkpoint_count = 0
+    compact_count = 0
     external_cost = 0.0
     for row in procedure_rows:
         procedure_id = str(row["procedure_id"] or "")
@@ -150,8 +150,6 @@ def compute_task_stats(connection: sqlite3.Connection, task_id: str) -> dict[str
         external_cost += _external_cost(row["external_cost_json"])
         if procedure_id == "core.compact":
             compact_count += 1
-        if procedure_id == "core.checkpoint":
-            checkpoint_count += 1
         if status in {"SUCCEEDED", "SUCCESS", "OK"}:
             procedures_success += 1
         elif status in {"ERROR", "FAILED", "FAILURE"} or row["error_code"]:
@@ -182,6 +180,18 @@ def compute_task_stats(connection: sqlite3.Connection, task_id: str) -> dict[str
     ).fetchone()
     credit_pool = float(pool_row["credit_pool"]) if pool_row is not None else 0.0
     credit_debt = abs(min(0.0, credit_pool))
+
+    # checkpoint 由 ReportCoordinator 直接调用总结器，不经过 procedure_calls；
+    # 权威计数来自 summaries 表，否则 core.checkpoint 行数恒为 0。
+    checkpoint_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM summaries
+            WHERE task_id = ? AND kind = 'CHECKPOINT'
+            """,
+            (task_id,),
+        ).fetchone()["n"]
+    )
 
     # 协议纠错：reducer 以 ``{call_id}:correction`` 再 reserve；不依赖虚构的 lifecycle 事件名。
     protocol_correction_count = int(

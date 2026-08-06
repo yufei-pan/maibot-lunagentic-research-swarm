@@ -164,7 +164,10 @@ class CommandsSection(PluginConfigBase):
     maintenance_allowed_user_ids: list[str] = _ui_factory(
         factory=list,
         label="维护人员用户 ID",
-        hint="允许执行维护命令的 Host user_id 列表（与命令 RPC 的 user_id 对齐，不是 person_id）。空列表表示不限制。",
+        hint=(
+            "允许执行维护命令的身份列表。每项可填平台 user_id（与命令 RPC 的 user_id 对齐），"
+            "也可填 MaiBot person_id（md5(平台_用户ID)，跨适配器唯一）。空列表表示不限制。"
+        ),
     )
     allow_vector_rebuild: bool = _ui_field(
         False,

@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from lunagentic_research_swarm.llm.gateway import resolve_generation_selector
 from lunagentic_research_swarm.llm.pricing import TokenUsage, charge
 from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
-from lunagentic_research_swarm.llm.tokens import estimate_prompt_tokens
+from lunagentic_research_swarm.llm.tokens import estimate_child_tokens, estimate_prompt_tokens
 from lunagentic_research_swarm.models import (
     BranchLifecycle,
     BranchRuntime,
@@ -39,9 +39,11 @@ from lunagentic_research_swarm.runtime.context import (
     should_auto_compact,
 )
 from lunagentic_research_swarm.runtime.controller import TaskController
-from lunagentic_research_swarm.runtime.credits import allocate_children, meter_summarizer_usage, reserve_input
+from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage, reserve_input
+from lunagentic_research_swarm.runtime.delegation import plan_delegations, rejected_edge_notice
 from lunagentic_research_swarm.runtime.epochs import ReportCoordinator, ReportRecord
 from lunagentic_research_swarm.runtime.events import (
+    AgentCallFailed,
     AgentCallReserved,
     AllInflightSettled,
     BranchFinalized,
@@ -87,6 +89,17 @@ def _now() -> float:
 
 def _iso_timestamp(value: float) -> str:
     return datetime.fromtimestamp(float(value), tz=UTC).isoformat().replace("+00:00", "Z")
+
+
+_RUNTIME_HEADER_MARKER = "[LRS runtime]"
+
+
+def _is_runtime_header(message: Mapping[str, Any] | Any) -> bool:
+    """Per-call runtime headers are ephemeral and never part of inherited history."""
+
+    if not isinstance(message, Mapping):
+        return False
+    return str(message.get("content", "")).startswith(_RUNTIME_HEADER_MARKER)
 
 
 class ResearchManager:
@@ -169,9 +182,15 @@ class ResearchManager:
             raise ValueError("summarizer selector 不能为空")
         selector = str(snapshot.root_force_selector or root.definition.model_selector)
         credits = float(snapshot.default_effort_credits) * float(effort_level)
-        warning = snapshot.price_catalog.low_budget_warning(selector, credits)
+        miss_tokens = int(self._runtime_limits.get("warning_miss_input_tokens", 500_000))
+        output_tokens = int(self._runtime_limits.get("warning_output_tokens", 50_000))
+        warning = snapshot.price_catalog.low_budget_warning(
+            selector, credits, miss_input_tokens=miss_tokens, output_tokens=output_tokens
+        )
         if warning:
-            self.ctx.logger.warning("%s（按 500000 cache-miss 输入与 50000 输出 token 重新估算）", warning)
+            self.ctx.logger.warning(
+                "%s（按 %d cache-miss 输入与 %d 输出 token 重新估算）", warning, miss_tokens, output_tokens
+            )
 
         task_id, round_id, created_at = new_task_id(), new_round_id(), _now()
         state = RuntimeState(task_id, TaskStatus.FORMALIZING, generation=0, active_round_id=round_id)
@@ -200,7 +219,65 @@ class ResearchManager:
         self._round_snapshots[task_id] = snapshot
         await self.scheduler.enqueue(PerformFormalization(task_id, round_id, 0, payload={"stream_id": stream_id}))
         self._track(task_id, self._formalize(task_id, objective, stream_id, planner_context, credits, snapshot, time_budget_seconds))
-        return {"task_id": task_id, "status": TaskStatus.FORMALIZING.value, "initial_credits": credits}
+        return {
+            "task_id": task_id,
+            "status": TaskStatus.FORMALIZING.value,
+            "round_id": round_id,
+            "round_number": 1,
+            "initial_credits": credits,
+        }
+
+    async def restore_tasks(self) -> int:
+        """Rehydrate controllers for persisted tasks after a Host/plugin restart.
+
+        Design §18.3/§18.4: raw branch context is deliberately not persisted, so a
+        restored task has no active graph — only its summary layer.  Restoring the
+        controller is what lets ``get_research_status`` / ``list_research_tasks``
+        still see the task and lets ``continue_deep_research`` open a fresh round
+        from the summaries.
+        """
+
+        try:
+            task_ids = await self.store.list_task_ids()
+        except Exception:
+            _LOG.warning("LRS 无法枚举已持久化任务，跳过 controller 恢复", exc_info=True)
+            return 0
+        restored = 0
+        for task_id in task_ids:
+            if task_id in self._controllers:
+                continue
+            try:
+                stored = await self.store.load_task(task_id)
+            except Exception:
+                _LOG.warning("LRS 恢复任务失败 task_id=%s", task_id, exc_info=True)
+                continue
+            if stored is None:
+                continue
+            current_round = getattr(stored, "current_round", None)
+            if current_round is None:
+                continue
+            state = RuntimeState(
+                task_id,
+                current_round.status,
+                formalized_task=stored.formalized_task,
+                generation=int(current_round.generation),
+                active_round_id=current_round.round_id,
+                credit_pool=float(current_round.credit_pool),
+                raw_context_released=True,
+            )
+            self._controllers[task_id] = TaskController(
+                state,
+                store=self.store,
+                scheduler=self.scheduler,
+                feedback=self._feedback_service,
+            )
+            self._round_numbers[task_id] = int(current_round.round_number)
+            self._task_streams[task_id] = str(stored.stream_id)
+            self._task_created_at[task_id] = float(stored.created_at)
+            # No active leaves survive a restart; a new round rebuilds the graph.
+            self._branches[task_id] = {}
+            restored += 1
+        return restored
 
     async def _formalize(self, task_id: str, objective: str, stream_id: str, planner_context: str | None, credits: float, snapshot: Any, time_budget_seconds: int) -> None:
         """Collect public context and immediately drop the raw bundle after use."""
@@ -463,7 +540,7 @@ class ResearchManager:
         if time_budget_seconds is not None and (isinstance(time_budget_seconds, bool) or time_budget_seconds <= 0):
             raise ValueError("time_budget_seconds 必须为正整数")
         state, branches = controller.state, self._branches[task_id]
-        effective_time = time_budget_seconds or self._stored_time_budget(task_id) or 120
+        effective_time = time_budget_seconds or await self._stored_time_budget(task_id) or 120
         if state.status is TaskStatus.PAUSED and branches:
             cancelled = self._pause_jobs.pop(task_id, None)
             if cancelled:
@@ -505,6 +582,9 @@ class ResearchManager:
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.COMPLETED_WITH_ERRORS,
+            # Design §18.4: a crash-interrupted round keeps its summary layer, so
+            # continue starts a fresh round from it rather than resuming raw work.
+            TaskStatus.INTERRUPTED,
         }:
             if state.formalized_task is None:
                 return {"success": False, "error": {"code": "task_not_formalized", "message": "任务尚未形式化"}}
@@ -656,9 +736,37 @@ class ResearchManager:
         # All current-generation worker outputs follow the same durable reducer
         # path.  In particular, AgentCallCompleted reconciles cost and queues the
         # next procedure/materialization phase after its transaction commits.
+        self._log_protocol_repairs(event)
         await self._submit(controller, event)
         self._sync_branch_credits(event.task_id, controller)
         self._sync_branch_messages_from_event(event)
+        self._sync_branch_model_from_event(event)
+
+    def _log_protocol_repairs(self, event: Any) -> None:
+        """spec §9.2：成功的有限修复必须留下 ``protocol_repaired`` 记录。"""
+
+        repairs = tuple(getattr(event, "protocol_repairs", ()) or ())
+        if not repairs:
+            return
+        self.ctx.logger.info(
+            "protocol_repaired=true task_id=%s branch_id=%s call_id=%s rules=%s",
+            getattr(event, "task_id", ""),
+            getattr(event, "branch_id", ""),
+            getattr(event, "call_id", ""),
+            ",".join(repairs),
+        )
+
+    def _sync_branch_model_from_event(self, event: Any) -> None:
+        """Remember the physical model a branch actually used, for cache lineage."""
+
+        model_name = str(getattr(event, "actual_model_name", "") or "")
+        branch_id = getattr(event, "branch_id", None)
+        task_id = getattr(event, "task_id", None)
+        if not model_name or not branch_id or not task_id:
+            return
+        branch = self._branches.get(task_id, {}).get(branch_id)
+        if branch is not None:
+            branch["last_actual_model_name"] = model_name
 
     def _sync_branch_messages_from_event(self, event: Any) -> None:
         """Apply compacted/rewritten parent messages and procedure summaries after batch complete."""
@@ -722,11 +830,42 @@ class ResearchManager:
             balance_before = float(controller.state.active_leaves[branch_id])
         else:
             balance_before = float(branch.get("credits", 0.0))
+        # Runtime headers are per-call and must never accumulate in inherited
+        # history (design §8.2); drop any carried over from a parent or a
+        # previous turn before appending this call's fresh header below.
+        messages = tuple(item for item in messages if not _is_runtime_header(item))
+        appended = tuple(
+            dict(item) for item in effect.payload.get("appended_messages", ()) if isinstance(item, Mapping)
+        )
+        if appended:
+            messages = messages + appended
+        # `add_research_context` broadcasts supplied information into every active
+        # branch's next call (design §17.1); drain it so it is injected exactly once.
+        supplied = [str(item) for item in branch.get("pending_context", ()) if str(item).strip()]
+        if supplied:
+            messages = messages + tuple(
+                {"role": "user", "content": f"补充信息：{item}"} for item in supplied
+            )
+            branch["pending_context"] = []
+        if appended or supplied:
+            branch["messages"] = [dict(item) for item in messages]
+            runtime_branch = None
+            coordinator_now = self.report_coordinators.get(effect.task_id)
+            if coordinator_now is not None:
+                runtime_branch = coordinator_now.branches.get(branch_id)
+            if runtime_branch is not None:
+                runtime_branch.messages = [dict(item) for item in messages]
+        turn_number = int(branch.get("turn", 0)) + 1
+        branch["turn"] = turn_number
+        inherited_messages = tuple(branch.get("inherited_messages", ()))
+        inherited_model_name = str(branch.get("inherited_model_name", "") or "")
         estimated_charge, prompt_tokens, cache_hit, cache_miss, resolved = self._estimate_agent_reservation(
             snapshot=snapshot,
             selector=selector,
             messages=messages,
             protocol=protocol,
+            inherited_messages=inherited_messages,
+            parent_actual_model_name=inherited_model_name,
         )
         messages, prompt_tokens, cache_hit, cache_miss, estimated_charge, resolved = await self._maybe_auto_compact(
             effect=effect,
@@ -760,7 +899,30 @@ class ResearchManager:
                     selector=selector,
                     messages=messages,
                     protocol=protocol,
+                    inherited_messages=inherited_messages,
+                    parent_actual_model_name=inherited_model_name,
                 )
+        # design §8.2: every ordinary agent call gets a freshly computed runtime
+        # header (branch/turn, remaining report time, post-reservation credits,
+        # active/queued counts).  It is appended last and never persisted into the
+        # stable prefix.
+        messages = messages + (
+            self._runtime_header(
+                task_id=effect.task_id,
+                branch_id=branch_id,
+                turn_number=turn_number,
+                definition=definition,
+                credits_after_reservation=balance_before - estimated_charge,
+            ),
+        )
+        estimated_charge, prompt_tokens, cache_hit, cache_miss, resolved = self._estimate_agent_reservation(
+            snapshot=snapshot,
+            selector=selector,
+            messages=messages,
+            protocol=protocol,
+            inherited_messages=inherited_messages,
+            parent_actual_model_name=inherited_model_name,
+        )
         credits_after_reservation = balance_before - estimated_charge
         usage_id = f"usage_{call_id}"
         ledger_id = f"ledger_{call_id}"
@@ -818,10 +980,49 @@ class ResearchManager:
                 "max_delegations_per_turn": int(self._runtime_limits.get("max_delegations_per_turn", 8)),
                 "max_branch_depth": int(self._runtime_limits.get("max_branch_depth", 32)),
                 "max_agent_calls_per_task": int(self._runtime_limits.get("max_agent_calls_per_task", 256)),
+                "max_correction_turns": int(self._runtime_limits.get("max_correction_turns", 1)),
                 "agent_calls_started": int(controller.state.agent_calls_started),
             }
         )
         return replace(effect, payload=payload)
+
+    def _runtime_header(
+        self,
+        *,
+        task_id: str,
+        branch_id: str,
+        turn_number: int,
+        definition: Any,
+        credits_after_reservation: float,
+    ) -> dict[str, Any]:
+        """Build this call's runtime header from live scheduler/report state."""
+
+        coordinator = self.report_coordinators.get(task_id)
+        remaining = 0
+        if coordinator is not None:
+            due_at = getattr(coordinator, "deadline_at", None)
+            clock = getattr(coordinator, "clock", None)
+            now = float(clock()) if callable(clock) else _now()
+            if due_at is not None:
+                remaining = int(max(0.0, float(due_at) - now))
+        active_count = queued_count = 0
+        stats = getattr(self.scheduler, "stats", None)
+        if callable(stats):
+            try:
+                task_stats = dict((stats().get("tasks") or {}).get(task_id) or {})
+                active_count = int(task_stats.get("active", 0))
+                queued_count = int(task_stats.get("queued", 0))
+            except Exception:  # telemetry must never block a research call
+                active_count = queued_count = 0
+        return RuntimeHeader(
+            branch_id,
+            turn_number,
+            str(getattr(definition, "description", "") or getattr(definition, "agent_id", "")),
+            remaining,
+            credits_after_reservation,
+            active_count,
+            queued_count,
+        ).message()
 
     def _estimate_agent_reservation(
         self,
@@ -830,6 +1031,8 @@ class ResearchManager:
         selector: str,
         messages: tuple[dict[str, Any], ...],
         protocol: str,
+        inherited_messages: Sequence[Mapping[str, Any]] = (),
+        parent_actual_model_name: str = "",
     ) -> tuple[float, int, int, int, Any]:
         """Estimate input-only research credits before an agent LLM call."""
 
@@ -841,10 +1044,24 @@ class ResearchManager:
                 tools = SWARM_TURN_TOOLS
             except Exception:
                 tools = None
-        token_est = estimate_prompt_tokens(messages, tools)
         catalog = getattr(snapshot, "price_catalog", None)
         resolved = None
         estimated_charge = 0.0
+        token_est = estimate_prompt_tokens(messages, tools)
+        if catalog is not None and inherited_messages and parent_actual_model_name:
+            # design §11.2: estimate input from messages *and* cache lineage.  A
+            # proven byte-identical inherited prefix on the same physical model is
+            # billed at the cache-hit price instead of the conservative all-miss
+            # estimate.
+            candidate = catalog.estimate_model_for_selector(selector)
+            token_est = estimate_child_tokens(
+                messages,
+                inherited_messages=tuple(dict(item) for item in inherited_messages),
+                parent_actual_model_name=parent_actual_model_name,
+                estimated_model_name=candidate.model_name,
+                cache_enabled=bool(candidate.profile.cache),
+                tools=tools,
+            )
         if catalog is not None:
             # Missing Host prices resolve to an explicit free profile inside the
             # catalog. Unexpected estimator failures must not silently under-reserve.
@@ -894,10 +1111,6 @@ class ResearchManager:
         configured_window = self._runtime_limits.get("model_context_window")
         if configured_window is not None:
             model_limit = int(configured_window)
-        if resolved is not None:
-            profile_window = getattr(getattr(resolved, "profile", None), "context_window", None)
-            if profile_window is not None:
-                model_limit = int(profile_window)
         if not should_auto_compact(
             int(prompt_tokens),
             agent_override=int(agent_override) if agent_override is not None else None,
@@ -909,6 +1122,7 @@ class ResearchManager:
         ):
             return messages, prompt_tokens, cache_hit, cache_miss, estimated_charge, resolved
         formalized = controller.state.formalized_task
+        compact_started = time.perf_counter()
         compact_result = await execute_core_procedure(
             CORE_COMPACT_ID,
             {},
@@ -917,6 +1131,18 @@ class ResearchManager:
                 formalized_task=formalized.text if formalized is not None else None,
                 branch_history=messages,
             ),
+        )
+        # Automatic compaction is a real core procedure invocation; record it so
+        # `compact_count` is not silently limited to agent-requested compaction.
+        await self._record_auto_compact_call(
+            effect=effect,
+            branch_id=branch_id,
+            agent_id=str(getattr(definition, "agent_id", "") or ""),
+            success=bool(getattr(compact_result, "success", False)),
+            error_code=(getattr(compact_result, "error", None) or {}).get("code")
+            if isinstance(getattr(compact_result, "error", None), Mapping)
+            else None,
+            duration_ms=int((time.perf_counter() - compact_started) * 1000),
         )
         data = getattr(compact_result, "data", None)
         if not bool(getattr(compact_result, "success", False)) or not isinstance(data, Mapping) or not data.get("compacted"):
@@ -950,6 +1176,48 @@ class ResearchManager:
         ):
             raise RuntimeError("自动 compact 后上下文仍超过安全窗口，终止该分支调用")
         return messages, prompt_tokens, cache_hit, cache_miss, estimated_charge, resolved
+
+    async def _record_auto_compact_call(
+        self,
+        *,
+        effect: PerformAgentCall,
+        branch_id: str,
+        agent_id: str,
+        success: bool,
+        error_code: str | None,
+        duration_ms: int,
+    ) -> None:
+        """Persist a ``procedure_calls`` row for scheduler-driven compaction."""
+
+        try:
+            await self.store.transact(
+                (
+                    StoreCommand(
+                        "insert_procedure_call",
+                        {
+                            "request_id": f"autocompact_{uuid.uuid4().hex}",
+                            "task_id": effect.task_id,
+                            "round_id": str(effect.round_id or ""),
+                            "branch_id": branch_id,
+                            "turn_id": str(effect.payload.get("call_id") or ""),
+                            "agent_id": agent_id or "lrs.scheduler",
+                            "procedure_id": CORE_COMPACT_ID,
+                            "provider_plugin_id": "core",
+                            "status": "succeeded" if success else "failed",
+                            "duration_ms": max(0, int(duration_ms)),
+                            "error_code": error_code if not success else None,
+                            "provenance_json": json.dumps(
+                                {"trigger": "auto_compact"}, ensure_ascii=False, sort_keys=True
+                            ),
+                            "external_cost_json": None,
+                            "created_at": _now(),
+                        },
+                    ),
+                )
+            )
+        except Exception:
+            # Telemetry must never block the research call it describes.
+            _LOG.warning("自动 compact 计量写入失败 task_id=%s", effect.task_id, exc_info=True)
 
     async def prepare_procedure_effect(self, effect: Any) -> Any:
         """Attach the procedure catalog frozen for this task round."""
@@ -1004,13 +1272,11 @@ class ResearchManager:
         payload = dict(effect.payload)
         snapshot = self._round_snapshots[effect.task_id]
         agent_id = str(payload.get("agent_id", ""))
-        if not self._agent_is_live(agent_id, snapshot):
-            failed = dict(payload)
-            failed.update({"reason": "agent_unavailable", "edge_finalization": True})
-            await self.scheduler.enqueue(
-                PerformBranchSummary(effect.task_id, effect.round_id, effect.generation, priority="barrier", payload=failed)
-            )
-            return
+        # An agent removed between delegation and materialization still has to be
+        # committed as a branch: this effect may be the one carrying the parent's
+        # retirement and pool return, and its allocated credits must settle back
+        # through BranchFinalized rather than disappearing.
+        agent_live = self._agent_is_live(agent_id, snapshot)
         branch_id = str(payload["branch_id"])
         parent_id = str(payload["parent_branch_id"])
         credits = float(payload.get("credits", 0.0))
@@ -1026,13 +1292,21 @@ class ResearchManager:
                 credits=credits, depth=depth, retire_parent=bool(payload.get("retire_parent", False)),
                 pool_return=float(payload.get("pool_return", 0.0)),
                 parent_credits_after=parent_credits_after,
+                agent_calls_started=int(payload.get("agent_calls_started", 0) or 0),
             ),
         )
         self._sync_branch_credits(effect.task_id, controller)
         messages = [dict(item) for item in payload.get("messages", ())]
+        parent_branch = self._branches[effect.task_id].get(parent_id) or {}
         self._branches[effect.task_id][branch_id] = {
             "credits": credits, "pending_context": [], "agent_id": agent_id,
             "messages": messages, "depth": depth,
+            # Cache lineage for the child's first input estimate (design §11.2):
+            # everything before the appended assignment is byte-identical to what
+            # the parent already sent to its own physical model.
+            "inherited_messages": tuple(dict(item) for item in messages[:-1]),
+            "inherited_model_name": str(parent_branch.get("last_actual_model_name", "") or ""),
+            "turn": 0,
         }
         if payload.get("retire_parent"):
             self._branches[effect.task_id].pop(parent_id, None)
@@ -1051,8 +1325,57 @@ class ResearchManager:
                 branch_id, coordinator.formalized_task, snapshot.agent_catalog.fingerprint,
                 effect.generation, messages, credits, depth, parent_branch_id=parent_id,
             )
+        if not agent_live:
+            failed = dict(payload)
+            failed.update({"reason": "agent_unavailable", "edge_finalization": True})
+            await self.scheduler.enqueue(
+                PerformBranchSummary(
+                    effect.task_id, effect.round_id, effect.generation, priority="barrier", payload=failed
+                )
+            )
+            return
         await self.scheduler.enqueue(
             PerformAgentCall(effect.task_id, effect.round_id, effect.generation, payload={"branch_id": branch_id})
+        )
+
+    async def fail_agent_effect(self, effect: Any, *, error_code: str, error_message: str) -> None:
+        """Turn a crashed worker effect into a durable branch failure.
+
+        Without this, an exception raised while preparing or running an effect
+        leaves the branch in ``active_leaves`` with no scheduled work: no summary,
+        no error, and a round that can never reach FINALIZING (design §23.2/§23.3).
+        """
+
+        controller = self._controllers.get(getattr(effect, "task_id", ""))
+        if (
+            controller is None
+            or getattr(effect, "round_id", None) != controller.state.active_round_id
+            or getattr(effect, "generation", None) != controller.state.generation
+        ):
+            return
+        branch_id = str(dict(getattr(effect, "payload", {}) or {}).get("branch_id", ""))
+        if not branch_id or branch_id not in controller.state.active_leaves:
+            return
+        self.ctx.logger.error(
+            "LRS effect 执行失败，已终结分支：task_id=%s branch_id=%s code=%s",
+            controller.state.task_id,
+            branch_id,
+            error_code,
+        )
+        await self.handle_runtime_event(
+            AgentCallFailed(
+                _event_id(),
+                controller.state.task_id,
+                str(controller.state.active_round_id or ""),
+                controller.state.generation,
+                branch_id=branch_id,
+                call_id=str(dict(getattr(effect, "payload", {}) or {}).get("call_id", "")),
+                error_code=error_code,
+                error_message=error_message[:512],
+                # No usage was produced, so the branch keeps whatever the ledger
+                # already debited; do not invent a reconciliation.
+                balance_before_reconciliation=float(controller.state.active_leaves[branch_id]),
+            )
         )
 
     async def handle_branch_summary_effect(self, effect: PerformBranchSummary) -> None:
@@ -1083,6 +1406,13 @@ class ResearchManager:
             )
         reason = str(payload.get("reason", "no_further_work"))
         held = tuple(payload.get("held_delegations", ()))
+        appended = tuple(
+            dict(item) for item in payload.get("appended_messages", ()) if isinstance(item, Mapping)
+        )
+        if appended:
+            runtime = coordinator.branches.get(branch_id)
+            if runtime is not None:
+                runtime.messages.extend(dict(item) for item in appended)
         if reason == "checkpoint":
             await coordinator.on_branch_safe_point(
                 branch_id, checkpoint=True, terminal=False, delegations=held
@@ -1517,6 +1847,10 @@ class ResearchManager:
             statistics=self.statistics,
             price_catalog=getattr(self._round_snapshots.get(task_id), "price_catalog", None),
             summarizer_selector=self._summarizer_selector,
+            max_report_chars=int(self._runtime_limits.get("max_report_chars", 60000)),
+            max_stats_chars=int(self._runtime_limits.get("max_stats_chars", 12000)),
+            deliver_intermediate=bool(self._runtime_limits.get("deliver_intermediate", True)),
+            deliver_final=bool(self._runtime_limits.get("deliver_final", True)),
         )
 
     def _restore_round_ephemeral(
@@ -1635,18 +1969,78 @@ class ResearchManager:
                 parent.get("credits", parent_runtime.credits if parent_runtime is not None else 0.0),
             )
         )
-        allocatable: list[tuple[str, float]] = []
-        normalized: list[tuple[str, str, str, float]] = []
-        for index, raw in enumerate(delegations):
-            agent_id = str(raw.get("agent_id") or "")
-            assignment = str(raw.get("task") or raw.get("assignment") or "")
-            requested = float(raw.get("credits", 0.0) or 0.0)
-            branch_id = str(raw.get("branch_id") or f"{parent_branch_id}:{index + 1}")
-            normalized.append((branch_id, agent_id, assignment, requested))
-            allocatable.append((str(index), requested))
-        allocation = allocate_children(parent_credits, allocatable)
-        for index, (branch_id, agent_id, assignment, _requested) in enumerate(normalized):
-            credits = float(allocation.allocations.get(str(index), 0.0))
+        live_ids = tuple(
+            sorted(
+                item.definition.agent_id
+                for item in getattr(snapshot.agent_catalog, "entries", ())
+                if item is not None and self._agent_is_live(item.definition.agent_id, snapshot)
+            )
+        )
+        limits = {
+            "max_delegations_per_turn": int(self._runtime_limits.get("max_delegations_per_turn", 8)),
+            "max_branch_depth": int(self._runtime_limits.get("max_branch_depth", 32)),
+            "max_agent_calls_per_task": int(self._runtime_limits.get("max_agent_calls_per_task", 256)),
+        }
+        try:
+            # Releasing a held checkpoint is that same deferred delegation, so it
+            # runs through the identical planner as an ordinary turn: structural
+            # limits, liveness and credit scaling cannot diverge between the paths.
+            plan = plan_delegations(
+                delegations,
+                parent_branch_id=parent_branch_id,
+                parent_depth=parent_depth,
+                parent_credits=parent_credits,
+                parent_messages=parent_messages,
+                live_agent_ids=live_ids,
+                agent_calls_started=int(controller.state.agent_calls_started),
+                **limits,
+            )
+        except (TypeError, ValueError):
+            _LOG.warning(
+                "暂存委派无效，终结父分支 task_id=%s branch_id=%s", task_id, parent_branch_id, exc_info=True
+            )
+            await self._finalize_held_parent(
+                task_id, parent_branch_id, reason="delegation_invalid", appended=()
+            )
+            return
+
+        for edge in plan.rejected:
+            await self.scheduler.enqueue(
+                PerformBranchSummary(
+                    task_id,
+                    controller.state.active_round_id or "",
+                    controller.state.generation,
+                    priority="barrier",
+                    payload={
+                        "edge_finalization": True,
+                        "branch_id": edge.branch_id,
+                        "parent_branch_id": parent_branch_id,
+                        "agent_id": edge.agent_id,
+                        "assignment": edge.assignment,
+                        "reason": edge.reason,
+                        "credits": 0.0,
+                        "depth": edge.depth,
+                        "messages": edge.messages,
+                    },
+                )
+            )
+        if plan.all_rejected:
+            notice = rejected_edge_notice(plan.rejected)
+            if plan.blocking_reason is not None:
+                await self._finalize_held_parent(
+                    task_id, parent_branch_id, reason=plan.blocking_reason, appended=(notice,)
+                )
+                return
+            await self.scheduler.enqueue(
+                PerformAgentCall(
+                    task_id,
+                    controller.state.active_round_id or "",
+                    controller.state.generation,
+                    payload={"branch_id": parent_branch_id, "appended_messages": (notice,)},
+                )
+            )
+            return
+        for child in plan.children:
             await self.scheduler.enqueue(
                 NotifyToolWaiter(
                     task_id,
@@ -1655,25 +2049,51 @@ class ResearchManager:
                     priority="barrier",
                     payload={
                         "action": "materialize_child",
-                        "branch_id": branch_id,
+                        "branch_id": child.branch_id,
                         "parent_branch_id": parent_branch_id,
-                        "agent_id": agent_id,
-                        "assignment": assignment,
-                        "credits": credits,
-                        "depth": parent_depth + 1,
-                        "messages": (
-                            *parent_messages,
-                            {"role": "user", "content": f"assignment: {assignment}"},
-                        ),
-                        "retire_parent": False,
-                        "pool_return": 0.0,
-                        # First child carries the parent's post-transfer remainder.
-                        "parent_credits_after": (
-                            float(allocation.returned_to_pool) if index == 0 else None
-                        ),
+                        "agent_id": child.agent_id,
+                        "assignment": child.assignment,
+                        "credits": child.credits,
+                        "depth": child.depth,
+                        "messages": child.messages,
+                        # Design §10 step 12: a delegating parent retires once its
+                        # children exist.  Keeping it active here would strand it
+                        # with no scheduled work and let it reuse `{parent}:{n}` ids.
+                        "retire_parent": child.retire_parent,
+                        "pool_return": child.pool_return,
+                        "parent_credits_after": None,
+                        "agent_calls_started": plan.calls_after_reservation,
                     },
                 )
             )
+
+    async def _finalize_held_parent(
+        self,
+        task_id: str,
+        parent_branch_id: str,
+        *,
+        reason: str,
+        appended: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        """Finalize a parent whose released delegations can never launch."""
+
+        controller = self._controllers.get(task_id)
+        if controller is None:
+            return
+        await self.scheduler.enqueue(
+            PerformBranchSummary(
+                task_id,
+                controller.state.active_round_id or "",
+                controller.state.generation,
+                priority="barrier",
+                payload={
+                    "branch_id": parent_branch_id,
+                    "reason": reason,
+                    "held_delegations": (),
+                    "appended_messages": appended,
+                },
+            )
+        )
 
     async def wait_idle(self, task_id: str) -> None:
         while True:
@@ -1744,8 +2164,22 @@ class ResearchManager:
             "created_at": _iso_timestamp(created_at) if created_at is not None else None,
         }
 
-    def _stored_time_budget(self, task_id: str) -> int | None:
-        return None
+    async def _stored_time_budget(self, task_id: str) -> int | None:
+        """Design §7.5: omitting ``time_budget_seconds`` reuses the Task's saved interval.
+
+        This is the stored interval, not the unconsumed remainder — ``continue``
+        always restarts the report clock from a full interval.
+        """
+
+        try:
+            stored = await self.store.load_task(task_id)
+        except Exception:
+            return None
+        current_round = getattr(stored, "current_round", None) if stored is not None else None
+        value = getattr(current_round, "time_budget_seconds", None)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+        return value
 
     def _controller(self, task_id: str) -> TaskController:
         try:

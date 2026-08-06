@@ -5,6 +5,7 @@ from lunagentic_research_swarm.models import TaskStatus
 from lunagentic_research_swarm.runtime.events import ProcedureBatchCompleted
 from lunagentic_research_swarm.runtime.reducer import (
     NotifyToolWaiter,
+    PerformAgentCall,
     PerformBranchSummary,
     RuntimeState,
     reduce_event,
@@ -104,6 +105,9 @@ def test_registry_removal_is_reflected_in_inflight_edge_resolution() -> None:
     assert snapshot.get("extension.sibling") is not None
     assert not registry.is_live("extension.sibling")
 
+    # 唯一一条委派边指向已移除的 agent：没有任何子分支可以启动，父分支不能被
+    # 悬空。credits 全额留在父分支，父分支带着失败说明重试一次（spec §14.3 的
+    # "同一 envelope 中其他有效委派不受影响" 在这里退化为"没有有效委派"）。
     transition = reduce_event(
         RuntimeState("task", TaskStatus.RUNNING, active_round_id="round", active_leaves={"parent": 1.0}),
         _procedure_event(
@@ -111,5 +115,14 @@ def test_registry_removal_is_reflected_in_inflight_edge_resolution() -> None:
             live_agent_ids=(),
         ),
     )
-    removed = [effect for effect in transition.effects if isinstance(effect, PerformBranchSummary)]
-    assert removed and removed[0].payload["reason"] == "agent_unavailable"
+    assert not [effect for effect in transition.effects if isinstance(effect, NotifyToolWaiter)]
+    retries = [effect for effect in transition.effects if isinstance(effect, PerformAgentCall)]
+    assert len(retries) == 1
+    assert retries[0].payload["branch_id"] == "parent"
+    notice = retries[0].payload["appended_messages"][0]["content"]
+    assert "extension.sibling" in notice and "agent_unavailable" in notice
+    # 请求的 1.0 credits 没有流向从未存在的边，父分支保留本 turn 的全部余额。
+    assert transition.next_state.active_leaves == {"parent": 10.0}
+    assert transition.next_state.credit_pool == 0.0
+    # 重试是一次正常 turn，必须计入 max_agent_calls_per_task（事件基线为 1）。
+    assert transition.next_state.agent_calls_started == 2

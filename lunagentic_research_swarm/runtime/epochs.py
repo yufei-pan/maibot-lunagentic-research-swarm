@@ -140,6 +140,10 @@ class ReportCoordinator:
         statistics: StatisticsService | None = None,
         price_catalog: Any | None = None,
         summarizer_selector: str = "task:mid_memory",
+        max_report_chars: int = 60000,
+        max_stats_chars: int = 12000,
+        deliver_intermediate: bool = True,
+        deliver_final: bool = True,
     ) -> None:
         if time_budget_seconds <= 0 or grace_period_seconds < 0:
             raise ValueError("报告时间预算必须为正且 grace 不得为负")
@@ -157,6 +161,10 @@ class ReportCoordinator:
         self.statistics = statistics
         self.price_catalog = price_catalog
         self.summarizer_selector = str(summarizer_selector or "task:mid_memory")
+        self.max_report_chars = max(1000, int(max_report_chars))
+        self.max_stats_chars = max(1000, int(max_stats_chars))
+        self.deliver_intermediate = bool(deliver_intermediate)
+        self.deliver_final = bool(deliver_final)
         self.current_epoch: ReportEpoch | None = None
         self.epochs: list[ReportEpoch] = []
         self.reports: list[ReportRecord] = []
@@ -172,10 +180,19 @@ class ReportCoordinator:
         }
 
     def pending_summary_messages(self, branch_id: str) -> tuple[dict[str, str], ...]:
-        """Return committed broadcasts once per branch, for its next LLM call."""
+        """Return committed broadcasts once per branch, for its next LLM call.
+
+        Design §13.5 broadcasts a summary to the *other* active branches; a branch
+        already carries its own history, so its own checkpoint is never echoed
+        back to it.
+        """
 
         seen = self._seen.setdefault(branch_id, set())
-        pending = [item for item in self._summaries if item.summary_id not in seen and item.available]
+        pending = [
+            item
+            for item in self._summaries
+            if item.summary_id not in seen and item.available and item.branch_id != branch_id
+        ]
         seen.update(item.summary_id for item in pending)
         return coverage_messages(CoverageSet(tuple(pending)))
 
@@ -518,41 +535,62 @@ class ReportCoordinator:
     ) -> tuple[dict[str, Any], str]:
         """在同一 store transaction 内重算 stats 并写入 report/outbox。"""
 
+        def _clip(text: str, limit: int) -> str:
+            return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
+
         def _build_text(ledger_stats: dict[str, Any]) -> str:
-            return render_report(
-                kind=frozen_kind,
-                body=body,
-                task_id=self.task_id,
-                round_id=self.round_id,
-                epoch=report_epoch.epoch,
-                running_branch_count=running,
-                queued_branch_count=len(self._held),
-                unavailable_count=coverage.unavailable_count,
-                elapsed_seconds=created_at - self.started_at,
-                next_interval_seconds=self.time_budget_seconds,
-                credit_balance=credit_balance,
-                credit_pool=self.credit_pool,
-                pending_work=tuple(self._held),
-                stats=ledger_stats,
+            # `[reporting] max_stats_chars` / `max_report_chars` bound what a single
+            # report may put into Maisaka context.
+            bounded_stats = dict(ledger_stats)
+            rendered = json.dumps(bounded_stats, ensure_ascii=False, sort_keys=True)
+            if len(rendered) > self.max_stats_chars:
+                bounded_stats = {"task_id": self.task_id, "stats_truncated": True}
+            return _clip(
+                render_report(
+                    kind=frozen_kind,
+                    body=body,
+                    task_id=self.task_id,
+                    round_id=self.round_id,
+                    epoch=report_epoch.epoch,
+                    running_branch_count=running,
+                    queued_branch_count=len(self._held),
+                    unavailable_count=coverage.unavailable_count,
+                    elapsed_seconds=created_at - self.started_at,
+                    next_interval_seconds=self.time_budget_seconds,
+                    credit_balance=credit_balance,
+                    credit_pool=self.credit_pool,
+                    pending_work=tuple(self._held),
+                    stats=bounded_stats,
+                ),
+                self.max_report_chars,
             )
 
         def _commands(ledger_stats: dict[str, Any], text: str) -> tuple[StoreCommand, ...]:
+            # `[reporting] deliver_intermediate` / `deliver_final` only gate Maisaka
+            # delivery.  The report itself is always durable, so `/swarm status`,
+            # statistics and past-case retrieval keep working.
+            deliver = (
+                self.deliver_final if frozen_kind is ReportKind.FINAL else self.deliver_intermediate
+            )
+            report_command = StoreCommand(
+                "insert_report",
+                {
+                    "report_id": report_id,
+                    "task_id": self.task_id,
+                    "round_id": self.round_id,
+                    "epoch": report_epoch.epoch,
+                    "kind": frozen_kind.value,
+                    "text": text,
+                    "status": status,
+                    "running_branch_count": running,
+                    "stats_json": json.dumps(ledger_stats, ensure_ascii=False, sort_keys=True),
+                    "created_at": created_at,
+                },
+            )
+            if not deliver:
+                return (report_command,)
             return (
-                StoreCommand(
-                    "insert_report",
-                    {
-                        "report_id": report_id,
-                        "task_id": self.task_id,
-                        "round_id": self.round_id,
-                        "epoch": report_epoch.epoch,
-                        "kind": frozen_kind.value,
-                        "text": text,
-                        "status": status,
-                        "running_branch_count": running,
-                        "stats_json": json.dumps(ledger_stats, ensure_ascii=False, sort_keys=True),
-                        "created_at": created_at,
-                    },
-                ),
+                report_command,
                 StoreCommand(
                     "insert_outbox",
                     {

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from lunagentic_research_swarm.models import BranchRuntime, FormalizedTask
+from lunagentic_research_swarm.models import BranchRuntime, FormalizedTask, SummaryKind
+from lunagentic_research_swarm.procedures.executor import ProcedureExecutor
+from lunagentic_research_swarm.reporting import CoverageSet, CoverageSummary, coverage_messages
 from lunagentic_research_swarm.runtime.context import (
     RuntimeHeader,
     StablePromptBuilder,
     release_raw_context,
     should_auto_compact,
 )
+
+
+def _checkpoint_coverage(text: str) -> CoverageSet:
+    return CoverageSet((CoverageSummary("sum_1", "agent.sibling", SummaryKind.CHECKPOINT, 1, text, 1.0),))
 
 
 def user_one_bytes(messages: list[dict[str, object]]) -> bytes:
@@ -24,14 +30,24 @@ def test_formalized_task_is_byte_invariant_across_graph_context_operations() -> 
         procedure_catalog={"builtin.echo": {"description": "回显"}},
         pricing={"agent.root": {"fingerprint": "price-1", "price_in": 1.0, "price_out": 2.0}},
     )
+    # 走生产路径构造后代消息：reducer 追加 assignment，executor 在 compact 时重写
+    # 可变历史并原样保留 system + 正式任务前缀。
     root = builder.root_context(coordinator="agent.root")
-    snapshots = [builder.messages_for_call(root, RuntimeHeader("root", 1, "root", 99, 8.0, 1, 0))]
-    child = builder.delegate(root, assignment="核查来源", agent_id="agent.child")
-    snapshots.append(builder.messages_for_call(child, RuntimeHeader("child", 1, "search", 80, 2.0, 2, 1)))
-    builder.compact(child, summary="压缩摘要")
-    snapshots.append(builder.messages_for_call(child, RuntimeHeader("child", 2, "search", 60, 1.0, 1, 0)))
-    builder.checkpoint(child, summary="checkpoint 摘要")
-    snapshots.append(builder.messages_for_call(child, RuntimeHeader("child", 3, "search", 40, 1.0, 1, 0)))
+    root_messages = builder.messages_for_call(root, RuntimeHeader("root", 1, "root", 99, 8.0, 1, 0))
+    snapshots = [root_messages]
+
+    child_messages = [*root_messages, {"role": "user", "content": "assignment: 核查来源"}]
+    snapshots.append(child_messages)
+
+    child_messages = [*child_messages, {"role": "assistant", "content": "本 turn 的 report"}]
+    snapshots.append(child_messages)
+
+    compacted = list(ProcedureExecutor._rewrite_compacted_messages(child_messages, "压缩摘要"))
+    snapshots.append(compacted)
+
+    broadcast = [*compacted, *coverage_messages(_checkpoint_coverage("checkpoint 摘要"))]
+    snapshots.append(broadcast)
+
     restarted = builder.restart_context(summary_layers=("branch summary", "task report"), coordinator="agent.root")
     snapshots.append(builder.messages_for_call(restarted, RuntimeHeader("restart", 1, "root", 120, 3.0, 1, 0)))
 

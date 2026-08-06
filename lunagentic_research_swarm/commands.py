@@ -532,7 +532,11 @@ def _allow_vector_rebuild(plugin: Any) -> bool:
 
 
 def _maintenance_allowlist(plugin: Any) -> list[str]:
-    """维护白名单：优先 `maintenance_allowed_user_ids`（Host user_id），兼容旧字段名。"""
+    """维护白名单：优先 `maintenance_allowed_user_ids`，兼容旧字段名。
+
+    条目可以是平台 `user_id`，也可以是 MaiBot `person_id`
+    （``md5(f"{platform}_{user_id}")``，跨适配器唯一）。
+    """
 
     section = _commands_config(plugin)
     if section is None:
@@ -543,23 +547,43 @@ def _maintenance_allowlist(plugin: Any) -> list[str]:
     return [str(item).strip() for item in list(raw or []) if str(item).strip()]
 
 
-def _maintenance_allowed(plugin: Any, kwargs: Mapping[str, Any]) -> bool:
-    """空白名单 = 不限制；非空时与 Host 命令 RPC 的 `user_id` 对齐。"""
+async def _maintenance_allowed(plugin: Any, kwargs: Mapping[str, Any]) -> bool:
+    """空白名单 = 不限制；非空时匹配平台 `user_id` 或 MaiBot `person_id`。
+
+    Host 的命令 RPC 只传 `platform` / `user_id`，不传 `person_id`；因此 person_id
+    由 `ctx.person.get_id(platform, user_id)` 现算。两种 ID 格式不会互相碰撞
+    （person_id 固定是 32 位 md5 hex），所以同时接受是安全的。
+    """
 
     allowed = _maintenance_allowlist(plugin)
     if not allowed:
         return True
     message = kwargs.get("message") if isinstance(kwargs.get("message"), Mapping) else {}
-    candidates = [
-        kwargs.get("user_id"),
-        message.get("user_id") if isinstance(message, Mapping) else None,
-        kwargs.get("person_id"),
-    ]
+    user_info = message.get("user_info") if isinstance(message, Mapping) else None
+    raw_user_id = next(
+        (
+            str(value).strip()
+            for value in (
+                kwargs.get("user_id"),
+                message.get("user_id") if isinstance(message, Mapping) else None,
+                user_info.get("user_id") if isinstance(user_info, Mapping) else None,
+            )
+            if isinstance(value, (str, int)) and str(value).strip()
+        ),
+        "",
+    )
     allowed_set = set(allowed)
-    for value in candidates:
-        if isinstance(value, str) and value.strip() and value.strip() in allowed_set:
-            return True
-    return False
+    if raw_user_id and raw_user_id in allowed_set:
+        return True
+    platform = str(kwargs.get("platform") or (message.get("platform") if isinstance(message, Mapping) else "") or "")
+    if not raw_user_id or not platform:
+        return False
+    try:
+        person_id = await plugin.ctx.person.get_id(platform, raw_user_id)
+    except Exception:
+        # person 能力不可用时只按 user_id 判定，绝不放宽为“允许”。
+        return False
+    return isinstance(person_id, str) and person_id.strip() in allowed_set
 
 
 class SwarmCommandsMixin:
@@ -811,7 +835,7 @@ class SwarmCommandsMixin:
         assert stream_id is not None
         if not _allow_vector_rebuild(self):
             return await self._swarm_fail("已禁止向量重建（commands.allow_vector_rebuild=false）", stream_id)
-        if not _maintenance_allowed(self, {**kwargs, "stream_id": stream_id}):
+        if not await _maintenance_allowed(self, {**kwargs, "stream_id": stream_id}):
             return await self._swarm_fail("当前用户不在维护人员白名单中", stream_id)
         services = self._swarm_services()
         vector = getattr(services, "vector_index", None) if services is not None else None

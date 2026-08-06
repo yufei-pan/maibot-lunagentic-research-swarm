@@ -19,6 +19,7 @@ class FakeRound:
     generation: int
     status: SimpleNamespace
     credit_pool: float = 0.0
+    time_budget_seconds: int = 0
 
 
 @dataclass
@@ -51,6 +52,7 @@ class FakeStore:
                     values["generation"],
                     SimpleNamespace(value=values["status"]),
                     float(values.get("credit_pool", 0.0)),
+                    int(values.get("time_budget_seconds", 0) or 0),
                 )
             elif command.kind == "update_round_status":
                 for task in self.tasks.values():
@@ -170,7 +172,7 @@ class FakeScheduler:
 class FakePriceCatalog:
     fingerprint = "price-fingerprint"
 
-    def low_budget_warning(self, selector: str, credits: float):
+    def low_budget_warning(self, selector: str, credits: float, **_kwargs: object):
         return "预算偏低" if credits < 25 else None
 
     def estimate_model_for_selector(self, selector: str):
@@ -221,7 +223,11 @@ def harness():
     ctx = SimpleNamespace(
         message=message,
         config=config,
-        logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
+        logger=SimpleNamespace(
+            warning=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: None,
+            info=lambda *args, **kwargs: None,
+        ),
     )
     snapshot = SimpleNamespace(
         root_agent="root",
@@ -596,14 +602,52 @@ async def test_held_release_transfers_parent_credits_without_minting(harness) ->
         if isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
     ]
     assert len(materialize) == 2
-    assert materialize[0].payload["parent_credits_after"] == 0.0
-    assert materialize[1].payload["parent_credits_after"] is None
+    # 释放暂存委派就是那次被推迟的委派：第一个 child 承担父节点退休与 pool 归还，
+    # 父节点不再是活动叶子，因此 `{parent}:{n}` 子 ID 空间只会被使用一次。
+    assert materialize[0].payload["retire_parent"] is True
+    assert materialize[0].payload["pool_return"] == pytest.approx(0.0)
+    assert materialize[1].payload["retire_parent"] is False
+    assert all(item.payload["parent_credits_after"] is None for item in materialize)
     for item in materialize:
         await manager.materialize_child_effect(item)
-    leaves = dict(manager._controllers[task_id].state.active_leaves)
-    assert leaves[parent_id] == 0.0
+    state = manager._controllers[task_id].state
+    leaves = dict(state.active_leaves)
+    assert parent_id not in leaves
     assert leaves[f"{parent_id}:1"] + leaves[f"{parent_id}:2"] == pytest.approx(100.0)
-    assert sum(leaves.values()) == pytest.approx(100.0)
+    assert sum(leaves.values()) + state.credit_pool == pytest.approx(100.0)
+
+
+@pytest.mark.asyncio
+async def test_held_release_returns_the_unallocated_remainder_to_the_pool(harness) -> None:
+    from lunagentic_research_swarm.runtime.reducer import NotifyToolWaiter
+
+    manager, _, _, scheduler, *_ = harness
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120, effort_level=1.0)
+    await manager.wait_idle(result["task_id"])
+    task_id = result["task_id"]
+    parent_id = (await manager.status(task_id))["active_leaves"][0]["branch_id"]
+
+    scheduler.enqueued.clear()
+    await manager._release_held_delegations(
+        task_id,
+        parent_id,
+        ({"branch_id": f"{parent_id}:1", "agent_id": "child", "task": "a", "credits": 30.0},),
+    )
+    materialize = [
+        item
+        for item in scheduler.enqueued
+        if isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
+    ]
+    for item in materialize:
+        await manager.materialize_child_effect(item)
+
+    state = manager._controllers[task_id].state
+    leaves = dict(state.active_leaves)
+    assert parent_id not in leaves
+    assert leaves[f"{parent_id}:1"] == pytest.approx(30.0)
+    # 未分配的 70 随父节点退休结算进 dormant pool，不会凭空消失。
+    assert state.credit_pool == pytest.approx(70.0)
+    assert sum(leaves.values()) + state.credit_pool == pytest.approx(100.0)
 
 
 @pytest.mark.asyncio

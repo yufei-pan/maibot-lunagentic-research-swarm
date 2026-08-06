@@ -188,7 +188,7 @@ class LRSServiceContainer:
         }
 
     @staticmethod
-    def _extract_safety_limits(config: LRSConfig) -> dict[str, int | float | None]:
+    def _extract_safety_limits(config: LRSConfig) -> dict[str, Any]:
         return {
             "default_time_budget_seconds": int(config.timing.default_time_budget_seconds),
             "grace_period_seconds": int(config.timing.grace_period_seconds),
@@ -209,10 +209,22 @@ class LRSServiceContainer:
                 else None
             ),
             "max_correction_turns": int(config.protocol.max_correction_turns),
+            "warning_miss_input_tokens": int(config.budget.warning_miss_input_tokens),
+            "warning_output_tokens": int(config.budget.warning_output_tokens),
+            "default_protocol": str(config.protocol.default_mode),
+            "max_report_chars": int(config.reporting.max_report_chars),
+            "max_stats_chars": int(config.reporting.max_stats_chars),
+            "deliver_intermediate": bool(config.reporting.deliver_intermediate),
+            "deliver_final": bool(config.reporting.deliver_final),
         }
 
+    def _default_protocol(self) -> str:
+        """`[protocol] default_mode`：provider 未声明 protocol 时的回退协议。"""
+
+        return str(self._config.protocol.default_mode)
+
     @property
-    def safety_limits(self) -> Mapping[str, int | float | None]:
+    def safety_limits(self) -> Mapping[str, Any]:
         return dict(self._safety_limits)
 
     @property
@@ -337,13 +349,53 @@ class LRSServiceContainer:
             self._record_physical_pinning_health()
             self._warn_for_low_root_budget()
             await self._start_runtime()
+            assert self.manager is not None
+            restored = await self.manager.restore_tasks()
+            self._status["legacy_rounds"] = {
+                **self._status["legacy_rounds"],
+                "restored_tasks": int(restored),
+            }
             self._discovery.start()
             self._state = "running"
-        except BaseException:
-            self._status["sqlite"] = {"status": "critical", "code": "sqlite_initialization_failed"}
+        except BaseException as exc:
+            # Only a genuine store failure is a SQLite failure; a root-agent or
+            # extension error must not be reported as `sqlite_initialization_failed`.
+            self._record_start_failure(exc)
             await self._cleanup_start_failure()
             self._state = "failed"
             raise
+
+    _START_STAGE_CODES: Mapping[str, str] = MappingProxyType(
+        {
+            "sqlite": "sqlite_initialization_failed",
+            "root_agent": "root_agent_unavailable",
+            "extension_fingerprint_store": "extension_fingerprint_persistence_failed",
+            "runtime": "runtime_start_failed",
+        }
+    )
+
+    def _record_start_failure(self, exc: BaseException) -> None:
+        """Attribute a startup failure to the stage that actually failed."""
+
+        if isinstance(exc, RootAgentUnavailableError):
+            self._status["root_agent"] = {
+                "status": "critical",
+                "code": self._START_STAGE_CODES["root_agent"],
+            }
+            return
+        if self._status["extension_fingerprint_store"]["status"] == "critical":
+            return
+        if self._status["sqlite"]["status"] != "healthy":
+            self._status["sqlite"] = {
+                "status": "critical",
+                "code": self._START_STAGE_CODES["sqlite"],
+            }
+            return
+        self._status["runtime"] = {
+            "status": "critical",
+            "code": self._START_STAGE_CODES["runtime"],
+            "error_type": type(exc).__name__,
+        }
 
     def _install_builtin_providers(self) -> None:
         """装入内置 agents/procedures，并保留带真实 ctx 的 durable procedure provider。"""
@@ -617,12 +669,17 @@ class LRSServiceContainer:
     def _ensure_configured_root_available(self) -> None:
         """在暴露 running runtime 前确认配置的 root 能形成有效 catalog snapshot。"""
 
-        self.agent_registry.snapshot(self._next_round_state.detached_agent_overrides())
+        self.agent_registry.snapshot(
+            self._next_round_state.detached_agent_overrides(),
+            default_protocol=self._default_protocol(),
+        )
 
     def _root_selector(self) -> str | None:
         state = self._next_round_state
         try:
-            snapshot = self.agent_registry.snapshot(state.detached_agent_overrides())
+            snapshot = self.agent_registry.snapshot(
+                state.detached_agent_overrides(), default_protocol=self._default_protocol()
+            )
         except RootAgentUnavailableError:
             return None
         entry = snapshot.get(state.root_agent)
@@ -638,14 +695,20 @@ class LRSServiceContainer:
         selector = self._root_selector()
         if selector is None:
             return
+        miss_tokens = int(self._config.budget.warning_miss_input_tokens)
+        output_tokens = int(self._config.budget.warning_output_tokens)
         warning = self.price_catalog.low_budget_warning(
             selector,
             self._next_round_state.default_effort_credits,
+            miss_input_tokens=miss_tokens,
+            output_tokens=output_tokens,
         )
         if warning is not None:
             self._ctx.logger.warning(
-                "%s（按 500000 个 cache miss 输入 token 与 50000 个输出 token 估算）",
+                "%s（按 %d 个 cache miss 输入 token 与 %d 个输出 token 估算）",
                 warning,
+                miss_tokens,
+                output_tokens,
             )
 
     def _ensure_running(self) -> None:
@@ -703,7 +766,9 @@ class LRSServiceContainer:
                 root_force_selector=state.root_force_selector,
                 summarizer_selector=state.summarizer_selector,
                 default_effort_credits=state.default_effort_credits,
-                agent_catalog=self.agent_registry.snapshot(state.detached_agent_overrides()),
+                agent_catalog=self.agent_registry.snapshot(
+                    state.detached_agent_overrides(), default_protocol=self._default_protocol()
+                ),
                 procedure_catalog=self.procedure_registry.snapshot(
                     state.detached_procedure_overrides()
                 ),

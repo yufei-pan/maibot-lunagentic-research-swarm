@@ -25,7 +25,7 @@ from lunagentic_research_swarm.runtime.reducer import (
     RuntimeState,
     reduce_event,
 )
-from lunagentic_research_swarm.runtime.turns import TurnLimits, TurnWorker, resolve_completed_turn
+from lunagentic_research_swarm.runtime.turns import TurnWorker
 
 NOW = datetime(2026, 8, 3, tzinfo=timezone.utc)
 
@@ -110,90 +110,6 @@ async def test_turn_worker_returns_normalized_protocol_event_without_mutating_ef
     assert event.protocol_result == {"report": "ok", "procedures": (), "delegations": ()}
     assert event.usage == {"prompt_tokens": 10, "completion_tokens": 2, "cache_hit_tokens": 0, "cache_miss_tokens": 10}
     assert dict(effect.payload) == original_payload
-
-
-@pytest.mark.asyncio
-async def test_zero_credit_agent_can_delegate_to_zero_credit_children() -> None:
-    result = await resolve_completed_turn(
-        branch=branch(credits=0.0),
-        envelope=envelope(delegations=(delegation("agent.a", 10), delegation("agent.b", 5))),
-        actual_charge=0.0,
-        procedures=RecordingProcedures(),
-        live_agents={"agent.a", "agent.b"},
-    )
-
-    assert [child.credits for child in result.children] == [0.0, 0.0]
-    assert result.finalize_reason is None
-
-
-@pytest.mark.asyncio
-async def test_procedures_finish_before_negative_credit_blocks_children() -> None:
-    procedures = RecordingProcedures()
-    result = await resolve_completed_turn(
-        branch=branch(credits=1.0),
-        envelope=envelope(
-            procedures=(ProcedureRequest(procedure_id="builtin.echo"),),
-            delegations=(delegation("agent.a", 1),),
-        ),
-        actual_charge=5.0,
-        procedures=procedures,
-        live_agents={"agent.a"},
-    )
-
-    assert procedures.calls == ["builtin.echo"]
-    assert result.children == ()
-    assert result.finalize_reason == "negative_credit"
-
-
-@pytest.mark.asyncio
-async def test_removed_agent_edge_is_finalized_without_blocking_sibling() -> None:
-    result = await resolve_completed_turn(
-        branch=branch(),
-        envelope=envelope(
-            delegations=(delegation("agent.removed", 1), delegation("agent.valid", 1)),
-        ),
-        actual_charge=0.0,
-        procedures=RecordingProcedures(),
-        live_agents={"agent.valid"},
-        limits=TurnLimits(max_agent_calls_per_task=256),
-        agent_calls_started=255,
-    )
-
-    assert [child.agent_id for child in result.children] == ["agent.valid"]
-    assert result.edge_finalizations[0].reason == "agent_unavailable"
-    assert result.edge_finalizations[0].messages[-1]["content"].endswith("agent_unavailable")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("limits", "depth", "calls", "delegations", "reason", "child_ids"),
-    [
-        (TurnLimits(max_delegations_per_turn=1), 0, 0, 2, "delegation_limit_exceeded", ["agent.a"]),
-        (TurnLimits(max_branch_depth=1), 1, 0, 1, "branch_depth_exceeded", []),
-        (TurnLimits(max_agent_calls_per_task=2), 0, 2, 1, "agent_call_limit_exceeded", []),
-    ],
-)
-async def test_structural_limit_finalizes_each_rejected_edge_without_hiding_valid_edges(
-    limits: TurnLimits,
-    depth: int,
-    calls: int,
-    delegations: int,
-    reason: str,
-    child_ids: list[str],
-) -> None:
-    requests = tuple(delegation(f"agent.{chr(97 + index)}", 1) for index in range(delegations))
-    result = await resolve_completed_turn(
-        branch=branch(depth=depth),
-        envelope=envelope(delegations=requests),
-        actual_charge=0.0,
-        procedures=RecordingProcedures(),
-        live_agents={request.agent_id for request in requests},
-        limits=limits,
-        agent_calls_started=calls,
-    )
-
-    assert [child.agent_id for child in result.children] == child_ids
-    assert [edge.reason for edge in result.edge_finalizations] == [reason] * (delegations - len(child_ids))
 
 
 def test_reducer_reserves_before_scheduling_agent_call() -> None:

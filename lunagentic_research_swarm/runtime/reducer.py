@@ -21,10 +21,14 @@ from lunagentic_research_swarm.errors import INVALID_STATE, STORAGE_COMMIT_FAILE
 from lunagentic_research_swarm.models import FormalizedTask, TaskStatus
 from lunagentic_research_swarm.llm.protocol import ProtocolError, build_correction_message
 from lunagentic_research_swarm.runtime.credits import (
-    allocate_children,
     reconcile_usage,
     redistribute_pool,
     reserve_input,
+)
+from lunagentic_research_swarm.runtime.delegation import (
+    DelegationPlan,
+    plan_delegations,
+    rejected_edge_notice,
 )
 from lunagentic_research_swarm.runtime.events import (
     AgentCallCompleted,
@@ -420,86 +424,49 @@ def _delegation_effects(
     credits_after: float,
     agent_calls_started: int,
 ) -> tuple[tuple[Effect, ...], int]:
-    """在 Procedure durable boundary 把每条 delegation 解析为显式 immutable effect。"""
+    """把一批 delegation 判定结果转成显式 immutable effect。
 
-    max_delegations = _positive_limit(event.max_delegations_per_turn, "max_delegations_per_turn")
-    max_depth = _positive_limit(event.max_branch_depth, "max_branch_depth")
-    max_calls = _positive_limit(event.max_agent_calls_per_task, "max_agent_calls_per_task")
-    if isinstance(event.parent_depth, bool) or not isinstance(event.parent_depth, int) or event.parent_depth < 0:
-        raise ValueError("parent_depth 必须为非负整数")
-    if (
-        isinstance(event.agent_calls_started, bool)
-        or not isinstance(event.agent_calls_started, int)
-        or event.agent_calls_started < 0
-    ):
-        raise ValueError("agent_calls_started 必须为非负整数")
+    判定本身由 :func:`plan_delegations` 独占，暂存 checkpoint 的释放路径复用同一
+    实现，因此两条路径的结构上限与分配结果必然一致。
+    """
 
-    normalized: list[tuple[int, str, str, float, str | None]] = []
-    allocatable: list[tuple[str, float]] = []
-    live_agents = None if event.live_agent_ids is None else frozenset(event.live_agent_ids)
-    reserved_calls = 0
-    for index, raw in enumerate(event.delegations):
-        if not isinstance(raw, Mapping):
-            raise ValueError(f"delegations[{index}] 必须为对象")
-        agent_id = raw.get("agent_id")
-        assignment = raw.get("task")
-        requested_credits = raw.get("credits", 0.0)
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError(f"delegations[{index}].agent_id 必须为非空字符串")
-        if not isinstance(assignment, str) or not assignment:
-            raise ValueError(f"delegations[{index}].task 必须为非空字符串")
-        if isinstance(requested_credits, bool) or not isinstance(requested_credits, int | float):
-            raise ValueError(f"delegations[{index}].credits 必须为非负有限数")
-        reason: str | None = None
-        if index >= max_delegations:
-            reason = "delegation_limit_exceeded"
-        elif event.parent_depth >= max_depth:
-            reason = "branch_depth_exceeded"
-        elif live_agents is not None and agent_id not in live_agents:
-            reason = "agent_unavailable"
-        elif agent_calls_started + reserved_calls >= max_calls:
-            reason = "agent_call_limit_exceeded"
-        else:
-            reserved_calls += 1
-        normalized.append((index, agent_id, assignment, float(requested_credits), reason))
-        if reason is None or reason == "agent_unavailable":
-            allocatable.append((str(index), float(requested_credits)))
+    plan = plan_delegations(
+        event.delegations,
+        parent_branch_id=event.branch_id,
+        parent_depth=event.parent_depth,
+        parent_credits=credits_after,
+        parent_messages=event.parent_messages,
+        live_agent_ids=event.live_agent_ids,
+        agent_calls_started=agent_calls_started,
+        max_delegations_per_turn=event.max_delegations_per_turn,
+        max_branch_depth=event.max_branch_depth,
+        max_agent_calls_per_task=event.max_agent_calls_per_task,
+    )
+    if plan.all_rejected:
+        return _all_delegations_rejected(event, plan)
 
-    allocation = allocate_children(credits_after, allocatable)
-    allocations = allocation.allocations
-    calls_after_reservation = agent_calls_started + reserved_calls
-    first_live_index = next((index for index, *_rest, reason in normalized if reason is None), None)
     effects: list[Effect] = []
-    for index, agent_id, assignment, _requested_credits, reason in normalized:
-        child_branch_id = f"{event.branch_id}:{index + 1}"
-        credits = float(allocations.get(str(index), 0.0))
-        if reason is not None:
-            edge_messages = (
-                *event.parent_messages,
-                {
-                    "role": "user",
-                    "content": f"assignment: {assignment}\nedge finalized: {reason}",
+    for edge in plan.rejected:
+        effects.append(
+            _effect(
+                PerformBranchSummary,
+                event,
+                priority="barrier",
+                payload={
+                    "edge_finalization": True,
+                    "branch_id": edge.branch_id,
+                    "parent_branch_id": event.branch_id,
+                    "agent_id": edge.agent_id,
+                    "assignment": edge.assignment,
+                    "reason": edge.reason,
+                    # 边未成为分支，credits 从未离开父节点。
+                    "credits": 0.0,
+                    "depth": edge.depth,
+                    "messages": edge.messages,
                 },
             )
-            effects.append(
-                _effect(
-                    PerformBranchSummary,
-                    event,
-                    priority="barrier",
-                    payload={
-                        "edge_finalization": True,
-                        "branch_id": child_branch_id,
-                        "parent_branch_id": event.branch_id,
-                        "agent_id": agent_id,
-                        "assignment": assignment,
-                        "reason": reason,
-                        "credits": credits if reason == "agent_unavailable" else 0.0,
-                        "depth": event.parent_depth + 1,
-                        "messages": edge_messages,
-                    },
-                )
-            )
-            continue
+        )
+    for child in plan.children:
         effects.append(
             _effect(
                 NotifyToolWaiter,
@@ -507,24 +474,69 @@ def _delegation_effects(
                 priority="barrier",
                 payload={
                     "action": "materialize_child",
-                    "branch_id": child_branch_id,
+                    "branch_id": child.branch_id,
                     "parent_branch_id": event.branch_id,
-                    "agent_id": agent_id,
-                    "assignment": assignment,
-                    "credits": credits,
-                    "depth": event.parent_depth + 1,
-                    "messages": (*event.parent_messages, {"role": "user", "content": f"assignment: {assignment}"}),
+                    "agent_id": child.agent_id,
+                    "assignment": child.assignment,
+                    "credits": child.credits,
+                    "depth": child.depth,
+                    "messages": child.messages,
                     "live_agent_ids": event.live_agent_ids,
-                    "max_delegations_per_turn": max_delegations,
-                    "max_branch_depth": max_depth,
-                    "max_agent_calls_per_task": max_calls,
-                    "agent_calls_started": calls_after_reservation,
-                    "retire_parent": index == first_live_index,
-                    "pool_return": allocation.returned_to_pool if index == first_live_index else 0.0,
+                    "max_delegations_per_turn": event.max_delegations_per_turn,
+                    "max_branch_depth": event.max_branch_depth,
+                    "max_agent_calls_per_task": event.max_agent_calls_per_task,
+                    "agent_calls_started": plan.calls_after_reservation,
+                    "retire_parent": child.retire_parent,
+                    "pool_return": child.pool_return,
                 },
             )
         )
-    return tuple(effects), calls_after_reservation
+    return tuple(effects), plan.calls_after_reservation
+
+
+def _all_delegations_rejected(
+    event: ProcedureBatchCompleted,
+    plan: DelegationPlan,
+) -> tuple[tuple[Effect, ...], int]:
+    """父分支请求了委派但每一条都被拒绝时的恢复路径。
+
+    这些边从未成为分支，因此没有 credits 转移，也没有子分支能推进本分支。若不
+    处理，父节点会永远留在 ``active_leaves`` 里而没有任何待执行工作，round 无法
+    进入 FINALIZING。credits 全额留在父分支；可恢复原因（agent 在途被移除）附带
+    错误说明重试父节点一次并计入调用次数，确定性原因直接终结分支。
+    """
+
+    notice = rejected_edge_notice(plan.rejected)
+    if plan.blocking_reason is not None:
+        return (
+            _effect(
+                PerformBranchSummary,
+                event,
+                priority="barrier",
+                payload={
+                    "branch_id": event.branch_id,
+                    "reason": plan.blocking_reason,
+                    "held_delegations": (),
+                    "appended_messages": (notice,),
+                },
+            ),
+        ), plan.calls_after_reservation
+    return (
+        _effect(
+            PerformAgentCall,
+            event,
+            payload={
+                "branch_id": event.branch_id,
+                "appended_messages": (notice,),
+                "branch_depth": event.parent_depth,
+                "live_agent_ids": event.live_agent_ids,
+                "max_delegations_per_turn": event.max_delegations_per_turn,
+                "max_branch_depth": event.max_branch_depth,
+                "max_agent_calls_per_task": event.max_agent_calls_per_task,
+                "agent_calls_started": plan.calls_after_reservation,
+            },
+        ),
+    ), plan.calls_after_reservation
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -1094,7 +1106,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                     ),
                 )
             can_correct = (
-                event.correction_count == 0
+                event.correction_count < max(0, int(event.max_correction_turns))
                 and event.pinning_supported
                 and bool(event.actual_model_name)
             )
@@ -1134,13 +1146,20 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                 estimated_model_name=event.actual_model_name,
                 prompt_tokens=0,
                 balance_after=correction_balance,
-                metadata={"event_type": "AgentCallReserved", "correction_count": 1},
+                metadata={"event_type": "AgentCallReserved", "correction_count": event.correction_count + 1},
                 created_at=event.occurred_at,
             )
             commands.extend(correction_reservation.commands)
             messages = (*event.messages, correction_message)
+            # spec §9.2：纠正 turn 是正常递归 turn，必须计入调用次数。
+            correction_calls_started = int(getattr(state, "agent_calls_started", 0))
+            correction_calls_started = max(correction_calls_started, event.agent_calls_started) + 1
             return Transition(
-                _replace_state(reconciled_state, active_leaves=correction_leaves),
+                _replace_state(
+                    reconciled_state,
+                    active_leaves=correction_leaves,
+                    agent_calls_started=correction_calls_started,
+                ),
                 commands=tuple(commands),
                 effects=(
                     _effect(
@@ -1150,18 +1169,20 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                             "branch_id": event.branch_id,
                             "call_id": correction_call_id,
                             "selector": f"model:{event.actual_model_name}",
-                            "protocol": "json_envelope",
+                            # spec §9.2：同一 agent、同一模型、同一协议再调用一次。
+                            "protocol": event.protocol or "json_envelope",
                             "messages": messages,
                             "estimated_charge": correction_estimate,
                             "credits_after_reservation": correction_balance,
-                            "correction_count": 1,
+                            "correction_count": event.correction_count + 1,
+                            "max_correction_turns": event.max_correction_turns,
                             "pinning_supported": True,
                             "branch_depth": event.branch_depth,
                             "live_agent_ids": event.live_agent_ids,
                             "max_delegations_per_turn": event.max_delegations_per_turn,
                             "max_branch_depth": event.max_branch_depth,
                             "max_agent_calls_per_task": event.max_agent_calls_per_task,
-                            "agent_calls_started": event.agent_calls_started,
+                            "agent_calls_started": correction_calls_started,
                         },
                     ),
                 ),
@@ -1314,9 +1335,13 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             reason = "terminate"
         elif credits_after < 0:
             reason = "negative_credit"
-        elif checkpoint:
+        elif checkpoint and held:
             reason = "checkpoint"
         elif not held:
+            # A checkpoint without delegations adds no pending work, so design §9.1's
+            # natural end applies: finalize now rather than holding the branch for an
+            # epoch boundary that would have nothing to release.  The terminal summary
+            # supersedes the checkpoint it would have produced.
             reason = "no_further_work"
         else:
             try:
@@ -1422,7 +1447,15 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                     },
                 )
             )
-        return Transition(_replace_state(state, active_leaves=leaves, credit_pool=pool), commands=tuple(commands))
+        calls_started = max(
+            int(getattr(state, "agent_calls_started", 0)), int(event.agent_calls_started)
+        )
+        return Transition(
+            _replace_state(
+                state, active_leaves=leaves, credit_pool=pool, agent_calls_started=calls_started
+            ),
+            commands=tuple(commands),
+        )
 
     if isinstance(event, BranchFinalized):
         if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.FINALIZING}:

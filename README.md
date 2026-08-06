@@ -61,8 +61,8 @@
 维护命令（`/swarm vectors rebuild`）受 `[commands]` 约束：
 
 - `allow_vector_rebuild` 默认 **false**；设为 true 才允许手动重建。
-- `maintenance_allowed_user_ids` 填 Host 命令 RPC 的 **`user_id`**（平台用户 ID），**不是** MaiBot `person_id`。
-- **空列表 = 不限制**（任何聊天成员都可通过白名单检查）。生产环境请填入维护者 user_id，或保持 `allow_vector_rebuild = false`。
+- `maintenance_allowed_user_ids` 每项可填 Host 命令 RPC 的 **`user_id`**（平台用户 ID），也可填 MaiBot **`person_id`**（`md5(f"{platform}_{user_id}")` 的 32 位 hex，跨适配器唯一）。两种格式不会碰撞，可混填；person_id 由插件用 `ctx.person.get_id` 现算比对。
+- **空列表 = 不限制**（任何聊天成员都可通过白名单检查）。生产环境请填入维护者身份，或保持 `allow_vector_rebuild = false`。
 
 ## 协议
 

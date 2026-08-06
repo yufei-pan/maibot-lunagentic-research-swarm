@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+from lunagentic_research_swarm.errors import LRSError
 from lunagentic_research_swarm.runtime.reducer import (
     ArmDeadline,
     ArmPauseExpiry,
@@ -16,6 +18,9 @@ from lunagentic_research_swarm.runtime.reducer import (
     PerformProcedureBatch,
     ReleaseRawContext,
 )
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class RuntimeEffectRunner:
@@ -41,6 +46,25 @@ class RuntimeEffectRunner:
             raise RuntimeError("runtime effect runner 尚未绑定 manager")
         return self._manager
 
+    @staticmethod
+    async def _fail_branch(manager: Any, effect: Any, exc: Exception, default_code: str) -> None:
+        """Convert a crashed agent/procedure effect into a durable branch failure.
+
+        The scheduler only records the exception type on an un-awaited future, so
+        an unhandled worker error would otherwise strand the branch forever.
+        """
+
+        _LOG.exception("LRS runtime effect 执行失败：kind=%s", getattr(effect, "kind", "?"))
+        code = exc.code if isinstance(exc, LRSError) else default_code
+        message = exc.message if isinstance(exc, LRSError) else f"{type(exc).__name__}: {exc}"
+        fail = getattr(manager, "fail_agent_effect", None)
+        if not callable(fail):
+            return
+        try:
+            await fail(effect, error_code=str(code), error_message=str(message))
+        except Exception:
+            _LOG.exception("LRS 无法终结失败分支：kind=%s", getattr(effect, "kind", "?"))
+
     async def run(self, effect: Any, _token: Any = None) -> Any:
         if isinstance(effect, PerformFormalization):
             # ResearchManager owns the short-lived raw formalization coroutine.
@@ -48,14 +72,22 @@ class RuntimeEffectRunner:
 
         manager = self._require_manager()
         if isinstance(effect, PerformAgentCall):
-            prepared = await manager.prepare_agent_effect(effect)
-            completed = await self._turn_worker.perform_agent_call(prepared)
+            try:
+                prepared = await manager.prepare_agent_effect(effect)
+                completed = await self._turn_worker.perform_agent_call(prepared)
+            except Exception as exc:
+                await self._fail_branch(manager, effect, exc, "agent_effect_failed")
+                return None
             await manager.handle_runtime_event(completed)
             return completed
         if isinstance(effect, PerformProcedureBatch):
-            prepare = getattr(manager, "prepare_procedure_effect", None)
-            prepared = await prepare(effect) if callable(prepare) else effect
-            completed = await self._turn_worker.perform_procedure_batch(prepared)
+            try:
+                prepare = getattr(manager, "prepare_procedure_effect", None)
+                prepared = await prepare(effect) if callable(prepare) else effect
+                completed = await self._turn_worker.perform_procedure_batch(prepared)
+            except Exception as exc:
+                await self._fail_branch(manager, effect, exc, "procedure_effect_failed")
+                return None
             await manager.handle_runtime_event(completed)
             return completed
         if isinstance(effect, PerformBranchSummary):

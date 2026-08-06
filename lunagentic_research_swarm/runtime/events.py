@@ -135,13 +135,16 @@ class AgentCallCompleted(Event):
     actual_charge: float | None = None
     estimated_charge: float = 0.0
     balance_before_reconciliation: float = 0.0
+    protocol: str = "json_envelope"
     protocol_result: Mapping[str, Any] | None = None
     protocol_error: Mapping[str, Any] | None = None
+    protocol_repairs: tuple[str, ...] = ()
     correction_count: int = 0
     correction_call_id: str = ""
     correction_usage_id: str = ""
     correction_ledger_id: str = ""
     correction_estimated_charge: float = 0.0
+    max_correction_turns: int = 1
     pinning_supported: bool = True
     messages: tuple[Mapping[str, Any], ...] = ()
     branch_depth: int = 0
@@ -158,6 +161,7 @@ class AgentCallCompleted(Event):
             object.__setattr__(self, "protocol_result", _freeze_value(self.protocol_result))
         if self.protocol_error is not None:
             object.__setattr__(self, "protocol_error", _freeze_value(self.protocol_error))
+        object.__setattr__(self, "protocol_repairs", tuple(str(item) for item in self.protocol_repairs))
         object.__setattr__(self, "messages", tuple(_freeze_value(self.messages)))
         if self.live_agent_ids is not None:
             object.__setattr__(self, "live_agent_ids", tuple(str(item) for item in self.live_agent_ids))
@@ -256,6 +260,9 @@ class ProcedureBatchCompleted(Event):
 @_register
 @dataclass(frozen=True, slots=True)
 class ChildMaterialized(Event):
+    # 暂存 checkpoint 释放的子分支不经过 ProcedureBatchCompleted，因此由本事件
+    # 单调推进 Task 级 agent 调用计数，避免绕过 max_agent_calls_per_task。
+    agent_calls_started: int = 0
     branch_id: str = ""
     parent_branch_id: str = ""
     agent_id: str = ""

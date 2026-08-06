@@ -116,19 +116,6 @@ class StablePromptBuilder:
             [{"role": "user", "content": f"本轮起始协调者：{coordinator}"}]
         )
 
-    def delegate(self, parent: BranchContext, *, assignment: str, agent_id: str) -> BranchContext:
-        history = [dict(message) for message in parent.history]
-        history.append(
-            {"role": "user", "content": f"委派给 {agent_id} 的 assignment：{assignment}"}
-        )
-        return BranchContext(history)
-
-    def compact(self, context: BranchContext, *, summary: str) -> None:
-        context.history[:] = [{"role": "assistant", "content": f"分支压缩摘要：{summary}"}]
-
-    def checkpoint(self, context: BranchContext, *, summary: str) -> None:
-        context.history.append({"role": "assistant", "content": f"checkpoint 摘要：{summary}"})
-
     def restart_context(self, *, summary_layers: Sequence[str], coordinator: str) -> BranchContext:
         history = [
             {"role": "assistant", "content": f"既有 summary layer：{summary}"}

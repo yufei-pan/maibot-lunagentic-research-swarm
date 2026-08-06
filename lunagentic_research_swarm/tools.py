@@ -166,7 +166,7 @@ def success_result(
         else:
             output["error"] = {"code": "manager_error", "message": "研究任务未能继续"}
         output.setdefault("task_id", task_id)
-        output.setdefault("round", output.get("round_id"))
+        output.setdefault("round", output.get("round_number"))
         output.setdefault("status", None)
         output.setdefault("effective_time_budget_seconds", effective_time_budget_seconds)
         output.setdefault("effective_credits_or_adjustment", adjustment)
@@ -174,7 +174,8 @@ def success_result(
     output = public_task_dto(result, task_id=task_id)
     output["success"] = True
     if "round" not in output:
-        output["round"] = output.get("round_id")
+        # Design §17.1: `round` is the 1-based investigation round number.
+        output["round"] = output.get("round_number")
     output.setdefault("effective_time_budget_seconds", effective_time_budget_seconds)
     output.setdefault("effective_credits_or_adjustment", output.get("initial_credits", adjustment))
     return output

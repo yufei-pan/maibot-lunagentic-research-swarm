@@ -221,8 +221,8 @@ flowchart TD
   "report": "本次工作的简要说明；原生工具模式可为空字符串",
   "procedures": [
     {
-      "call_id": "本 turn 内唯一 ID",
-      "name": "procedure_id",
+      "procedure_id": "provider_namespace.procedure_name",
+      "call_id": "可选；本 turn 内由智能体自定的关联 ID",
       "arguments": {}
     }
   ],
@@ -236,7 +236,12 @@ flowchart TD
 }
 ```
 
-- `report` 不包含 provider reasoning。
+- `report` 不包含 provider reasoning，但它是该智能体本 turn 的工作输出：turn 结束后
+  以 assistant 消息追加进该 branch 的可变历史，因此子分支继承父节点的输出，分支
+  总结 / checkpoint / compact 也以它为主要输入。
+- Procedure 请求的身份字段是 `procedure_id`，与第 15.1 节 definition 同名。`call_id`
+  可选，由智能体自行生成，仅原样回显在结果摘要中用于对账，不参与路由或去重；
+  结果顺序始终由请求顺序决定。
 - `credits` 必须为非负数，允许为 0。
 - 智能体可把自己列为下一智能体，实现“调用 Procedure 后把结果交回自己”的工具循环。
 - 智能体也可同时请求 checkpoint、其他 Procedure 和多个子智能体。
@@ -289,13 +294,22 @@ submit_swarm_turn(report, procedures, delegations)
 
 Procedure 先执行、credits 终止后检查这一顺序是强制规则。这样即使模型估算错误导致本 turn 结束后变成负余额，它已经请求的搜索、计算或资料读取仍会完成并进入最终总结，但不会继续生成新的普通智能体调用。
 
-普通 Procedure 结果会按 `call_id` 以确定顺序加入父 branch 上下文；随后创建的所有子 branch 都继承这些结果。若智能体希望自己理解结果，就把自己作为一个子委派目标。
+本 turn 的 `report` 与普通 Procedure 结果按请求顺序确定性地加入父 branch 上下文；随后创建的所有子 branch 都继承它们。若智能体希望自己理解结果，就把自己作为一个子委派目标。
+
+若某个 turn 请求了委派，但每一条委派边都被拒绝（目标 agent 已被移除、超过分支深度或超过 Task 调用上限），则不会产生任何子分支来推进该 branch。此时分配给这些边的 credits 全额留在父分支：
+
+- 原因可能在下一 turn 改变（`agent_unavailable`）时，把全部失败原因作为 user 消息追加给父分支并重试父节点一次，该重试计入 `max_agent_calls_per_task`；
+- 原因是确定性的（`branch_depth_exceeded`、`agent_call_limit_exceeded`）时，直接按该原因最终总结父分支。
+
+父节点绝不允许在没有任何待执行工作的情况下留在活动叶子集合中。
 
 ### 10.1 控制 Procedure
 
-- **`terminate`：** 主动结束当前分支。与其他 Procedure 同时请求时，其他普通 Procedure 可先完成；所有委派忽略。
+- **`terminate`：** 主动结束当前分支。与其他 Procedure 同时请求时，其他普通 Procedure 可先完成；同一 envelope 中的 `compact` 仍先执行，因此分支最终总结运行在压缩后的历史上；`checkpoint` 与所有委派忽略。
 - **`compact`：** 使用核心总结器压缩当前分支的可变历史。可与普通 Procedure 和委派同时请求；压缩在普通 Procedure 结果进入上下文后、子分支 clone 前完成，因此所有新子分支继承压缩后的父上下文。
-- **`checkpoint`：** 调用“分支总结”角色，生成不终止原分支的阶段性总结。总结广播给其他活动分支；当前 envelope 的委派先暂存，branch 等到下一报告时间点再继续。若已经处于 grace，则 summary 完成后即可继续。
+- **`checkpoint`：** 调用“分支总结”角色，生成不终止原分支的阶段性总结。总结广播给其他活动分支；当前 envelope 的委派先暂存，branch 等到下一报告时间点再继续。若已经处于 grace，则 summary 完成后即可继续。checkpoint 本身不产生待执行工作：同一 envelope 没有委派时按第 9.1 节的自然结束处理，直接最终总结该分支，而不是把它挂在一个无事可释放的 epoch 边界上。
+
+  释放暂存委派就是那次被推迟的委派，因此与普通委派共用同一套判定，不得另起一套：结构上限（`max_delegations_per_turn`、`max_branch_depth`、`max_agent_calls_per_task`）、目标 agent 存活性检查、父子 credits 比例缩放，以及“被拒绝的边不参与分配”的守恒规则全部相同；被拒绝的边同样以对应原因终结，全部被拒时走第 10 节的恢复路径。释放后按第 10 节步骤 12 让父节点退休并把未分配余额结算到 Task pool，因此父节点对 `{parent}:{n}` 子分支 ID 空间只使用一次。
 
 调度器为报告自动生成的 checkpoint 与智能体主动 Procedure 不同：自动 checkpoint clone 稳定上下文后，原 branch 立即继续，不进入等待状态。总结器本身仍不是可委派智能体。
 

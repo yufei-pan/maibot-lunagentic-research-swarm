@@ -59,6 +59,13 @@ class LunagenticResearchSwarmPlugin(SwarmCommandsMixin, MaiBotPlugin):
     async def on_load(self) -> None:
         config = self.config
         assert isinstance(config, LRSConfig)
+        if not config.plugin.enabled:
+            # 与其他一方插件一致：`[plugin] enabled = false` 只加载插件本体，
+            # 不启动研究运行时，也不注册任何后台任务。
+            self._services = None
+            self._manager = None
+            self.ctx.logger.info("麦麦深度调查组已按配置禁用（plugin.enabled=false）")
+            return
         services = LRSServiceContainer(self.ctx, config)
         self._services = services
         try:
@@ -73,8 +80,10 @@ class LunagenticResearchSwarmPlugin(SwarmCommandsMixin, MaiBotPlugin):
         self.ctx.logger.info("麦麦深度调查组基础组件已加载")
 
     async def on_unload(self) -> None:
-        services = self._require_services()
-        await services.close()
+        if self._services is None:
+            self.ctx.logger.info("麦麦深度调查组未启动，无需卸载")
+            return
+        await self._services.close()
         self._manager = None
         self.ctx.logger.info("麦麦深度调查组基础组件已卸载")
 

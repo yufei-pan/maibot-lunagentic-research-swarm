@@ -306,6 +306,19 @@ class _FakeServices:
         }
 
 
+class _FakePersonAPI:
+    """与 Host 一致：person_id = md5(f"{platform}_{user_id}")。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_id(self, platform: str, user_id: str) -> str:
+        import hashlib
+
+        self.calls.append((platform, user_id))
+        return hashlib.md5(f"{platform}_{user_id}".encode()).hexdigest()
+
+
 class CommandHarness:
     """匹配已注册 COMMAND 正则并调用插件 handler。"""
 
@@ -316,7 +329,12 @@ class CommandHarness:
         self.vector = self.services.vector_index
         plugin._services = self.services
         plugin._manager = self.services.manager
-        plugin._ctx = SimpleNamespace(send=self.send, logger=SimpleNamespace(info=lambda *a, **k: None))
+        self.person = _FakePersonAPI()
+        plugin._ctx = SimpleNamespace(
+            send=self.send,
+            person=self.person,
+            logger=SimpleNamespace(info=lambda *a, **k: None),
+        )
         # config property via _plugin_config_instance if present
         plugin._plugin_config_instance = self.services._config
 
@@ -516,6 +534,44 @@ async def test_vector_rebuild_allows_listed_user_id(command_harness) -> None:
     )
     assert result[0] is True
     assert command_harness.vector.rebuild_calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_vector_rebuild_allows_listed_person_id(command_harness) -> None:
+    """person_id 是 md5(platform_userid)，跨适配器唯一，可直接写进白名单。"""
+
+    import hashlib
+
+    person_id = hashlib.md5(b"qq_maintainer-1").hexdigest()
+    command_harness.services._config.commands.maintenance_allowed_user_ids = [person_id]
+    result = await command_harness.invoke(
+        "/swarm vectors rebuild --force",
+        stream_id="s",
+        user_id="maintainer-1",
+        platform="qq",
+    )
+    assert result[0] is True
+    assert command_harness.vector.rebuild_calls == [True]
+    assert command_harness.person.calls == [("qq", "maintainer-1")]
+
+
+@pytest.mark.asyncio
+async def test_vector_rebuild_denies_person_id_of_another_platform(command_harness) -> None:
+    """同一 user_id 在别的平台是另一个人，person_id 因此必须不同。"""
+
+    import hashlib
+
+    command_harness.services._config.commands.maintenance_allowed_user_ids = [
+        hashlib.md5(b"telegram_maintainer-1").hexdigest()
+    ]
+    result = await command_harness.invoke(
+        "/swarm vectors rebuild --force",
+        stream_id="s",
+        user_id="maintainer-1",
+        platform="qq",
+    )
+    assert result[0] is False
+    assert command_harness.vector.rebuild_calls == []
 
 
 @pytest.mark.asyncio

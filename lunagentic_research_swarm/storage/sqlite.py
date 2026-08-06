@@ -222,6 +222,11 @@ class SQLiteStateStore:
     async def list_active_rounds(self) -> tuple[StoredRound, ...]:
         return await self._call(self._list_active_rounds_sync)
 
+    async def list_task_ids(self, *, limit: int = 500) -> tuple[str, ...]:
+        """Newest-first task ids, used to rehydrate controllers after a restart."""
+
+        return await self._call(self._list_task_ids_sync, int(limit))
+
     async def load_summary_layer(self, task_id: str) -> SummaryLayer | None:
         return await self._call(self._load_summary_layer_sync, task_id)
 
@@ -935,6 +940,14 @@ class SQLiteStateStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def _list_task_ids_sync(self, limit: int) -> tuple[str, ...]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            "SELECT task_id FROM tasks ORDER BY created_at DESC, task_id DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return tuple(str(row["task_id"]) for row in rows)
 
     def _list_active_rounds_sync(self) -> tuple[StoredRound, ...]:
         connection = self._require_connection()

@@ -118,7 +118,10 @@ def render_report(
 ) -> str:
     """Add the deterministic user-facing header around a synthesized body."""
 
+    rendered_stats = "；".join(f"{key}={value}" for key, value in sorted((stats or {}).items()))
     if kind is ReportKind.INTERMEDIATE:
+        # design §13.3: an intermediate report also carries token / cache
+        # hit-miss / credits / failure figures, not just branch counts.
         header = (
             "中间报告\n"
             f"task/round/epoch：{task_id}/{round_id}/{epoch}\n"
@@ -126,10 +129,10 @@ def render_report(
             f"coverage 不可用：{max(0, unavailable_count)}\n"
             f"已用时间：{max(0, int(elapsed_seconds))}s；下一报告间隔：{max(0, next_interval_seconds)}s\n"
             f"当前余额/pool：{credit_balance:g}/{credit_pool:g}\n"
+            f"统计：{rendered_stats or '无'}\n"
             f"主要未决工作：{'；'.join(pending_work) if pending_work else '无'}"
         )
     else:
-        rendered_stats = "；".join(f"{key}={value}" for key, value in sorted((stats or {}).items()))
         header = f"最终结论\ntask/round/epoch：{task_id}/{round_id}/{epoch}\n统计：{rendered_stats or '无'}"
     return f"{header}\n\n{body.strip()}" if body.strip() else header
 

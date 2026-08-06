@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Mapping
@@ -18,6 +19,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from lunagentic_research_swarm.runtime.reducer import Effect
+
+_LOG = logging.getLogger(__name__)
 
 
 class GenerationToken(int):
@@ -503,7 +506,21 @@ class FairScheduler:
             self._cancel_future(entry.future)
             raise
         except Exception as exc:
-            self._errors.append({"kind": type(exc).__name__})
+            # Nobody awaits `entry.future`, so this is the only place an effect
+            # failure becomes visible.  Log it with a traceback instead of
+            # silently dropping everything but the exception's class name.
+            # `stats()` stays payload-free on purpose: exception messages can
+            # quote prompts, so only structural identity goes into telemetry.
+            self._errors.append(
+                {
+                    "kind": type(exc).__name__,
+                    "effect": str(entry.effect.kind),
+                    "task_id": task_id,
+                }
+            )
+            _LOG.exception(
+                "LRS scheduler effect 失败：kind=%s task_id=%s", entry.effect.kind, task_id
+            )
             if not entry.future.done():
                 entry.future.set_exception(exc)
                 entry.future.add_done_callback(self._consume_future_exception)

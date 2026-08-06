@@ -296,7 +296,7 @@ class _AgentCatalog:
 class _PriceCatalog:
     fingerprint = "integration-prices"
 
-    def low_budget_warning(self, _selector: str, _credits: float) -> None:
+    def low_budget_warning(self, _selector: str, _credits: float, **_kwargs: object) -> None:
         return None
 
 

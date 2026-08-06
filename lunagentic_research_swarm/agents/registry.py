@@ -88,6 +88,8 @@ class AgentRegistry:
         self._providers: dict[str, _ProviderBatch] = {}
         self._owners: dict[str, str] = {}
         self._health: dict[str, ProviderHealth] = {}
+        # agent_id 集合：provider 显式声明了 protocol，不接受全局 default_mode。
+        self._explicit_protocol: set[str] = set()
 
     @property
     def health(self) -> Mapping[str, ProviderHealth]:
@@ -146,6 +148,13 @@ class AgentRegistry:
             else:
                 raise TypeError("agent provider 批次只能包含 AgentDefinition 或 Mapping")
         checked = tuple(AgentDefinition.model_validate(item) for item in raw_definitions)
+        # `[protocol] default_mode` only applies to definitions that never stated a
+        # protocol; an explicit per-agent protocol always wins.
+        for raw, definition in zip(raw_definitions, checked):
+            if "protocol" in raw:
+                self._explicit_protocol.add(definition.agent_id)
+            else:
+                self._explicit_protocol.discard(definition.agent_id)
         ids = [item.agent_id for item in checked]
         if len(set(ids)) != len(ids):
             raise ValueError("agent provider 批次包含重复 ID")
@@ -187,11 +196,23 @@ class AgentRegistry:
         batch = self._providers[provider_id]
         return any(item.agent_id == agent_id and item.enabled for item in batch.definitions)
 
-    def snapshot(self, overrides: Mapping[str, AgentOverride]) -> AgentCatalogSnapshot:
+    def snapshot(
+        self,
+        overrides: Mapping[str, AgentOverride],
+        *,
+        default_protocol: str | None = None,
+    ) -> AgentCatalogSnapshot:
         entries: list[AgentCatalogEntry] = []
         for provider_id, batch in self._providers.items():
             for original in batch.definitions:
-                definition = self._apply_override(original, overrides.get(original.agent_id))
+                fallback = (
+                    default_protocol
+                    if default_protocol and original.agent_id not in self._explicit_protocol
+                    else None
+                )
+                definition = self._apply_override(
+                    original, overrides.get(original.agent_id), default_protocol=fallback
+                )
                 if not definition.enabled:
                     continue
                 fingerprint = canonical_fingerprint(definition)
@@ -211,11 +232,18 @@ class AgentRegistry:
         return snapshot
 
     @staticmethod
-    def _apply_override(definition: AgentDefinition, override: AgentOverride | None) -> AgentDefinition:
-        if override is None:
+    def _apply_override(
+        definition: AgentDefinition,
+        override: AgentOverride | None,
+        *,
+        default_protocol: str | None = None,
+    ) -> AgentDefinition:
+        explicit = override.model_dump(mode="python", exclude_unset=True) if override is not None else {}
+        if override is None and not default_protocol:
             return definition.model_copy(deep=True)
-        explicit = override.model_dump(mode="python", exclude_unset=True)
         raw = definition.model_dump(mode="python")
+        if default_protocol and explicit.get("protocol") is None:
+            raw["protocol"] = default_protocol
         if explicit.get("enabled") is not None:
             raw["enabled"] = explicit["enabled"]
         if explicit.get("protocol") is not None:

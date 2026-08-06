@@ -342,13 +342,32 @@ class PriceCatalog:
         resolved = self.resolve_model(actual_model_name, actual=True)
         return ChargedUsage(resolved, usage, charge(resolved.profile, usage))
 
-    def estimate_root_minimum(self, selector: str | Any) -> ChargedUsage:
+    def estimate_root_minimum(
+        self,
+        selector: str | Any,
+        *,
+        miss_input_tokens: int = 500_000,
+        output_tokens: int = 50_000,
+    ) -> ChargedUsage:
+        """Design §11.3 low-budget probe; thresholds come from ``[budget]`` config."""
+
         resolved = self.estimate_model_for_selector(selector)
-        usage = TokenUsage(500_000, 50_000, 0, 500_000, source="estimated")
+        miss = max(0, int(miss_input_tokens))
+        completion = max(0, int(output_tokens))
+        usage = TokenUsage(miss, completion, 0, miss, source="estimated")
         return ChargedUsage(resolved, usage, charge(resolved.profile, usage))
 
-    def low_budget_warning(self, selector: str | Any, effective_budget: float) -> str | None:
-        estimate = self.estimate_root_minimum(selector)
+    def low_budget_warning(
+        self,
+        selector: str | Any,
+        effective_budget: float,
+        *,
+        miss_input_tokens: int = 500_000,
+        output_tokens: int = 50_000,
+    ) -> str | None:
+        estimate = self.estimate_root_minimum(
+            selector, miss_input_tokens=miss_input_tokens, output_tokens=output_tokens
+        )
         if estimate.credits == 0.0 or effective_budget >= estimate.credits:
             return None
         return f"有效预算 {effective_budget:g} credits 低于根调用保守估算 {estimate.credits:g} credits；任务仍会启动"

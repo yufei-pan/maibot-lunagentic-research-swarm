@@ -52,15 +52,24 @@ def test_json_envelope_applies_each_allowed_local_repair(raw: str, expected_repo
     assert parse_json_envelope(raw).report == expected_report
 
 
-def test_json_envelope_extracts_only_the_first_balanced_object() -> None:
+def test_json_envelope_extracts_the_unique_object_without_scanning_past_strings() -> None:
     """若 object 扫描越过第一个完整对象或误把字符串大括号当结构，本测试应失败。"""
 
     parsed = parse_json_envelope(
-        '说明 {"report":"first } \\\" still text","procedures":[],"delegations":[]}'
-        ' 另一个 {"report":"second","procedures":[],"delegations":[]}'
+        '说明 {"report":"first } \\\" still text","procedures":[],"delegations":[]} 后记'
     )
 
     assert parsed.report == 'first } " still text'
+
+
+def test_json_envelope_rejects_multiple_top_level_objects() -> None:
+    """spec §9.2 禁止“在多个对象中选择”，因此两个顶层 object 必须整体拒绝。"""
+
+    with pytest.raises(ProtocolError):
+        parse_json_envelope(
+            '说明 {"report":"first","procedures":[],"delegations":[]}'
+            ' 另一个 {"report":"second","procedures":[],"delegations":[]}'
+        )
 
 
 @pytest.mark.parametrize(

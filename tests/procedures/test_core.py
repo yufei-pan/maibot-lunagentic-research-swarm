@@ -18,18 +18,22 @@ from lunagentic_research_swarm.runtime.events import (
 )
 
 
-def test_terminate_dominates_other_control_procedures() -> None:
+def test_terminate_ignores_checkpoint_but_keeps_compact() -> None:
+    """spec §10 步骤 6→7：compact 先执行，分支最终总结运行在压缩后的历史上。"""
+
     ordinary, controls = split_procedure_requests(
         [
             ProcedureRequest(procedure_id=CORE_COMPACT_ID),
+            ProcedureRequest(procedure_id=CORE_CHECKPOINT_ID),
             ProcedureRequest(procedure_id=CORE_TERMINATE_ID, arguments={"reason": "done"}),
         ]
     )
 
     assert ordinary == []
     assert controls.terminate
-    assert not controls.compact
-    assert controls.ignored_controls == [CORE_COMPACT_ID]
+    assert controls.compact
+    assert not controls.checkpoint
+    assert controls.ignored_controls == [CORE_CHECKPOINT_ID]
 
 
 class FakeSummarizer:

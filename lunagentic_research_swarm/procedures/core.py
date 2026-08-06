@@ -199,12 +199,13 @@ def split_procedure_requests(requests: Sequence[Any]) -> tuple[list[Any], CorePr
 
     ignored: list[str] = []
     if terminate:
-        # 只记录实际出现过的其它控制，并保持请求顺序；重复控制不被静默去重。
+        # spec §10 步骤 6→7：compact 先于 terminate 执行，分支最终总结因此运行在
+        # 压缩后的历史上；terminate 只忽略 checkpoint 与全部委派。
+        # 只记录实际被忽略的控制，并保持请求顺序；重复控制不被静默去重。
         for request in controls:
             procedure_id = _request_procedure_id(request)
-            if procedure_id != CORE_TERMINATE_ID:
+            if procedure_id == CORE_CHECKPOINT_ID:
                 ignored.append(procedure_id)
-        compact = False
         checkpoint = False
 
     return ordinary, CoreProcedureDecision(
