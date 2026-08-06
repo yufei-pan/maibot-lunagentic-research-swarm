@@ -351,11 +351,19 @@ async def _run_nested_procedures(
     requests: Sequence[ProcedureRequest],
     *,
     deps: ContractorDeps,
+    messages: Sequence[Mapping[str, Any]],
+    outsider_task: str,
 ) -> tuple[list[str], float]:
-    """执行 allowlist 内嵌套调用；禁止项写入错误；返回 (transcript notes, nested_charge_sum)。"""
+    """执行 allowlist 内嵌套调用；禁止项写入错误；返回 (transcript notes, nested_charge_sum)。
+
+    嵌套 ``core.compact`` 时注入承包商 transcript 与 outsider 问题作为总结上下文
+    （agent 侧常见空 arguments），使 compact 可成功并申报计费。
+    """
 
     notes: list[str] = []
     nested_charged = 0.0
+    transcript = [dict(item) for item in messages if isinstance(item, Mapping)]
+    task_text = str(outsider_task or "").strip() or "承包商旁路问题"
     for req in requests:
         pid = str(req.procedure_id)
         if _is_forbidden_nested(pid):
@@ -364,12 +372,19 @@ async def _run_nested_procedures(
         if deps.invoke_nested_procedure is None:
             notes.append(_NESTED_RUNTIME_MISSING.format(procedure_id=pid))
             continue
+        scoped: dict[str, Any] = {}
+        if pid == "core.compact":
+            scoped = {
+                "formalized_task": task_text,
+                "branch_history": list(transcript),
+            }
         try:
             result = await deps.invoke_nested_procedure(
                 pid,
                 dict(req.arguments or {}),
                 credits=float(req.credits or 0.0),
                 call_id=req.call_id,
+                scoped_metadata=scoped,
             )
         except Exception as exc:  # noqa: BLE001 — 嵌套失败写入 transcript，不中断承包商
             notes.append(f"嵌套 Procedure 执行异常（{pid}）：{type(exc).__name__}: {exc}")
@@ -628,6 +643,8 @@ async def run_contractor(
             nested_notes, nested_charge = await _run_nested_procedures(
                 outcome.procedure_requests,
                 deps=deps,
+                messages=messages,
+                outsider_task=question,
             )
             notes.extend(nested_notes)
             total_charged += nested_charge
@@ -748,6 +765,13 @@ def make_nested_procedure_invoker(
             history: Sequence[Mapping[str, Any]] = ()
             if isinstance(history_raw, Sequence) and not isinstance(history_raw, (str, bytes, bytearray)):
                 history = tuple(item for item in history_raw if isinstance(item, Mapping))
+            # 空 arguments 的 agent 请求：回落到 scoped outsider 上下文
+            if not formalized:
+                formalized = meta.get("formalized_task") or "承包商旁路问题"
+            if not history:
+                fallback = meta.get("branch_history")
+                if isinstance(fallback, Sequence) and not isinstance(fallback, (str, bytes, bytearray)):
+                    history = tuple(item for item in fallback if isinstance(item, Mapping))
             return await execute_core_procedure(
                 CORE_COMPACT_ID,
                 args,

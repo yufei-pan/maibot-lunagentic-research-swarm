@@ -350,21 +350,35 @@ async def test_contractor_rejects_nested_contractor_and_controls(
 async def test_contractor_nested_compact_adds_to_bill(
     contractor_harness: ContractorHarness,
 ) -> None:
-    """嵌套 core.compact 的 research_credits_charged 折入承包商总账单（不经外层二次扣）。"""
+    """嵌套 core.compact 经真实 invoker：注入 outsider transcript，计费折入总账单。"""
 
-    nested_calls: list[dict[str, Any]] = []
+    from lunagentic_research_swarm.llm.pricing import PriceCatalog, PriceProfile, TokenUsage
+    from lunagentic_research_swarm.llm.summarizer import SummaryResult
+    from test_memory import FakeCtx
 
-    async def _nested(procedure_id: str, arguments: Any, **kwargs: Any) -> ProcedureResult:
-        nested_calls.append({"procedure_id": procedure_id, "arguments": arguments, **kwargs})
-        return ProcedureResult(
-            success=True,
-            data={"summary": "压缩后"},
-            error=None,
-            metadata={"research_credits_charged": 2.0},
-            research_credits_charged=2.0,
-        )
+    compact_usage = TokenUsage(100, 50, 0, 100, source="actual")
+    compact_charge = 0.2
+    compact_catalog = PriceCatalog.from_sources(
+        {},
+        {"model:test": PriceProfile(price_in=10.0, price_out=20.0)},
+        {},
+    )
 
-    contractor_harness.deps.invoke_nested_procedure = _nested
+    class _CompactSummarizer:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def compact_branch(self, request: Any) -> SummaryResult:
+            self.requests.append(request)
+            return SummaryResult(True, "压缩摘要", "model:test", compact_usage, None)
+
+    summarizer = _CompactSummarizer()
+    provider = BundledProcedureProvider(FakeCtx())
+    contractor_harness.deps.invoke_nested_procedure = make_nested_procedure_invoker(
+        provider=provider,
+        summarizer=summarizer,
+        price_catalog=compact_catalog,
+    )
     contractor_harness.llm.queue_json(
         {"report": "压缩", "procedures": [{"procedure_id": "core.compact", "arguments": {}, "credits": 0}]}
     )
@@ -377,12 +391,17 @@ async def test_contractor_nested_compact_adds_to_bill(
     )
     assert result.success is True
     assert result.metadata["termination_reason"] == "returned"
-    assert len(nested_calls) == 1
-    assert nested_calls[0]["procedure_id"] == "core.compact"
-    # turn1 0.5 + nested 2.0 + turn2 0.5 = 3.0
-    assert float(result.research_credits_charged) == pytest.approx(3.0)
+    assert len(summarizer.requests) == 1
+    history = list(summarizer.requests[0].branch_history)
+    assert any(item.get("role") == "user" and "需要 compact" in str(item.get("content", "")) for item in history)
+    assert any(item.get("role") == "assistant" for item in history)
+    # turn1 0.5 + nested compact 0.2 + turn2 0.5 = 1.2
+    assert float(result.research_credits_charged) == pytest.approx(0.5 + compact_charge + 0.5)
     second_blob = json.dumps(contractor_harness.llm.calls[1]["messages"], ensure_ascii=False)
-    assert "core.compact" in second_blob or "压缩" in second_blob
+    assert "core.compact" in second_blob
+    assert "压缩摘要" in second_blob or "compacted" in second_blob
+    assert "summary_input_empty" not in second_blob
+    assert "未注入" not in second_blob
 
 
 @pytest.mark.asyncio
