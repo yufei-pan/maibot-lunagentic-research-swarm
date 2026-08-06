@@ -242,6 +242,7 @@ def _failure(procedure_id: str, code: str, message: str) -> ProcedureResult:
         data=None,
         error={"code": code, "message": message},
         metadata={"core": True, "procedure_id": procedure_id, "research_credits_charged": 0.0},
+        research_credits_charged=0.0,
     )
 
 
@@ -282,6 +283,7 @@ async def execute_core_procedure(
             data={"terminated": True, "reason": str(args.get("reason") or ctx.reason or "")},
             error=None,
             metadata={"core": True, "procedure_id": procedure_id, "research_credits_charged": 0.0},
+            research_credits_charged=0.0,
         )
     if summarizer is None:
         return _failure(procedure_id, "core_summary_unavailable", "core Procedure 缺少总结器")
@@ -318,6 +320,7 @@ async def execute_core_procedure(
             "research_credits_charged": 0.0,
             "model_name": summary.model_name,
         },
+        research_credits_charged=0.0,
     )
 
 

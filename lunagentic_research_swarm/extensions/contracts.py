@@ -158,6 +158,7 @@ class ProcedureResult(_StrictContract):
     data: dict[str, Any] | None
     error: dict[str, Any] | None
     metadata: dict[str, Any]
+    research_credits_charged: float = Field(default=0.0, ge=0.0)
 
     @field_validator("data", "error", "metadata")
     @classmethod

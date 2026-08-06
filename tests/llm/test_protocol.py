@@ -150,6 +150,16 @@ def test_json_envelope_rejects_nonstandard_nonfinite_constants(constant: str) ->
     assert exc_info.value.code == "protocol_invalid"
 
 
+def test_procedure_request_credits_default_zero() -> None:
+    req = ProcedureRequest(procedure_id="builtin.web_search", arguments={})
+    assert req.credits == 0.0
+
+
+def test_procedure_request_rejects_negative_credits() -> None:
+    with pytest.raises(ValidationError):
+        ProcedureRequest(procedure_id="builtin.web_search", credits=-1.0, arguments={})
+
+
 def test_envelope_models_reject_extra_fields_when_constructed_directly() -> None:
     """若 direct model 构造绕过 strict extra 契约，本测试应失败。"""
 

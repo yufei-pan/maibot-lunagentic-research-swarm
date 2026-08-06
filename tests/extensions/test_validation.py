@@ -169,10 +169,31 @@ def test_invocation_and_result_have_fixed_strict_envelopes() -> None:
         "arguments",
         "scoped_metadata",
     }
-    assert set(ProcedureResult.model_fields) == {"success", "data", "error", "metadata"}
+    assert set(ProcedureResult.model_fields) == {
+        "success",
+        "data",
+        "error",
+        "metadata",
+        "research_credits_charged",
+    }
+    assert result.research_credits_charged == 0.0
     with pytest.raises(ValidationError):
         ProcedureResult.model_validate({**result.model_dump(), "raw_payload": "secret"})
     assert invocation.arguments["url"] == "https://example.test"
+
+
+def test_procedure_result_research_credits_charged_default() -> None:
+    result = ProcedureResult.model_validate(
+        {"success": True, "data": {}, "error": None, "metadata": {}}
+    )
+    assert result.research_credits_charged == 0.0
+    assert set(ProcedureResult.model_fields) == {
+        "success",
+        "data",
+        "error",
+        "metadata",
+        "research_credits_charged",
+    }
 
 
 def test_contract_nested_payloads_are_immutable_after_validation() -> None:
