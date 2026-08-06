@@ -280,6 +280,124 @@ async def test_contractor_budget_zero_runs_one_turn_then_force_returns_if_spend(
 
 
 @pytest.mark.asyncio
+async def test_insufficient_funds_skips_same_turn_nested_procedures(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """Turn spend 使余额 <0 → insufficient_funds；同轮 nested 不得执行（预算机 step 4）。"""
+
+    nested_calls: list[str] = []
+
+    async def _nested(procedure_id: str, arguments: Any = None, **kwargs: Any) -> ProcedureResult:
+        del arguments, kwargs
+        nested_calls.append(str(procedure_id))
+        return ProcedureResult(
+            success=True,
+            data={},
+            error=None,
+            metadata={},
+            research_credits_charged=0.0,
+        )
+
+    contractor_harness.deps.invoke_nested_procedure = _nested
+    # per_turn=0.5 > credit_budget=0 → 扣费后余额为负，即使信封含 procedures
+    contractor_harness.llm.queue_json(
+        {
+            "report": "x",
+            "procedures": [{"procedure_id": "builtin.calculate", "arguments": {"expression": "1+1"}}],
+            "return": "should-not-matter",
+        }
+    )
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="额度不足跳过嵌套",
+        caller_protocol="json_envelope",
+        credit_budget=0.0,
+    )
+    assert result.success is True
+    assert result.metadata["termination_reason"] == "insufficient_funds"
+    assert nested_calls == []
+    assert len(contractor_harness.llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_return_ignores_sibling_procedures(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """同轮显式 return + procedures → return 优先；nested 不调用（预算机 step 5）。"""
+
+    nested_calls: list[str] = []
+
+    async def _nested(procedure_id: str, arguments: Any = None, **kwargs: Any) -> ProcedureResult:
+        del arguments, kwargs
+        nested_calls.append(str(procedure_id))
+        return ProcedureResult(
+            success=True,
+            data={},
+            error=None,
+            metadata={},
+            research_credits_charged=0.0,
+        )
+
+    contractor_harness.deps.invoke_nested_procedure = _nested
+    contractor_harness.llm.queue_json(
+        {
+            "return": "最终答案",
+            "procedures": [{"procedure_id": "builtin.calculate", "arguments": {"expression": "1"}}],
+        }
+    )
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="显式返回优先",
+        caller_protocol="json_envelope",
+        credit_budget=100.0,
+    )
+    assert result.success is True
+    assert result.data["result"] == "最终答案"
+    assert result.metadata["termination_reason"] == "returned"
+    assert nested_calls == []
+    assert len(contractor_harness.llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_nested_settlement_overspend_force_returns_without_next_turn(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """嵌套结算后余额 <0 → insufficient_funds，不再开下一轮 LLM（预算机 step 7）。"""
+
+    nested_charge = 5.0
+
+    async def _nested(procedure_id: str, arguments: Any = None, **kwargs: Any) -> ProcedureResult:
+        del procedure_id, arguments, kwargs
+        return ProcedureResult(
+            success=True,
+            data={"ok": True},
+            error=None,
+            metadata={},
+            research_credits_charged=nested_charge,
+        )
+
+    contractor_harness.deps.invoke_nested_procedure = _nested
+    # turn 0.5 后余额 0.5；嵌套 +5 → 余额 -4.5；勿再排队第二轮 LLM
+    contractor_harness.llm.queue_json(
+        {
+            "report": "算一下",
+            "procedures": [{"procedure_id": "builtin.calculate", "arguments": {"expression": "1"}}],
+        }
+    )
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="嵌套超额",
+        caller_protocol="json_envelope",
+        credit_budget=1.0,
+    )
+    assert result.success is True
+    assert result.metadata["termination_reason"] == "insufficient_funds"
+    assert len(contractor_harness.llm.calls) == 1
+    assert float(result.research_credits_charged) >= nested_charge
+    assert float(result.research_credits_charged) == pytest.approx(0.5 + nested_charge)
+
+
+@pytest.mark.asyncio
 async def test_contractor_soft_time_budget_force_returns(
     contractor_harness: ContractorHarness,
 ) -> None:
