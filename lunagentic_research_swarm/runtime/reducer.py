@@ -20,7 +20,9 @@ from typing import Any, ClassVar, TypeAlias
 from lunagentic_research_swarm.errors import INVALID_STATE, STORAGE_COMMIT_FAILED, LRSError
 from lunagentic_research_swarm.models import FormalizedTask, TaskStatus
 from lunagentic_research_swarm.llm.protocol import ProtocolError, build_correction_message
+from lunagentic_research_swarm.procedures.billing import extract_research_credits_charged
 from lunagentic_research_swarm.runtime.credits import (
+    charge_procedure_usage,
     reconcile_usage,
     redistribute_pool,
     reserve_input,
@@ -1313,6 +1315,37 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                     },
                 )
             )
+
+        # 仅顶层批结果扣调用方；按条目写 procedure_charge，避免与 manager 双写。
+        charge_items: list[tuple[Any, float]] = []
+        for item in event.results:
+            charged = extract_research_credits_charged(getattr(item, "result", None))
+            if charged > 0.0:
+                charge_items.append((item, charged))
+        if charge_items:
+            running_balance = float(event.credits_after) + sum(amount for _, amount in charge_items)
+            for item, charged in charge_items:
+                running_balance -= charged
+                procedure_id = str(getattr(item, "procedure_id", "") or "")
+                request_id = str(getattr(item, "request_id", "") or "")
+                item_call_id = str(getattr(item, "call_id", "") or event.call_id or "")
+                charge = charge_procedure_usage(
+                    charged,
+                    task_id=event.task_id,
+                    round_id=event.round_id,
+                    branch_id=event.branch_id,
+                    call_id=item_call_id,
+                    procedure_id=procedure_id,
+                    request_id=request_id,
+                    balance_after=running_balance,
+                    metadata={
+                        "procedure_id": procedure_id,
+                        "call_id": item_call_id,
+                        "request_id": request_id,
+                    },
+                    created_at=event.occurred_at,
+                )
+                commands.extend(charge.commands)
 
         state_calls_started = int(getattr(state, "agent_calls_started", 0))
         authoritative_calls_started = max(state_calls_started, event.agent_calls_started)

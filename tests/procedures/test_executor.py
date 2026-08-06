@@ -107,7 +107,18 @@ async def test_executor_runs_only_ordinary_batch_and_returns_event() -> None:
         "branch_id": "branch-1",
         "turn_id": "turn-1",
         "agent_id": "agent.reader",
+        "credit_budget": 0.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_executor_passes_credit_budget_in_scoped_metadata() -> None:
+    api = FakeAPI({"builtin.search": {"success": True, "data": {}, "error": None, "metadata": {}}})
+    executor = ProcedureExecutor(catalog(definition("builtin.search")), api=api)
+
+    await executor.invoke_many(effect([ProcedureRequest(procedure_id="builtin.search", credits=4.0)]))
+
+    assert float(api.calls[0][2]["scoped_metadata"]["credit_budget"]) == pytest.approx(4.0)
 
 
 @pytest.mark.asyncio

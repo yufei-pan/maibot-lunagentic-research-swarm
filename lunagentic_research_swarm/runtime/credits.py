@@ -749,3 +749,90 @@ def reconcile_usage(
         ledger_command=ledger_command,
         charged=charged,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcedureChargeResult:
+    """顶层 Procedure 批结果对调用方的研究额度扣费账本命令。"""
+
+    charged: float
+    commands: tuple[StoreCommand, ...]
+    ledger_command: StoreCommand | None
+    ledger_entry: CreditLedgerEntry | None
+
+
+def charge_procedure_usage(
+    charged: float,
+    *,
+    task_id: str = "",
+    round_id: str = "",
+    branch_id: str | None = None,
+    call_id: str = "",
+    procedure_id: str = "",
+    request_id: str = "",
+    budget_hint: float | None = None,
+    balance_after: float | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    ledger_id: str | None = None,
+    created_at: float | datetime = 0.0,
+) -> ProcedureChargeResult:
+    """为顶层 Procedure 批扣费构造 ``insert_credit_ledger`` 命令。
+
+    符号约定与 ``reserve_input`` 一致：支出为负 ``amount``（``amount = -charged``），
+    ``entry_kind="procedure_charge"``。``charged == 0`` 时不写账本。
+    """
+
+    amount_charged = _nonnegative_finite(charged, "charged")
+    timestamp = _timestamp(created_at)
+    if amount_charged == 0.0:
+        return ProcedureChargeResult(
+            charged=0.0,
+            commands=(),
+            ledger_command=None,
+            ledger_entry=None,
+        )
+
+    meta: dict[str, Any] = {
+        "procedure_id": procedure_id,
+        "call_id": call_id,
+        "request_id": request_id,
+        "charged": amount_charged,
+    }
+    if budget_hint is not None:
+        meta["budget_hint"] = _nonnegative_finite(budget_hint, "budget_hint")
+    if metadata:
+        meta.update(dict(metadata))
+    metadata_text = _metadata_json(meta)
+    entry = CreditLedgerEntry(
+        ledger_id=ledger_id or new_ledger_id(),
+        task_id=task_id,
+        round_id=round_id,
+        branch_id=branch_id,
+        call_id=call_id or None,
+        entry_kind="procedure_charge",
+        amount=-amount_charged,
+        balance_after=balance_after,
+        metadata_json=metadata_text,
+        created_at=timestamp,
+    )
+    ledger_command = StoreCommand(
+        "insert_credit_ledger",
+        {
+            "ledger_id": entry.ledger_id,
+            "task_id": entry.task_id,
+            "round_id": entry.round_id,
+            "branch_id": entry.branch_id,
+            "call_id": entry.call_id,
+            "entry_kind": entry.entry_kind,
+            "amount": entry.amount,
+            "balance_after": entry.balance_after,
+            "metadata_json": entry.metadata_json,
+            "created_at": entry.created_at,
+        },
+    )
+    return ProcedureChargeResult(
+        charged=amount_charged,
+        commands=(ledger_command,),
+        ledger_command=ledger_command,
+        ledger_entry=entry,
+    )

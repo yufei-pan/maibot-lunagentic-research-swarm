@@ -20,6 +20,7 @@ from lunagentic_research_swarm.llm.protocol import (
     parse_json_envelope_with_repairs,
     parse_native_tool_result_with_repairs,
 )
+from lunagentic_research_swarm.procedures.billing import extract_research_credits_charged
 from lunagentic_research_swarm.runtime.events import AgentCallCompleted, AgentCallFailed, ProcedureBatchCompleted
 from lunagentic_research_swarm.runtime.reducer import PerformAgentCall, PerformProcedureBatch
 
@@ -208,11 +209,13 @@ class TurnWorker:
             raise TypeError("Procedure executor 必须返回 ProcedureBatchCompleted")
         payload = effect.payload
         parent_messages = completed.parent_messages or tuple(payload.get("messages", ()))
+        prior = float(payload.get("credits_after", 0.0))
+        charged = sum(extract_research_credits_charged(getattr(item, "result", None)) for item in completed.results)
         return replace(
             completed,
             report=str(payload.get("report", "")),
             delegations=tuple(payload.get("delegations", ())),
-            credits_after=float(payload.get("credits_after", 0.0)),
+            credits_after=prior - charged,
             parent_messages=parent_messages,
             parent_depth=int(payload.get("branch_depth", 0)),
             live_agent_ids=payload.get("live_agent_ids"),

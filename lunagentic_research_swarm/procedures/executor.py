@@ -493,6 +493,7 @@ class ProcedureExecutor:
                 "data": sanitized_data,
                 "error": sanitized_error,
                 "metadata": metadata,
+                "research_credits_charged": float(getattr(result, "research_credits_charged", 0.0) or 0.0),
             },
             strict=True,
         )
@@ -527,6 +528,9 @@ class ProcedureExecutor:
         api_name = str(self._entry_value(entry, "api_name", ""))
         api_version = str(self._entry_value(entry, "api_version", "1"))
         try:
+            budget = float(_request_value(request, "credits", 0.0) or 0.0)
+            scoped = self._metadata(context)
+            scoped["credit_budget"] = budget
             invocation = ProcedureInvocation.model_validate(
                 {
                     "request_id": request_id,
@@ -536,7 +540,7 @@ class ProcedureExecutor:
                     "turn_id": context["turn_id"],
                     "agent_id": context["agent_id"],
                     "arguments": dict(_request_value(request, "arguments", {}) or {}),
-                    "scoped_metadata": self._metadata(context),
+                    "scoped_metadata": scoped,
                 },
                 strict=True,
             )
