@@ -954,7 +954,7 @@ class ResearchManager:
         self._branches.get(effect.task_id, {}).pop(branch_id, None)
 
     async def handle_report_deadline(self, event: ReportDeadlineReached) -> None:
-        """Durably enter REPORTING, then open the injected epoch coordinator.
+        """Durably enter REPORTING/FINALIZING, then open the injected epoch coordinator.
 
         This is the explicit scheduler/effect bridge for ``OpenReportEpoch``;
         it deliberately invokes the coordinator only after TaskController has
@@ -964,10 +964,10 @@ class ResearchManager:
         controller = self._controllers.get(event.task_id)
         if controller is None or event.generation != controller.state.generation or event.round_id != controller.state.active_round_id:
             return
-        if controller.state.status is not TaskStatus.RUNNING:
+        if controller.state.status not in {TaskStatus.RUNNING, TaskStatus.FINALIZING}:
             return
         await self._submit(controller, event)
-        if controller.state.status is not TaskStatus.REPORTING:
+        if controller.state.status not in {TaskStatus.REPORTING, TaskStatus.FINALIZING}:
             return
         await self.handle_runtime_effect(
             OpenReportEpoch(
@@ -975,7 +975,10 @@ class ResearchManager:
                 event.round_id,
                 event.generation,
                 priority="barrier",
-                payload={"epoch": controller.state.report_epoch},
+                payload={
+                    "epoch": controller.state.report_epoch,
+                    "kind": "FINAL" if controller.state.status is TaskStatus.FINALIZING else "INTERMEDIATE",
+                },
             )
         )
 
@@ -1005,7 +1008,7 @@ class ResearchManager:
         if not isinstance(effect, OpenReportEpoch):
             return
         controller = self._controllers.get(effect.task_id)
-        if controller is None or controller.state.status is not TaskStatus.REPORTING:
+        if controller is None or controller.state.status not in {TaskStatus.REPORTING, TaskStatus.FINALIZING}:
             return
         coordinator = self.report_coordinators.get(effect.task_id)
         if coordinator is None:
@@ -1015,6 +1018,9 @@ class ResearchManager:
         if current is not None and getattr(current, "epoch", None) == epoch:
             return
         opened = await coordinator.open_epoch(epoch=epoch)
+        # FINAL epochs (empty frontier or explicit kind) do not use grace clones.
+        if controller.state.status is TaskStatus.FINALIZING or str(effect.payload.get("kind") or "") == "FINAL":
+            return
         grace_due = getattr(opened, "grace_deadline_at", None)
         if grace_due is not None:
             self._arm_grace_timer(
@@ -1234,16 +1240,21 @@ class ResearchManager:
             return
         state = controller.state
         if record.kind is ReportKind.FINAL:
-            if state.status is TaskStatus.RUNNING:
-                # The intermediate completion returned this task to RUNNING.
-                # Commit the new final epoch before publishing its completed
-                # event, preserving transaction-before-effect for both steps.
+            if state.status in {TaskStatus.RUNNING, TaskStatus.FINALIZING}:
+                # Commit the final epoch (RUNNING→FINALIZING, or bump epoch while
+                # already FINALIZING after the last leaf settled) before publishing
+                # the completed event, preserving transaction-before-effect.
                 if record.epoch != state.report_epoch + 1:
                     return
                 await self._submit(
                     controller,
                     ReportDeadlineReached(
-                        _event_id(), task_id, state.active_round_id or "", state.generation, epoch=record.epoch
+                        _event_id(),
+                        task_id,
+                        state.active_round_id or "",
+                        state.generation,
+                        epoch=record.epoch,
+                        report_kind="FINAL",
                     ),
                 )
                 state = controller.state

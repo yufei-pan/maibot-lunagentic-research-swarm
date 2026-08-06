@@ -299,6 +299,10 @@ class BranchFinalized(Event):
 @dataclass(frozen=True, slots=True)
 class ReportDeadlineReached(Event):
     epoch: int | None = None
+    # ``FINAL`` commits a final-report epoch as FINALIZING; ``INTERMEDIATE`` or
+    # unset follows the normal deadline → REPORTING path (empty leaves alone
+    # also select FINAL so terminal-only wrap-up stays deadline-free).
+    report_kind: str | None = None
 
 
 @_register

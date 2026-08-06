@@ -839,14 +839,30 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         )
 
     if isinstance(event, ReportDeadlineReached):
-        if status is not TaskStatus.RUNNING:
-            return _invalid(state, event, "ReportDeadlineReached 只能用于 RUNNING")
         current_epoch = _state_report_epoch(state)
         epoch = event.epoch if event.epoch is not None else current_epoch + 1
         if epoch <= current_epoch:
             return Transition.from_ignored(state, reason="stale_report_epoch")
         if epoch != current_epoch + 1:
             return Transition.from_ignored(state, reason="future_report_epoch")
+        report_kind = str(getattr(event, "report_kind", None) or "").upper() or None
+        leaves_empty = not _state_leaves(state)
+        is_final = report_kind == "FINAL" or (report_kind is None and leaves_empty)
+        if report_kind == "INTERMEDIATE":
+            is_final = False
+        if status is TaskStatus.FINALIZING:
+            # Synthesis already moved the task into FINALIZING (last leaf done);
+            # only commit the final epoch counter before FinalReportCompleted.
+            if not is_final:
+                return _invalid(state, event, "FINALIZING 时 ReportDeadlineReached 只能提交最终报告 epoch")
+            return _transition_status(state, event, TaskStatus.FINALIZING, report_epoch=epoch)
+        if status is not TaskStatus.RUNNING:
+            return _invalid(state, event, "ReportDeadlineReached 只能用于 RUNNING 或 FINALIZING")
+        if is_final:
+            effects = (
+                _effect(OpenReportEpoch, event, priority="barrier", payload={"epoch": epoch, "kind": "FINAL"}),
+            )
+            return _transition_status(state, event, TaskStatus.FINALIZING, effects=effects, report_epoch=epoch)
         effects = (
             _effect(OpenReportEpoch, event, priority="barrier", payload={"epoch": epoch, "kind": "INTERMEDIATE"}),
         )
@@ -855,9 +871,15 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
     if isinstance(event, ReportCompleted):
         if status is not TaskStatus.REPORTING:
             return _invalid(state, event, "ReportCompleted 只能用于 REPORTING")
+        # Intermediate report done with no live leaves: enter FINALIZING so the
+        # immediate follow-up FINAL epoch is observable (design §13.4).
+        if not _state_leaves(state):
+            return _transition_status(state, event, TaskStatus.FINALIZING)
         return _transition_status(state, event, TaskStatus.RUNNING)
 
     if isinstance(event, GraceExpired):
+        if status is TaskStatus.FINALIZING:
+            return Transition.from_ignored(state, reason="grace_during_finalizing")
         if status is not TaskStatus.REPORTING:
             return _invalid(state, event, "GraceExpired 只能用于 REPORTING")
         current_epoch = _state_report_epoch(state)
@@ -1328,20 +1350,31 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         leaves = _state_leaves(state)
         balance = float(leaves.pop(event.branch_id, 0.0))
         pool = _state_credit_pool(state) + balance
+        settle = _command(
+            "settle_branch",
+            {
+                "round_id": event.round_id,
+                "branch_id": event.branch_id,
+                "credit_balance": balance,
+                "lifecycle": "FINALIZED",
+                "finalized_at": event.occurred_at.timestamp(),
+            },
+        )
+        # Spec §13.4: when every active leaf is finalized, enter FINALIZING
+        # immediately.  Do not leave REPORTING (an intermediate epoch may still
+        # be committing); only RUNNING → FINALIZING here.
+        if not leaves and status is TaskStatus.RUNNING:
+            return _transition_status(
+                state,
+                event,
+                TaskStatus.FINALIZING,
+                extra_commands=(settle,),
+                active_leaves=leaves,
+                credit_pool=pool,
+            )
         return Transition(
             _replace_state(state, active_leaves=leaves, credit_pool=pool),
-            commands=(
-                _command(
-                    "settle_branch",
-                    {
-                        "round_id": event.round_id,
-                        "branch_id": event.branch_id,
-                        "credit_balance": balance,
-                        "lifecycle": "FINALIZED",
-                        "finalized_at": event.occurred_at.timestamp(),
-                    },
-                ),
-            ),
+            commands=(settle,),
         )
 
     if isinstance(event, (SummaryCompleted, SummaryFailed, BranchCheckpointed)):

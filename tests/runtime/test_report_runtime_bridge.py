@@ -78,6 +78,48 @@ async def test_default_coordinator_completes_intermediate_then_final_report_thro
 
 
 @pytest.mark.asyncio
+async def test_last_leaf_finalization_enters_finalizing_before_completed(harness) -> None:
+    import asyncio
+
+    from lunagentic_research_swarm.runtime.events import BranchFinalized
+
+    manager, _, _, _, task_id = await _running_manager(harness)
+    before = await manager.status(task_id)
+    coordinator = manager.report_coordinators[task_id]
+    branch_id = before["active_leaves"][0]["branch_id"]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_synthesize = coordinator.synthesize
+
+    async def gated_synthesize(epoch=None):
+        started.set()
+        await release.wait()
+        return await original_synthesize(epoch)
+
+    coordinator.synthesize = gated_synthesize  # type: ignore[method-assign]
+
+    await manager.handle_branch_safe_point(task_id, branch_id, terminal=True)
+    await started.wait()
+    await manager.handle_runtime_event(
+        BranchFinalized(
+            "evt-leaf-done",
+            task_id,
+            before["round_id"],
+            before["generation"],
+            branch_id=branch_id,
+            summary_id="sum-terminal",
+            reason="no_further_work",
+        )
+    )
+    assert (await manager.status(task_id))["status"] == TaskStatus.FINALIZING.value
+
+    release.set()
+    await coordinator.wait_for_synthesis()
+    assert (await manager.status(task_id))["status"] == TaskStatus.COMPLETED.value
+    assert coordinator.reports[-1].kind.value == "FINAL"
+
+
+@pytest.mark.asyncio
 async def test_failed_final_synthesis_completes_with_errors_without_prompt_leak(harness) -> None:
     manager, _, summarizer, _, task_id = await _running_manager(harness)
     before = await manager.status(task_id)

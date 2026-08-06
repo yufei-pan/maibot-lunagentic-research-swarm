@@ -63,7 +63,7 @@ def event_factory(event_type: str, *, generation: int = 0):
         ("RUNNING", "PauseRequested", "PAUSING"),
         ("PAUSING", "AllInflightSettled", "PAUSED"),
         ("RUNNING", "StopRequested", "STOPPED"),
-        ("REPORTING", "ReportCompleted", "RUNNING"),
+        ("REPORTING", "ReportCompleted", "FINALIZING"),  # empty leaves → §13.4
         ("FINALIZING", "FinalReportCompleted", "COMPLETED"),
         ("FINALIZING", "FinalReportFailed", "COMPLETED_WITH_ERRORS"),
     ],
@@ -71,6 +71,19 @@ def event_factory(event_type: str, *, generation: int = 0):
 def test_lifecycle_transitions(status: str, event_type: str, expected: str) -> None:
     transition = reduce_event(state_factory(status), event_factory(event_type))
     assert transition.next_state.status.value == expected
+
+
+def test_report_completed_with_active_leaves_returns_to_running() -> None:
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.REPORTING,
+        generation=0,
+        active_round_id="round-1",
+        report_epoch=1,
+        active_leaves={"still-running": 2.0},
+    )
+    transition = reduce_event(state, event_factory("ReportCompleted"))
+    assert transition.next_state.status is TaskStatus.RUNNING
 
 
 def test_late_generation_is_ignored_without_commands_or_effects() -> None:
@@ -253,3 +266,125 @@ def test_outbox_delivery_is_invalid_before_completed_terminal_status() -> None:
     assert transition.error is not None
     assert transition.error.code == "invalid_state"
     assert any(type(effect).__name__ == "NotifyToolWaiter" for effect in transition.effects)
+
+
+def test_last_branch_finalized_enters_finalizing() -> None:
+    from lunagentic_research_swarm.runtime.events import BranchFinalized
+
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.RUNNING,
+        generation=0,
+        active_round_id="round-1",
+        active_leaves={"branch-1": 3.0},
+        credit_pool=1.0,
+    )
+    event = BranchFinalized(
+        "evt-final",
+        "task-1",
+        "round-1",
+        0,
+        branch_id="branch-1",
+        summary_id="sum-1",
+        reason="no_further_work",
+    )
+
+    transition = reduce_event(state, event)
+
+    assert transition.next_state.status is TaskStatus.FINALIZING
+    assert transition.next_state.active_leaves == {}
+    assert transition.next_state.credit_pool == pytest.approx(4.0)
+    assert any(command.kind == "settle_branch" for command in transition.commands)
+    assert any(command.kind == "update_round_status" for command in transition.commands)
+
+
+def test_branch_finalized_during_reporting_keeps_reporting_when_leaves_empty() -> None:
+    from lunagentic_research_swarm.runtime.events import BranchFinalized
+
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.REPORTING,
+        generation=0,
+        active_round_id="round-1",
+        report_epoch=1,
+        active_leaves={"branch-1": 1.0},
+    )
+    event = BranchFinalized(
+        "evt-final",
+        "task-1",
+        "round-1",
+        0,
+        branch_id="branch-1",
+        summary_id="sum-1",
+    )
+
+    transition = reduce_event(state, event)
+
+    assert transition.next_state.status is TaskStatus.REPORTING
+    assert transition.next_state.active_leaves == {}
+
+
+def test_report_completed_with_empty_leaves_enters_finalizing() -> None:
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.REPORTING,
+        generation=0,
+        active_round_id="round-1",
+        report_epoch=1,
+        active_leaves={},
+    )
+    event = ReportCompleted("evt-report", "task-1", "round-1", 0, report_id="rpt-1")
+
+    transition = reduce_event(state, event)
+
+    assert transition.next_state.status is TaskStatus.FINALIZING
+
+
+def test_report_deadline_with_final_kind_enters_finalizing() -> None:
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.RUNNING,
+        generation=0,
+        active_round_id="round-1",
+        active_leaves={"stale-leaf": 1.0},
+    )
+    event = ReportDeadlineReached(
+        "evt-deadline",
+        "task-1",
+        "round-1",
+        0,
+        epoch=1,
+        report_kind="FINAL",
+    )
+
+    transition = reduce_event(state, event)
+
+    assert transition.next_state.status is TaskStatus.FINALIZING
+    assert transition.next_state.report_epoch == 1
+    assert [type(effect).__name__ for effect in transition.effects] == ["OpenReportEpoch"]
+    assert transition.effects[0].payload["kind"] == "FINAL"
+
+
+def test_report_deadline_commits_epoch_while_already_finalizing() -> None:
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.FINALIZING,
+        generation=0,
+        active_round_id="round-1",
+        report_epoch=0,
+        active_leaves={},
+    )
+    event = ReportDeadlineReached(
+        "evt-deadline",
+        "task-1",
+        "round-1",
+        0,
+        epoch=1,
+        report_kind="FINAL",
+    )
+
+    transition = reduce_event(state, event)
+
+    assert transition.next_state.status is TaskStatus.FINALIZING
+    assert transition.next_state.report_epoch == 1
+    assert transition.effects == ()
