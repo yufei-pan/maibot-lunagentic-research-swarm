@@ -14,6 +14,10 @@
 
 **架构：** 中央事件归约器 + 有界异步图调度器 + 可扩展智能体/Procedure 注册表
 
+**增补：** Procedure 研究 credits 计费与旁路承包商 `builtin.contractor` 见
+`2026-08-06-contractor-procedure-design.md`（本文件相关不变量 / §9.1 / §11 / §12.2 / §15 / §25.3
+已与之对齐）。
+
 ## 1. 摘要
 
 麦麦深度调查组是一套面向 MaiBot 的深度研究智能体蜂群。插件接收 Maisaka Planner 发起的异步调查任务，在时间提示和 credits 预算下，让多代专职智能体动态分工、调用资料检索工具、互相质疑、压缩上下文，并持续产出带统计信息的中间报告和最终结论。
@@ -87,7 +91,7 @@
 
 1. 正式任务描述一经生成，在 Task 的所有 round、branch、compact 和总结中保持逐字节不变。
 2. 总结器不是智能体，不出现在委派目录，不受研究 credits 限制。
-3. Procedure 不扣研究 credits；外部 Procedure 的现实费用只作为独立遥测记录。
+3. Procedure **可以**通过结果字段 `research_credits_charged` 扣减研究 credits（缺省 / 未申报视为 0）。请求侧可选外层 `credits` 仅作预算提示，不预扣。`external_cost*` 仍只作现实费用遥测，不触碰研究余额。旁路承包商等细节见 `2026-08-06-contractor-procedure-design.md`。
 4. Task pool 只有 `continue_deep_research` 能触发重新分配。
 5. 零余额可以继续委派；只有负余额会触发 credits 终止。
 6. 委派只能把父分支的可用余额交给子分支，不能主动从 Task pool 取款。
@@ -223,6 +227,7 @@ flowchart TD
     {
       "procedure_id": "provider_namespace.procedure_name",
       "call_id": "可选；本 turn 内由智能体自定的关联 ID",
+      "credits": 0.0,
       "arguments": {}
     }
   ],
@@ -242,7 +247,9 @@ flowchart TD
 - Procedure 请求的身份字段是 `procedure_id`，与第 15.1 节 definition 同名。`call_id`
   可选，由智能体自行生成，仅原样回显在结果摘要中用于对账，不参与路由或去重；
   结果顺序始终由请求顺序决定。
-- `credits` 必须为非负数，允许为 0。
+- Procedure 请求的外层 `credits`（缺省 0）是交给 handler 的**预算提示**，调用前不预扣；
+  实际扣费以结果 `research_credits_charged` 为准。委派边的 `credits` 仍是父子余额分配份额。
+  两处 `credits` 都必须为非负数，允许为 0。
 - 智能体可把自己列为下一智能体，实现“调用 Procedure 后把结果交回自己”的工具循环。
 - 智能体也可同时请求 checkpoint、其他 Procedure 和多个子智能体。
 - 没有委派且没有显式终止时，视为自然结束，调用核心分支总结器。
@@ -422,7 +429,9 @@ initial credits
 + dormant task-pool balance
 ```
 
-分配只是转移，不能制造 credits。总结器和 Procedure 不进入这条研究 credits 等式；它们的 token、现实费用和 cost-equivalent 另行统计。
+分配只是转移，不能制造 credits。总结器（含自动 compact）的 token / cost-equivalent 仍在研究 credits 等式之外。
+普通 Procedure 若申报 `research_credits_charged`，则该金额进入研究余额扣减（与 LLM turn 扣费同属研究账本）；
+未申报视为 0。`external_cost*` 现实费用继续只作遥测，不进入研究 credits 等式。
 
 ## 12. 核心总结器
 
@@ -453,7 +462,8 @@ initial credits
 - fan-out 时先 clone 父上下文，再按每个目标 agent 的阈值判断；手动 compact 则发生在 clone 前，影响所有子分支。
 - compact 结果只替换可变历史，正式任务描述重新原样附加，因此仍能继承 root 或直接父节点的稳定 cache 前缀。
 - compact 会重写分支消息并从该点打断旧 cache lineage，因此它是 Procedure，而不是可复用父前缀的普通 agent call。
-- compact 调用不扣 credits，但记录 token 和 cost-equivalent。
+- **自动** compact 不扣研究 credits，但记录 token 和 cost-equivalent。
+- **智能体请求的** `core.compact` 经 `research_credits_charged` 按总结器用量扣研究 credits（即使外层 `credits` 预算为 0 也须跑完并事后扣费）。
 - compact 成功后旧可变上下文立即释放。compact 结果不是案例总结，默认不写入向量索引。
 - 若不可变 system/catalog/task 本身已经超过安全 context window，显式报错并终止相关分支，不能通过改写任务描述掩盖。
 
@@ -657,6 +667,9 @@ Procedure definition 至少包括：
 }
 ```
 
+- `timeout_seconds` 允许为 `0`，表示禁用执行器硬超时（`asyncio.wait_for`）；`>0` 时仍为硬上限。
+  配置 override 同样允许 `0`。内置 `builtin.contractor` 默认定义为 `0`。
+
 所有结果归一化为：
 
 ```json
@@ -664,6 +677,7 @@ Procedure definition 至少包括：
   "success": true,
   "data": {},
   "error": null,
+  "research_credits_charged": 0.0,
   "metadata": {
     "provider_plugin_id": "...",
     "duration_ms": 0,
@@ -673,7 +687,13 @@ Procedure definition 至少包括：
 }
 ```
 
-调用都携带 `request_id`、task/round/branch/turn ID、调用 agent ID 和经过最小化的 scoped metadata。Procedure 默认无权读取其他 branch 原始上下文。
+- `research_credits_charged` 为非负有限数，缺省 `0`。runtime 在 invoke 返回后对调用分支执行
+  `balance -= research_credits_charged`（允许余额为负）；无效 / 缺失按 `0` 处理。
+- `metadata.external_cost` 仍只服务现实费用遥测与统计，不改研究余额。
+
+调用都携带 `request_id`、task/round/branch/turn ID、调用 agent ID 和经过最小化的 scoped metadata
+（含 `credit_budget` 预算提示，以及承包商所需的 `caller_protocol` / `caller_agent_id` 等）。
+Procedure 默认无权读取其他 branch 原始上下文。
 
 ### 15.2 第三方 Procedure provider
 
@@ -688,9 +708,10 @@ LRS 始终使用完整 `plugin_id.api_name@version` 调用。提供方配置和 
 
 ### 15.3 首发核心 Procedure
 
-- `compact`：核心总结器压缩 branch。
-- `checkpoint`：生成阶段性分支总结但保留 branch。
-- `terminate`：最终结束 branch，忽略委派。
+- `compact`：核心总结器压缩 branch。自动触发不扣研究 credits；智能体请求的
+  `core.compact` 经 `research_credits_charged` 计费（见 §12.2）。
+- `checkpoint`：生成阶段性分支总结但保留 branch（不扣研究 credits）。
+- `terminate`：最终结束 branch，忽略委派（不扣研究 credits）。
 
 ### 15.4 首发内置 Procedure
 
@@ -701,6 +722,7 @@ LRS 始终使用完整 `plugin_id.api_name@version` 调用。提供方配置和 
 | 历史案例 | 从 SQLite/LanceDB 检索相似正式任务、分支总结、最终报告和反馈 lessons |
 | 分析辅助 | 安全 calculator、基础统计和单位换算 |
 | 来源处理 | URL 标准化、去重、来源/provenance 整理 |
+| 旁路承包商 | `builtin.contractor`：以目录中另一智能体作 outsider 工具（新鲜上下文、无子委派扇出、可计费）；细则见 `2026-08-06-contractor-procedure-design.md` |
 
 Web 搜索由 LRS 内部实现，API keys 和 SearXNG instance 由用户配置。返回结果必须保留 engine、query、URL、标题、摘要、时间和错误，不得把无来源摘要冒充网页事实。
 
@@ -1064,7 +1086,9 @@ price_out = 0.0
 - 最大 branch 深度：32；
 - 每 Task 普通 agent calls：256。
 
-总结器不扣 credits，但仍占用全局 LLM 并发。超过并发限额的工作排队，不丢弃。超过结构上限的委派边以明确原因终止并分支总结；不能静默裁剪。
+总结器（含自动 compact / checkpoint / finalize）本身不扣研究 credits，但仍占用全局 LLM 并发；
+智能体请求的 `core.compact` 与 `builtin.contractor` 等经 `research_credits_charged` 计费的调用另计。
+超过并发限额的工作排队，不丢弃。超过结构上限的委派边以明确原因终止并分支总结；不能静默裁剪。
 
 队列使用 task-aware 公平调度，防止一个宽 fan-out Task 饿死其他 Task。stop/pause/report/continue barrier 事件优先于普通 child launch。
 
@@ -1188,7 +1212,8 @@ maibot-lunagentic-research-swarm/
 5. 多个负分支结算后 pool 为负，但不自动影响仍活动 branch。
 6. active leaves 全为 0，continue 正/负 adjustment 均平均分配。
 7. 没有 active leaves 且 pool+adjustment 非负时创建新 root；为负时返回 insufficient funds。
-8. 总结器和 Procedure usage 不改变研究 credits 等式。
+8. 总结器 / 自动 compact 的 usage 不改变研究 credits 等式；Procedure 的 `research_credits_charged`
+   （含智能体请求的 `core.compact` 与 `builtin.contractor` 等）会扣减研究余额。`external_cost*` 仍不进入等式。
 
 ### 25.4 隐私和兼容测试
 

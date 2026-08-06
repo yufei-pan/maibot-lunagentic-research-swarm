@@ -39,6 +39,7 @@
 - 中间报告：先持久化到 SQLite / outbox，再 Maisaka append + trigger；最终报告含确定性统计区块。
 - `continue` 在无活动叶子时只从 **summary layer** 开新 round，不回放 raw。
 - Core procedures：`core.compact` / `core.checkpoint` / `core.terminate`。
+- Procedure 请求可带外层 `credits`（预算提示，不预扣）；handler 经 `research_credits_charged` 事后扣研究余额。自动 compact 不扣；智能体请求的 `core.compact` 会扣。
 
 ## 九个默认智能体与内置 Procedures
 
@@ -54,7 +55,7 @@
 | `builtin.evidence_verifier` | `task:planner` | 证据核验 |
 | `builtin.quantitative_analyst` | `task:planner` | 数值与量级 |
 
-内置 Procedures（节选）：`builtin.web_search`、memory 六件套、`builtin.past_cases`、`builtin.calculate` / `statistics` / `convert_units`、`builtin.normalize_urls` / `organize_provenance`。四搜索引擎（DuckDuckGo / SearXNG / Tavily / You）仅在配置有效时进入目录。
+内置 Procedures（节选）：`builtin.web_search`、memory 六件套、`builtin.past_cases`、`builtin.calculate` / `statistics` / `convert_units`、`builtin.normalize_urls` / `organize_provenance`、`builtin.contractor`（旁路承包商：目录智能体作 outsider 工具，新鲜上下文、无子委派）。四搜索引擎（DuckDuckGo / SearXNG / Tavily / You）仅在配置有效时进入目录。计费语义见 [docs/credits-and-reporting.md](docs/credits-and-reporting.md)。
 
 用户命令：`/swarm status|tasks|stats|agents|procedures|health|vectors status|vectors rebuild|feedback …`。
 

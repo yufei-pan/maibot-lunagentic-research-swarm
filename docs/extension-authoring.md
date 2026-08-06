@@ -79,6 +79,7 @@ async def describe_procedures(self) -> list[dict]:
             "arguments_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
             "result_schema": {"type": "object"},
             "idempotent": True,
+            # timeout_seconds=0 表示禁用执行器硬超时；>0 为硬上限秒数
             "timeout_seconds": 30,
             "external_cost_kind": "none",
             "enabled": True,
@@ -100,16 +101,19 @@ async def invoke_procedure(
     arguments: dict,
     scoped_metadata: dict,
 ) -> dict:
-    # scoped_metadata 含 task_id / round_id / branch_id / turn_id / agent_id
+    # scoped_metadata 含 task_id / round_id / branch_id / turn_id / agent_id，
+    # 以及 credit_budget（请求外层 credits 的预算提示，缺省 0；不预扣）
     return {
         "success": True,
         "data": {"ok": True},
         "error": None,
+        # research_credits_charged：非负有限；缺省 0。runtime 事后 caller_balance -= 该值
+        "research_credits_charged": 0.0,
         "metadata": {
             "provider_plugin_id": self.plugin_id,
             "duration_ms": 0,
             "provenance": [],
-            "external_cost": None,
+            "external_cost": None,  # 现实费用遥测；不触碰研究余额
         },
     }
 ```
@@ -121,9 +125,13 @@ async def invoke_procedure(
   "success": false,
   "data": null,
   "error": {"code": "invalid_arguments", "message": "……"},
+  "research_credits_charged": 0.0,
   "metadata": {"request_id": "…", "procedure_id": "myplugin.lookup"}
 }
 ```
+
+计费约定：可忽略 `credit_budget` 并保持 `research_credits_charged=0`；若申报扣费，runtime
+不做预算钳制（允许事后账单超过提示）。`external_cost*` 与研究余额无关。
 
 定义失效或已从 live catalog 移除后，**新调用**得到 `procedure_unavailable`；普通分支不会因此自动终止。
 

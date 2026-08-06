@@ -10,7 +10,9 @@
 - 根智能体获得 100% 初始 credits。普通智能体先付自身输入/输出，再从剩余 `R` 按比例分配子请求；`R < 0` 时 Procedure 仍完成，但不启动新委派。
 - 零余额仍可零 credits 委派；负余额触发 credits 终止（不得启动后代）。
 - **LLM turn 消耗研究 credits**。Procedure 可通过 `research_credits_charged` 扣减研究分支余额；`external_cost*` 仅作遥测，不触碰余额。
+- 请求外层 `credits`（缺省 0）只作传给 handler 的 **预算提示**（`scoped_metadata.credit_budget`），调用前不预扣、不钳制账单。
 - 自动 compact / 总结器 telemetry 不扣研究 credits；智能体请求的 `core.compact` 与其他可计费 Procedure 经 `research_credits_charged` 申报。
+- **`builtin.contractor`**：旁路承包商。调用方把问题交给目录中另一智能体（新鲜上下文、无子委派扇出）；内环 LLM / 嵌套普通 Procedure / 嵌套 `core.compact` 的研究费用汇总到一次 `research_credits_charged`。禁止嵌套再调 `builtin.contractor`。细则见 `docs/superpowers/specs/2026-08-06-contractor-procedure-design.md`。
 
 分配是转移，不能制造 credits。账本与任务状态在同一 SQLite 事务中提交。
 

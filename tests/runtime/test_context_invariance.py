@@ -91,11 +91,13 @@ def test_architecture_credits_rule_allows_procedure_debit_via_research_credits_c
     )
     system = builder.system_message
     assert "Procedure 不消耗研究 credits" not in system
+    assert "Procedure 不扣研究 credits" not in system
     assert "research_credits_charged" in system
     assert "external_cost*" in system
     assert "零余额仍可零额委派" in system
     assert "负余额不得启动后代" in system
     assert "LLM 调用消耗研究 credits" in system
+    assert "可通过 research_credits_charged 扣减" in system
 
 
 def test_auto_compact_honors_override_precedence_and_model_window() -> None:
