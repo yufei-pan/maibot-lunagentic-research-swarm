@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import pytest
 
+from lunagentic_research_swarm.llm.pricing import PriceCatalog, PriceProfile, TokenUsage
 from lunagentic_research_swarm.llm.summarizer import SummaryResult
 from lunagentic_research_swarm.procedures.core import (
     CORE_CHECKPOINT_ID,
     CORE_COMPACT_ID,
     CORE_TERMINATE_ID,
     CoreProcedureDecision,
+    execute_core_procedure,
     split_procedure_requests,
 )
 from lunagentic_research_swarm.llm.protocol import ProcedureRequest
@@ -16,6 +18,11 @@ from lunagentic_research_swarm.runtime.events import (
     event_from_json,
     event_to_json,
 )
+
+# price_in=10, price_out=20 → (100*10 + 50*20) / 1e6 * 100 = 0.2 credits
+COMPACT_USAGE = TokenUsage(100, 50, 0, 100, source="actual")
+COMPACT_CHARGE = 0.2
+COMPACT_CATALOG = PriceCatalog.from_sources({}, {"model:test": PriceProfile(price_in=10.0, price_out=20.0)}, {})
 
 
 def test_terminate_ignores_checkpoint_but_keeps_compact() -> None:
@@ -37,22 +44,21 @@ def test_terminate_ignores_checkpoint_but_keeps_compact() -> None:
 
 
 class FakeSummarizer:
-    def __init__(self) -> None:
+    def __init__(self, *, usage: TokenUsage | None = None) -> None:
         self.calls: list[str] = []
+        self.usage = usage
 
     async def compact_branch(self, request):
         self.calls.append("compact")
-        return SummaryResult(True, "压缩摘要", "model:test", None, None)
+        return SummaryResult(True, "压缩摘要", "model:test", self.usage, None)
 
     async def finalize_branch(self, request):
         self.calls.append("checkpoint")
-        return SummaryResult(True, "检查点摘要", "model:test", None, None)
+        return SummaryResult(True, "检查点摘要", "model:test", self.usage, None)
 
 
 @pytest.mark.asyncio
 async def test_core_compact_and_checkpoint_use_summarizer_without_api_or_credits() -> None:
-    from lunagentic_research_swarm.procedures.core import execute_core_procedure
-
     summarizer = FakeSummarizer()
     compact = await execute_core_procedure(
         CORE_COMPACT_ID,
@@ -68,6 +74,42 @@ async def test_core_compact_and_checkpoint_use_summarizer_without_api_or_credits
     assert compact.success and compact.data["compacted"]
     assert checkpoint.success and checkpoint.data["checkpoint"]
     assert summarizer.calls == ["compact", "checkpoint"]
+    assert compact.metadata["research_credits_charged"] == 0.0
+    assert compact.research_credits_charged == 0.0
+
+
+@pytest.mark.asyncio
+async def test_agent_requested_compact_sets_research_credits_from_summarizer_usage() -> None:
+    """有 usage + price_catalog 时，core.compact 设置 research_credits_charged（不写 ledger）。"""
+
+    summarizer = FakeSummarizer(usage=COMPACT_USAGE)
+    compact = await execute_core_procedure(
+        CORE_COMPACT_ID,
+        {"formalized_task": "正式任务", "branch_history": [{"role": "assistant", "content": "证据"}]},
+        summarizer=summarizer,
+        price_catalog=COMPACT_CATALOG,
+    )
+
+    assert compact.success
+    assert compact.research_credits_charged == pytest.approx(COMPACT_CHARGE)
+    assert compact.metadata["research_credits_charged"] == pytest.approx(COMPACT_CHARGE)
+
+
+@pytest.mark.asyncio
+async def test_compact_bill_research_false_forces_zero_charge() -> None:
+    """自动 compact 路径传入 bill_research_credits=False 时强制 charge=0。"""
+
+    summarizer = FakeSummarizer(usage=COMPACT_USAGE)
+    compact = await execute_core_procedure(
+        CORE_COMPACT_ID,
+        {"formalized_task": "正式任务", "branch_history": [{"role": "assistant", "content": "证据"}]},
+        summarizer=summarizer,
+        price_catalog=COMPACT_CATALOG,
+        bill_research_credits=False,
+    )
+
+    assert compact.success
+    assert compact.research_credits_charged == 0.0
     assert compact.metadata["research_credits_charged"] == 0.0
 
 

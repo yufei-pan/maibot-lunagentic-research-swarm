@@ -18,6 +18,7 @@ from lunagentic_research_swarm.llm.summarizer import (
     BranchFinalizationRequest,
     CompactionRequest,
 )
+from lunagentic_research_swarm.llm.pricing import TokenUsage
 
 
 CORE_COMPACT_ID = "core.compact"
@@ -246,6 +247,69 @@ def _failure(procedure_id: str, code: str, message: str) -> ProcedureResult:
     )
 
 
+def _usage_token_fields(usage: Any) -> tuple[int, int, int, int] | None:
+    """从 SummaryResult.usage / mapping 提取 charge_actual 所需四元组。"""
+
+    if usage is None:
+        return None
+    try:
+        if isinstance(usage, TokenUsage):
+            return (
+                int(usage.prompt_tokens),
+                int(usage.completion_tokens),
+                int(usage.cache_hit_tokens),
+                int(usage.cache_miss_tokens),
+            )
+        if isinstance(usage, Mapping):
+            return (
+                int(usage.get("prompt_tokens", 0) or 0),
+                int(usage.get("completion_tokens", 0) or 0),
+                int(usage.get("cache_hit_tokens", 0) or 0),
+                int(usage.get("cache_miss_tokens", 0) or 0),
+            )
+        return (
+            int(getattr(usage, "prompt_tokens", 0) or 0),
+            int(getattr(usage, "completion_tokens", 0) or 0),
+            int(getattr(usage, "cache_hit_tokens", 0) or 0),
+            int(getattr(usage, "cache_miss_tokens", 0) or 0),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def research_credits_for_summarizer_usage(
+    *,
+    catalog: Any | None,
+    model_name: str,
+    usage: Any | None,
+) -> float:
+    """把总结器 usage 换算为研究 credits；缺 catalog/usage/model 时返回 0。
+
+    与 ``meter_summarizer_usage`` 共用 ``catalog.charge_actual`` 路径，但不写 ledger。
+    """
+
+    if catalog is None or not model_name:
+        return 0.0
+    fields = _usage_token_fields(usage)
+    if fields is None:
+        return 0.0
+    prompt, completion, hit, miss = fields
+    charge_actual = getattr(catalog, "charge_actual", None)
+    if not callable(charge_actual):
+        return 0.0
+    try:
+        charged = charge_actual(
+            actual_model_name=str(model_name),
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            cache_hit_tokens=hit,
+            cache_miss_tokens=miss,
+        )
+        return max(0.0, float(getattr(charged, "credits", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 async def execute_core_procedure(
     procedure_id: str,
     arguments: Mapping[str, Any] | None = None,
@@ -254,13 +318,17 @@ async def execute_core_procedure(
     context: CoreProcedureContext | None = None,
     formalized_task: FormalizedTask | str | None = None,
     branch_history: Sequence[Mapping[str, Any]] = (),
+    price_catalog: Any | None = None,
+    bill_research_credits: bool = True,
 ) -> ProcedureResult:
     """执行一个本地 core Procedure。
 
     core.terminate 不需要总结器；compact/checkpoint 只通过明确的
     :class:`SummarizerService` 方法生成摘要，绝不会绕到 ``ctx.api.call``。
     该函数不写 credits ledger，调用方应把结果作为普通 Procedure event 交给
-    reducer 持久化。
+    reducer 持久化。Agent 请求的 ``core.compact`` 在 ``bill_research_credits``
+    为真时通过 ``research_credits_charged`` 申报计量费用；自动 compact 应传
+    ``False`` 以免进入研究扣费路径。
     """
 
     if procedure_id not in CORE_PROCEDURE_IDS:
@@ -310,6 +378,13 @@ async def execute_core_procedure(
             error.code if error is not None else "summary_failed",
             "core 总结器调用失败",
         )
+    charged = 0.0
+    if procedure_id == CORE_COMPACT_ID and bill_research_credits:
+        charged = research_credits_for_summarizer_usage(
+            catalog=price_catalog,
+            model_name=str(getattr(summary, "model_name", "") or ""),
+            usage=getattr(summary, "usage", None),
+        )
     return ProcedureResult(
         success=True,
         data=success_data,
@@ -317,10 +392,10 @@ async def execute_core_procedure(
         metadata={
             "core": True,
             "procedure_id": procedure_id,
-            "research_credits_charged": 0.0,
+            "research_credits_charged": charged,
             "model_name": summary.model_name,
         },
-        research_credits_charged=0.0,
+        research_credits_charged=charged,
     )
 
 
@@ -354,6 +429,7 @@ __all__ = [
     "FrozenControlRequest",
     "execute_core_procedure",
     "is_core_procedure",
+    "research_credits_for_summarizer_usage",
     "run_core_procedure",
     "split_procedure_requests",
 ]

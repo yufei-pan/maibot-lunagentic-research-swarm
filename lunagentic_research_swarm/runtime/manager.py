@@ -1146,6 +1146,8 @@ class ResearchManager:
                 formalized_task=formalized.text if formalized is not None else None,
                 branch_history=messages,
             ),
+            price_catalog=getattr(snapshot, "price_catalog", None),
+            bill_research_credits=False,
         )
         # Automatic compaction is a real core procedure invocation; record it so
         # `compact_count` is not silently limited to agent-requested compaction.
@@ -1271,6 +1273,7 @@ class ResearchManager:
         formalized = controller.state.formalized_task
         if formalized is not None:
             payload["formalized_task"] = formalized.text
+        payload["price_catalog"] = getattr(snapshot, "price_catalog", None)
         return replace(effect, payload=payload)
 
     def _agent_is_live(self, agent_id: str, snapshot: Any) -> bool:

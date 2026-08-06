@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from lunagentic_research_swarm.llm.gateway import GenerationError
+from lunagentic_research_swarm.llm.pricing import PriceCatalog, PriceProfile, TokenUsage
 from lunagentic_research_swarm.llm.summarizer import SummaryResult
 from lunagentic_research_swarm.llm.tokens import estimate_prompt_tokens
 from lunagentic_research_swarm.models import FormalizedTask, TaskStatus
@@ -362,3 +363,97 @@ async def _async_noop(store: Any, commands: Any) -> None:
 
 async def _async_true() -> bool:
     return True
+
+
+# price_in=10, price_out=20 → (100*10 + 50*20) / 1e6 * 100 = 0.2
+_COMPACT_USAGE = TokenUsage(100, 50, 0, 100, source="actual")
+_COMPACT_CHARGE = 0.2
+_COMPACT_CATALOG = PriceCatalog.from_sources({}, {"model:fake": PriceProfile(price_in=10.0, price_out=20.0)}, {})
+
+
+class _MeteredSummarizer:
+    def __init__(self, text: str = "压缩后的共享摘要") -> None:
+        self.text = text
+        self.calls = 0
+
+    async def compact_branch(self, request: Any) -> SummaryResult:
+        self.calls += 1
+        return SummaryResult(True, self.text, "model:fake", _COMPACT_USAGE, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_requested_compact_charges_caller_even_with_zero_budget() -> None:
+    """Agent 请求 core.compact（credits=0）仍按 summarizer 计量扣研究余额。"""
+
+    from lunagentic_research_swarm.runtime.turns import TurnWorker
+
+    summarizer = _MeteredSummarizer()
+    executor = ProcedureExecutor(catalog=SimpleNamespace(get=lambda _pid: None), summarizer=summarizer)
+    prior = 10.0
+    effect = PerformProcedureBatch(
+        "task-1",
+        "round-1",
+        0,
+        payload={
+            "branch_id": "parent",
+            "call_id": "call-bill",
+            "formalized_task": FORMALIZED_TEXT,
+            "messages": _parent_messages(),
+            "credits_after": prior,
+            "price_catalog": _COMPACT_CATALOG,
+            "requests": ({"procedure_id": CORE_COMPACT_ID, "arguments": {}, "credits": 0.0},),
+        },
+    )
+
+    completed = await TurnWorker(object(), executor).perform_procedure_batch(effect)
+
+    assert summarizer.calls == 1
+    assert completed.results[-1].result.research_credits_charged == pytest.approx(_COMPACT_CHARGE)
+    assert completed.credits_after == pytest.approx(prior - _COMPACT_CHARGE)
+
+
+@pytest.mark.asyncio
+async def test_auto_compact_does_not_debit_research_credits() -> None:
+    """自动 compact 即使 summarizer 有 usage，也不写研究 ledger / 不走 batch 扣费。"""
+
+    formalized = FormalizedTask.create(FORMALIZED_TEXT)
+    original = _parent_messages()
+    store = SimpleNamespace(commands=[], transact=lambda commands: _async_noop(store, commands))
+    manager = ResearchManager(
+        ctx=SimpleNamespace(logger=SimpleNamespace(warning=lambda *_a, **_k: None, error=lambda *_a, **_k: None)),
+        store=store,
+        summarizer=_MeteredSummarizer("短摘要"),
+        scheduler=SimpleNamespace(enqueue=lambda *_a, **_k: _async_true()),
+        snapshot_provider=lambda: SimpleNamespace(price_catalog=_COMPACT_CATALOG),
+        runtime_limits={
+            "auto_compact_tokens": 100,
+            "reserved_output_tokens": 0,
+            "safety_margin_tokens": 0,
+        },
+    )
+    controller = SimpleNamespace(state=SimpleNamespace(formalized_task=formalized))
+    branch: dict[str, Any] = {"messages": [dict(m) for m in original], "credits": 10.0}
+    credits_before = float(branch["credits"])
+    effect = PerformAgentCall("task-auto-compact", "round-1", 0, payload={"branch_id": "br"})
+
+    await manager._maybe_auto_compact(
+        effect=effect,
+        controller=controller,
+        snapshot=SimpleNamespace(price_catalog=_COMPACT_CATALOG),
+        definition=SimpleNamespace(auto_compact_tokens=None, agent_id="agent.root"),
+        selector="model:x",
+        protocol="json_envelope",
+        messages=tuple(dict(m) for m in original),
+        branch=branch,
+        branch_id="br",
+        prompt_tokens=5_000,
+        cache_hit=0,
+        cache_miss=5_000,
+        estimated_charge=0.0,
+        resolved=None,
+    )
+
+    assert float(branch["credits"]) == pytest.approx(credits_before)
+    ledger = [cmd for cmd in store.commands if getattr(cmd, "kind", None) == "insert_credit_ledger"]
+    assert ledger == []
+    assert any(getattr(cmd, "kind", None) == "insert_procedure_call" for cmd in store.commands)

@@ -789,6 +789,8 @@ class ProcedureExecutor:
             {},
             summarizer=self.summarizer,
             context=CoreProcedureContext(formalized_task=formalized, branch_history=history),
+            price_catalog=payload.get("price_catalog"),
+            bill_research_credits=True,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
         agent_id = str(context.get("agent_id") or "")
@@ -799,12 +801,15 @@ class ProcedureExecutor:
         metadata["duration_ms"] = duration_ms
         metadata["attempts"] = 1
         metadata["attempt"] = 1
+        charged = float(getattr(result, "research_credits_charged", 0.0) or 0.0)
+        metadata["research_credits_charged"] = charged
         normalized = ProcedureResult.model_validate(
             {
                 "success": bool(getattr(result, "success", False)),
                 "data": _sanitize_payload(getattr(result, "data", None)),
                 "error": _sanitize_payload(getattr(result, "error", None)),
                 "metadata": metadata,
+                "research_credits_charged": charged,
             },
             strict=True,
         )
