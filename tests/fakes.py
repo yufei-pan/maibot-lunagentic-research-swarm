@@ -42,12 +42,17 @@ class FakeClock:
 
 @dataclass(frozen=True, slots=True)
 class FakeLLMResponse:
-    """Fake LLM 的可复现响应；payload 可为普通文本或 JSON envelope。"""
+    """Fake LLM 的可复现响应；payload 可为普通文本或 JSON envelope。
+
+    ``tool_calls`` 用于 native_tools 协议（``submit_swarm_turn``）；assistant
+    正文可为空字符串（spec §9.3）。
+    """
 
     text: str = ""
     payload: dict[str, Any] | None = None
     model: str = "gpt-5.6-luna-max"
     usage: dict[str, int] = field(default_factory=lambda: {"prompt_tokens": 10, "completion_tokens": 10})
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class FakeLLMGateway:
@@ -96,7 +101,7 @@ class FakeLLMGateway:
             raise response
         if request is not None:
             rendered = response.text
-            if response.payload is not None:
+            if response.payload is not None and response.tool_calls is None:
                 rendered = json.dumps(response.payload, ensure_ascii=False, sort_keys=True)
             usage = TokenUsage(
                 prompt_tokens=int(response.usage.get("prompt_tokens", 0)),
@@ -105,7 +110,7 @@ class FakeLLMGateway:
                 cache_miss_tokens=int(response.usage.get("cache_miss_tokens", 0)),
                 source="actual",
             )
-            return GenerationResult(rendered, None, response.model, usage, True, None, 0.0)
+            return GenerationResult(rendered, response.tool_calls, response.model, usage, True, None, 0.0)
         return response
 
 
@@ -278,19 +283,42 @@ class _ConfigAPI:
 
 
 class _AgentCatalog:
+    """Integration catalog; ``entries`` feeds held-release ``plan_delegations`` live_ids."""
+
     fingerprint = "integration-catalog"
     root_agent = "builtin.quick_thinker"
 
-    def get(self, agent_id: str) -> Any:
-        if agent_id != self.root_agent:
-            return None
-        return SimpleNamespace(
+    def __init__(self) -> None:
+        self._extra_agents: dict[str, Any] = {}
+
+    def register_agent(self, agent_id: str, *, can_be_root: bool = False) -> None:
+        """Make ``agent_id`` visible to catalog.get / entries (held-release credit path)."""
+
+        self._extra_agents[str(agent_id)] = SimpleNamespace(
             definition=SimpleNamespace(
+                agent_id=str(agent_id),
                 model_selector="model:gpt-5.6-luna-max",
                 enabled=True,
-                can_be_root=True,
+                can_be_root=can_be_root,
             )
         )
+
+    def get(self, agent_id: str) -> Any:
+        if agent_id == self.root_agent:
+            return SimpleNamespace(
+                definition=SimpleNamespace(
+                    agent_id=self.root_agent,
+                    model_selector="model:gpt-5.6-luna-max",
+                    enabled=True,
+                    can_be_root=True,
+                )
+            )
+        return self._extra_agents.get(agent_id)
+
+    @property
+    def entries(self) -> tuple[Any, ...]:
+        root = self.get(self.root_agent)
+        return (root, *self._extra_agents.values())
 
 
 class _PriceCatalog:
@@ -434,6 +462,122 @@ class RuntimeHarness:
             )
         self.coordinator.branches.update(branches)
         await self.store.transact(commands)
+
+    def wire_live_agents(self, *agent_ids: str) -> None:
+        """Register catalog agents so held-release ``plan_delegations`` sees them live.
+
+        ``ResearchManager._release_held_delegations`` builds ``live_agent_ids`` from
+        ``snapshot.agent_catalog.entries`` (not from ProcedureBatchCompleted). Offline
+        multi-agent hold/release therefore needs explicit catalog entries.
+        """
+
+        assert self.manager is not None
+        snapshot = self.manager._round_snapshots.get(self.task_id)
+        if snapshot is None:
+            # Before formalize: mutate the shared snapshot provider object.
+            # ResearchManager caches the same SimpleNamespace into _round_snapshots.
+            raise RuntimeError("wire_live_agents requires an active formalized round snapshot")
+        catalog = snapshot.agent_catalog
+        if not hasattr(catalog, "register_agent"):
+            raise TypeError("agent catalog must support register_agent for held-release E2E")
+        for agent_id in agent_ids:
+            catalog.register_agent(str(agent_id))
+        self.manager._agent_live_provider = lambda _agent_id: True
+
+    async def root_allocates_real(
+        self,
+        allocations: dict[str, float],
+        *,
+        mark_agents_live: bool = True,
+    ) -> dict[str, float]:
+        """Drive root→children through real ``allocate_children`` + ``ChildMaterialized``.
+
+        Unlike :meth:`root_delegates` (synthetic store inserts that skip planning),
+        this submits a ``ProcedureBatchCompleted`` with delegations through the
+        controller reducer, then runs each ``materialize_child`` effect via
+        ``ResearchManager.materialize_child_effect``.
+
+        ``allocations`` maps desired ``branch_id`` → requested credits. Agent ids
+        default to ``agent.{branch_id}``. Returns controller ``active_leaves``
+        after materialization.
+        """
+
+        from lunagentic_research_swarm.runtime.events import ProcedureBatchCompleted
+        from lunagentic_research_swarm.runtime.reducer import NotifyToolWaiter
+
+        assert self.manager is not None
+        status = await self.manager.status(self.task_id)
+        active = list(status["active_leaves"])
+        assert len(active) == 1, "root_allocates_real expects a single root leaf"
+        root_branch_id = str(active[0]["branch_id"])
+        self._root_branch_id = root_branch_id
+        parent_credits = float(active[0]["credits"])
+        controller = self.manager._controllers[self.task_id]
+        generation = int(status["generation"])
+        round_id = str(status["round_id"])
+        self.round_id = round_id
+
+        agent_ids = tuple(f"agent.{name}" for name in allocations)
+        if mark_agents_live:
+            # Also register catalog entries so a later held-release on these
+            # leaves (or their children) can resolve the same ids via entries.
+            self.wire_live_agents(*agent_ids)
+        delegations = tuple(
+            {
+                "branch_id": str(name),
+                "agent_id": f"agent.{name}",
+                "task": f"work-{name}",
+                "credits": float(credits),
+            }
+            for name, credits in allocations.items()
+        )
+        parent_messages = tuple(
+            dict(item)
+            for item in (self.manager._branches.get(self.task_id, {}).get(root_branch_id) or {}).get(
+                "messages", ()
+            )
+        ) or ({"role": "user", "content": "formalized root"},)
+
+        # Clear prior enqueue noise so we only drain this delegation batch.
+        self.scheduler.enqueued.clear()
+        await self.manager.handle_runtime_event(
+            ProcedureBatchCompleted(
+                event_id=f"{self.task_id}:root-allocate",
+                task_id=self.task_id,
+                round_id=round_id,
+                generation=generation,
+                branch_id=root_branch_id,
+                call_id=f"{root_branch_id}:allocate",
+                result_id=f"{root_branch_id}:allocate-result",
+                credits_after=parent_credits,
+                delegations=delegations,
+                parent_messages=parent_messages,
+                parent_depth=0,
+                live_agent_ids=agent_ids,
+                agent_calls_started=int(controller.state.agent_calls_started),
+            )
+        )
+
+        materialize = [
+            item
+            for item in self.scheduler.enqueued
+            if isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
+        ]
+        if not materialize:
+            raise AssertionError(
+                "root_allocates_real expected materialize_child effects from real allocate_children path"
+            )
+        for effect in materialize:
+            await self.manager.materialize_child_effect(effect)
+
+        leaves = dict(controller.state.active_leaves)
+        # Keep coordinator report graph aligned with materialized leaves.
+        if self.coordinator is not None:
+            for branch_id, credits in leaves.items():
+                runtime = self.coordinator.branches.get(branch_id)
+                if runtime is not None:
+                    runtime.credits = float(credits)
+        return leaves
 
     async def branch_checkpoint(self, branch_id: str) -> None:
         assert self.coordinator is not None

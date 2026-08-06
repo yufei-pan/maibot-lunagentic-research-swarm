@@ -1,4 +1,7 @@
-"""LanceDB generation 重建：原子切换、失败候选保留、强制重建。"""
+"""LanceDB generation 重建：原子切换、失败候选保留、强制重建。
+
+Run in isolation via ``tests/run_vector_suite.sh`` (not the default aggregate).
+"""
 
 from __future__ import annotations
 

@@ -698,6 +698,8 @@ def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
         # 负叶子在 barrier 处保持终结；非负叶子允许继续运行。
         balances = dict(redistribution.balances)
         running = {key: value for key, value in balances.items() if value >= 0}
+        # §7.5 / §13.1: continue 重置报告时间预算；有叶子时也必须重新武装 deadline。
+        due_at = float(event.occurred_at.timestamp()) + float(event.time_budget_seconds)
         persistence = (
             _command(
                 "update_round_continuation",
@@ -705,7 +707,7 @@ def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
                     "round_id": event.round_id,
                     "credit_pool": redistribution.pool_after,
                     "time_budget_seconds": event.time_budget_seconds,
-                    "report_deadline_at": None,
+                    "report_deadline_at": due_at,
                 },
             ),
             *(
@@ -724,6 +726,14 @@ def _continue_terminal(state: Any, event: ContinueRequested) -> Transition:
             state,
             event,
             TaskStatus.RUNNING,
+            effects=(
+                _effect(
+                    ArmDeadline,
+                    event,
+                    priority="barrier",
+                    payload={"due_at": due_at, "kind": "report_deadline"},
+                ),
+            ),
             extra_commands=persistence,
             active_leaves=running,
             credit_pool=redistribution.pool_after,

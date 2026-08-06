@@ -574,6 +574,21 @@ class ResearchManager:
                     for branch_id, credits in controller.state.active_leaves.items()
                 }
             )
+            # Keep the report coordinator's wall-clock aligned with the re-armed deadline.
+            coordinator = self.report_coordinators.get(task_id)
+            due_at = _now() + float(effective_time)
+            if coordinator is not None:
+                coordinator.time_budget_seconds = int(effective_time)
+                coordinator.deadline_at = due_at
+            # Mirror `_restart_round`: drain emits ArmDeadline, and the manager
+            # also arms the local timer so pause→continue resets the clock even
+            # when a test scheduler only records effects.
+            self._arm_deadline_timer(
+                task_id,
+                due_at=due_at,
+                round_id=str(controller.state.active_round_id or ""),
+                generation=controller.state.generation,
+            )
             self.scheduler.resume_task(task_id)
             return {**self._status(controller), "effective_time_budget_seconds": effective_time}
         if not branches and state.status in {

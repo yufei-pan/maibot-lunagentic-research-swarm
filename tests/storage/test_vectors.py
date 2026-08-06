@@ -1,4 +1,8 @@
-"""LanceDB generation 索引：维度/selector/model/schema mismatch 与检索不可用。"""
+"""LanceDB generation 索引：维度/selector/model/schema mismatch 与检索不可用。
+
+Run in isolation via ``tests/run_vector_suite.sh`` (not the default aggregate;
+Lance can segfault when mixed into the full suite).
+"""
 
 from __future__ import annotations
 

@@ -230,10 +230,11 @@ class ReportCoordinator:
     ) -> ReportEpoch | None:
         """Handle a completed turn after normal accounting/procedures are durable.
 
-        Manual checkpoint holds its children until the next epoch.  A branch
-        returning during an existing epoch grace window is checkpointed from a
-        stable clone while its new children immediately belong to the next
-        epoch.
+        Manual checkpoint before a report epoch holds children until the next
+        ``open_epoch`` (grace start).  A checkpoint requested while already in
+        an open frontier/grace releases held children as soon as the branch
+        summary finishes (design §13.1).  A non-checkpoint return during grace
+        is cloned for coverage while new children belong to the next epoch.
         """
 
         branch = self.branches[branch_id]
@@ -289,6 +290,8 @@ class ReportCoordinator:
                 entry.checkpoint_summary_id = summary_id
                 entry.failed = summary_id is None
                 await self._maybe_start_synthesis(active_epoch)
+                # §13.1: checkpoint during grace → continue after branch summary.
+                await self._release_held_branch(branch_id)
                 return active_epoch
             if self._all_active_checkpointed():
                 return await self.open_epoch()
@@ -653,15 +656,30 @@ class ReportCoordinator:
     async def _release_held(self) -> None:
         held, self._held = self._held, {}
         for branch_id, delegations in held.items():
+            await self._launch_held(branch_id, delegations)
+
+    async def _release_held_branch(self, branch_id: str) -> None:
+        """Release one branch's held children after an in-grace checkpoint summary."""
+
+        if branch_id not in self._held:
             branch = self.branches.get(branch_id)
             if branch is not None and branch.lifecycle is BranchLifecycle.WAITING_REPORT_WITH_CHECKPOINT:
                 branch.lifecycle = BranchLifecycle.READY
-            if self.release_held_delegations is not None:
-                returned = self.release_held_delegations(branch_id, delegations)
-                if hasattr(returned, "__await__"):
-                    await returned
-            else:
-                await self._launch(delegations, branch_id, report_epoch=self.current_epoch.epoch + 1)
+            return
+        delegations = self._held.pop(branch_id)
+        await self._launch_held(branch_id, delegations)
+
+    async def _launch_held(self, branch_id: str, delegations: Sequence[Mapping[str, Any]]) -> None:
+        branch = self.branches.get(branch_id)
+        if branch is not None and branch.lifecycle is BranchLifecycle.WAITING_REPORT_WITH_CHECKPOINT:
+            branch.lifecycle = BranchLifecycle.READY
+        next_epoch = (self.current_epoch.epoch + 1) if self.current_epoch is not None else None
+        if self.release_held_delegations is not None:
+            returned = self.release_held_delegations(branch_id, delegations)
+            if hasattr(returned, "__await__"):
+                await returned
+        else:
+            await self._launch(delegations, branch_id, report_epoch=next_epoch)
 
     async def _launch(
         self,
