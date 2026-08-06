@@ -719,6 +719,64 @@ def make_contractor_handler(deps: ContractorDeps | None = None) -> Handler:
     return _contractor
 
 
+def make_nested_procedure_invoker(
+    *,
+    provider: Any,
+    summarizer: Any | None = None,
+    price_catalog: Any | None = None,
+) -> Callable[..., Awaitable[ProcedureResult]]:
+    """构造 handler-local 嵌套 invoker：走 provider / core.compact，不经外层 batch 扣费。"""
+
+    from lunagentic_research_swarm.procedures.core import CORE_COMPACT_ID, execute_core_procedure
+
+    async def _invoke(
+        procedure_id: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        credits: float = 0.0,
+        call_id: str | None = None,
+        scoped_metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> ProcedureResult:
+        del _kwargs
+        pid = str(procedure_id)
+        args = dict(arguments or {})
+        meta = dict(scoped_metadata or {})
+        if pid == CORE_COMPACT_ID:
+            formalized = args.get("formalized_task", meta.get("formalized_task"))
+            history_raw = args.get("branch_history", meta.get("branch_history"))
+            history: Sequence[Mapping[str, Any]] = ()
+            if isinstance(history_raw, Sequence) and not isinstance(history_raw, (str, bytes, bytearray)):
+                history = tuple(item for item in history_raw if isinstance(item, Mapping))
+            return await execute_core_procedure(
+                CORE_COMPACT_ID,
+                args,
+                summarizer=summarizer,
+                formalized_task=formalized,
+                branch_history=history,
+                price_catalog=price_catalog,
+                bill_research_credits=True,
+            )
+        if pid.startswith("core.") or pid == CONTRACTOR_PROCEDURE_ID:
+            return ProcedureResult(
+                success=False,
+                data=None,
+                error={"code": "procedure_not_allowed", "message": f"承包商嵌套禁止：{pid}"},
+                metadata={"research_credits_charged": 0.0},
+                research_credits_charged=0.0,
+            )
+        scoped = dict(meta)
+        scoped.setdefault("credit_budget", float(credits or 0.0))
+        if call_id:
+            scoped.setdefault("call_id", call_id)
+        result = await provider.invoke(pid, args, scoped_metadata=scoped)
+        if isinstance(result, ProcedureResult):
+            return result
+        return ProcedureResult.model_validate(result)
+
+    return _invoke
+
+
 CONTRACTOR_HANDLERS: dict[str, Handler] = {
     CONTRACTOR_PROCEDURE_ID: make_contractor_handler(),
 }

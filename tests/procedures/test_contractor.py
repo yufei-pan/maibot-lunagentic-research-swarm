@@ -19,6 +19,7 @@ from lunagentic_research_swarm.procedures.bundled.contractor import (
     ContractorDeps,
     contractor_procedure_definitions,
     make_contractor_handler,
+    make_nested_procedure_invoker,
     run_contractor,
 )
 from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
@@ -476,3 +477,38 @@ async def test_contractor_prefers_frozen_round_snapshot_over_live_deps() -> None
     blob = json.dumps(llm.calls[0]["messages"], ensure_ascii=False)
     assert "FROZEN_ROUND_PERSONALITY" in blob
     assert "LIVE_PERSONALITY_MUST_NOT_APPEAR" not in blob
+
+
+@pytest.mark.asyncio
+async def test_contractor_nested_calculate_runs_via_real_provider_invoker() -> None:
+    """生产同形 nested invoker：允许的 builtin.calculate 真实执行，结果进 transcript。"""
+
+    from test_memory import FakeCtx
+
+    provider = BundledProcedureProvider(FakeCtx())
+    nested = make_nested_procedure_invoker(provider=provider, summarizer=None, price_catalog=None)
+    harness = ContractorHarness.create()
+    harness.deps.invoke_nested_procedure = nested
+    harness.llm.queue_json(
+        {
+            "report": "算一下",
+            "procedures": [
+                {"procedure_id": "builtin.calculate", "arguments": {"expression": "6*7"}},
+            ],
+        }
+    )
+    harness.llm.queue_json({"return": "四十二"})
+    result = await harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="6*7=?",
+        caller_protocol="json_envelope",
+        credit_budget=10.0,
+    )
+    assert result.success is True
+    assert result.data["result"] == "四十二"
+    assert result.metadata["termination_reason"] == "returned"
+    second_blob = json.dumps(harness.llm.calls[1]["messages"], ensure_ascii=False)
+    assert "builtin.calculate" in second_blob
+    assert "42" in second_blob
+    assert "未注入" not in second_blob
+    assert "拒绝" not in second_blob

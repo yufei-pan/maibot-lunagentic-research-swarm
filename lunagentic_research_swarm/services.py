@@ -438,13 +438,22 @@ class LRSServiceContainer:
             return {}
         return {"builtin.invoke_procedure": bundled_procedure_invoker(provider)}
 
-    def _bind_contractor_runtime(self, *, gateway: Any, price_catalog: Any) -> None:
-        """把 LLM / 冻结 round 查找 / live 回落解析注入 builtin.contractor。"""
+    def _bind_contractor_runtime(
+        self,
+        *,
+        gateway: Any,
+        price_catalog: Any,
+        summarizer: Any | None = None,
+    ) -> None:
+        """把 LLM / 冻结 round 查找 / live 回落解析 / 嵌套 invoker 注入 builtin.contractor。"""
 
         provider = self._bundled_procedure_provider
         if provider is None:
             return
-        from lunagentic_research_swarm.procedures.bundled.contractor import ContractorDeps
+        from lunagentic_research_swarm.procedures.bundled.contractor import (
+            ContractorDeps,
+            make_nested_procedure_invoker,
+        )
 
         def round_snapshot_for_task(task_id: str) -> Any | None:
             """按 task_id 取 ResearchManager 冻结的 round snapshot（若有）。"""
@@ -484,12 +493,17 @@ class LRSServiceContainer:
                 )
             return items
 
+        invoke_nested = make_nested_procedure_invoker(
+            provider=provider,
+            summarizer=summarizer,
+            price_catalog=price_catalog,
+        )
         provider.bind_contractor_deps(
             ContractorDeps(
                 llm=gateway,
                 prices=price_catalog,
                 resolve_agent=resolve_agent,
-                invoke_nested_procedure=None,
+                invoke_nested_procedure=invoke_nested,
                 resolve_procedure_catalog=resolve_procedure_catalog,
                 round_snapshot_for_task=round_snapshot_for_task,
             )
@@ -592,7 +606,11 @@ class LRSServiceContainer:
             procedure_factory=procedure_factory,
             debug_store=self.debug_store,
         )
-        self._bind_contractor_runtime(gateway=gateway, price_catalog=self.price_catalog)
+        self._bind_contractor_runtime(
+            gateway=gateway,
+            price_catalog=self.price_catalog,
+            summarizer=summarizer,
+        )
         runner = RuntimeEffectRunner(turn_worker)
         scheduler = FairScheduler(
             global_llm=int(config.scheduler.max_global_llm_concurrency),
