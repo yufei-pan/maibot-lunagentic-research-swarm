@@ -21,6 +21,7 @@ _EXPECTED_MEMORY_IDS = {
     "builtin.knowledge_search",
 }
 _EXPECTED_WEB_SEARCH_ID = "builtin.web_search"
+_EXPECTED_CONTRACTOR_ID = "builtin.contractor"
 
 
 class _Knowledge:
@@ -38,13 +39,19 @@ def test_describe_returns_six_valid_memory_procedures() -> None:
     ids = {item.procedure_id for item in definitions}
     assert _EXPECTED_MEMORY_IDS <= ids
     assert _EXPECTED_WEB_SEARCH_ID in ids
+    assert _EXPECTED_CONTRACTOR_ID in ids
     memory = [item for item in definitions if item.procedure_id in _EXPECTED_MEMORY_IDS]
     web = next(item for item in definitions if item.procedure_id == _EXPECTED_WEB_SEARCH_ID)
-    assert all(item.idempotent is True for item in definitions)
+    contractor = next(item for item in definitions if item.procedure_id == _EXPECTED_CONTRACTOR_ID)
+    non_contractor = [item for item in definitions if item.procedure_id != _EXPECTED_CONTRACTOR_ID]
+    assert all(item.idempotent is True for item in non_contractor)
     assert all(item.timeout_seconds == 30.0 for item in memory)
     assert all(item.external_cost_kind == "none" for item in memory)
     assert web.external_cost_kind == "provider_metered"
     assert web.idempotent is True
+    assert contractor.timeout_seconds == 0.0
+    assert contractor.idempotent is False
+    assert contractor.enabled is True
     assert all(item.enabled is True for item in definitions)
 
 

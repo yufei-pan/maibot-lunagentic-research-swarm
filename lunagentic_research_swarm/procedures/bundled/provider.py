@@ -13,6 +13,11 @@ from lunagentic_research_swarm.procedures.bundled.analysis import (
     ANALYSIS_HANDLERS,
     analysis_procedure_definitions,
 )
+from lunagentic_research_swarm.procedures.bundled.contractor import (
+    CONTRACTOR_PROCEDURE_ID,
+    make_contractor_handler,
+    contractor_procedure_definitions,
+)
 from lunagentic_research_swarm.procedures.bundled.memory import (
     MEMORY_HANDLERS,
     memory_procedure_definitions,
@@ -63,11 +68,13 @@ class BundledProcedureProvider:
                 self._http = http_client
             self._web_search = WebSearchService(section, self._http)
         self._past_cases_handler = make_past_cases_handler(store=store, vector_index=vector_index)
+        self._contractor_handler = make_contractor_handler()
         self._handlers = dict(MEMORY_HANDLERS)
         self._handlers.update(ANALYSIS_HANDLERS)
         self._handlers.update(PROVENANCE_HANDLERS)
         self._handlers[WEB_SEARCH_PROCEDURE_ID] = make_web_search_handler(self._web_search)
         self._handlers[PAST_CASES_PROCEDURE_ID] = self._past_cases_handler
+        self._handlers[CONTRACTOR_PROCEDURE_ID] = self._contractor_handler
 
     @property
     def web_search(self) -> WebSearchService:
@@ -104,6 +111,7 @@ class BundledProcedureProvider:
             + provenance_procedure_definitions()
             + web_search_procedure_definitions(self._web_search)
             + past_cases_procedure_definitions()
+            + contractor_procedure_definitions()
         )
         return [item.model_dump(mode="json") for item in definitions]
 

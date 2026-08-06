@@ -151,6 +151,60 @@ you_api_key = ""
 # protocol = "native_tools"
 
 [procedures]
+# 内置 Procedure 覆写示例（取消注释后生效；留空字段继承定义）
+# [procedures."builtin.chat_streams"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.message_recent"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.message_by_id"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.message_time_range"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.person_lookup"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.knowledge_search"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.calculate"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.statistics"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.convert_units"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.normalize_urls"]
+# enabled = true
+# timeout_seconds = 30.0
+#
+# [procedures."builtin.organize_provenance"]
+# enabled = true
+# timeout_seconds = 30.0
+#
 # [procedures."builtin.web_search"]
 # enabled = true
 # timeout_seconds = 30.0
+#
+# [procedures."builtin.past_cases"]
+# enabled = true
+# timeout_seconds = 60.0
+
+# 旁路承包商：硬超时关闭（0）；软预算用参数 time_budget_seconds
+[procedures."builtin.contractor"]
+enabled = true
+timeout_seconds = 0
