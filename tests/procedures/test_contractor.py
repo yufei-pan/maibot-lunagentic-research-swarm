@@ -259,6 +259,159 @@ async def test_contractor_native_contractor_return(contractor_harness: Contracto
 
 
 @pytest.mark.asyncio
+async def test_contractor_uses_selected_agent_model_selector(contractor_harness: ContractorHarness) -> None:
+    contractor_harness.llm.queue_json({"return": "ok"})
+    await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="selector?",
+        caller_protocol="json_envelope",
+        credit_budget=10.0,
+    )
+    assert contractor_harness.llm.calls[0]["selector"] == "task:utils"
+
+
+@pytest.mark.asyncio
+async def test_contractor_personality_and_temperature_overrides(
+    contractor_harness: ContractorHarness,
+) -> None:
+    contractor_harness.llm.queue_json({"return": "ok"})
+    await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="覆写？",
+        caller_protocol="json_envelope",
+        credit_budget=10.0,
+        personality="【OVERRIDE_PERSONALITY_MARKER】",
+        temperature=0.42,
+    )
+    req = contractor_harness.llm.calls[0]
+    assert abs(float(req["temperature"]) - 0.42) < 1e-9
+    assert "【OVERRIDE_PERSONALITY_MARKER】" in json.dumps(req["messages"], ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_contractor_invalid_temperature_rejected(contractor_harness: ContractorHarness) -> None:
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="坏温度",
+        caller_protocol="json_envelope",
+        credit_budget=10.0,
+        temperature="hot",
+    )
+    assert result.success is False
+    assert result.error is not None
+    assert result.error["code"] == "invalid_arguments"
+
+
+@pytest.mark.asyncio
+async def test_native_call_procedure_runs_allowed_nested(contractor_harness: ContractorHarness) -> None:
+    nested_calls: list[str] = []
+
+    async def _nested(procedure_id: str, arguments: Any = None, **kwargs: Any) -> ProcedureResult:
+        del arguments, kwargs
+        nested_calls.append(str(procedure_id))
+        return ProcedureResult(
+            success=True,
+            data={"v": 1},
+            error=None,
+            metadata={},
+            research_credits_charged=0.1,
+        )
+
+    contractor_harness.deps.invoke_nested_procedure = _nested
+    contractor_harness.llm.enqueue(
+        FakeLLMResponse(
+            text="",
+            tool_calls=[
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {
+                        "name": "call_procedure",
+                        "arguments": json.dumps(
+                            {
+                                "procedure_id": "builtin.calculate",
+                                "arguments": {"expression": "1+1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        )
+    )
+    contractor_harness.llm.enqueue(
+        FakeLLMResponse(
+            text="",
+            tool_calls=[
+                {
+                    "id": "2",
+                    "type": "function",
+                    "function": {
+                        "name": "contractor_return",
+                        "arguments": json.dumps({"result": "嵌套完成"}, ensure_ascii=False),
+                    },
+                }
+            ],
+        )
+    )
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="原生嵌套",
+        caller_protocol="native_tools",
+        credit_budget=10.0,
+    )
+    assert result.success is True
+    assert nested_calls == ["builtin.calculate"]
+    assert result.data["result"] == "嵌套完成"
+    assert result.metadata["termination_reason"] == "returned"
+    tools = contractor_harness.llm.calls[0].get("tools")
+    assert tools is not None
+    names = {item["function"]["name"] for item in tools}
+    assert "call_procedure" in names
+    assert "contractor_return" in names
+    assert len(contractor_harness.llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_force_return_includes_attempted_procedure_ids(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """insufficient_funds force-return text mentions attempted nested procedure_id."""
+
+    nested_calls: list[str] = []
+
+    async def _nested(procedure_id: str, arguments: Any = None, **kwargs: Any) -> ProcedureResult:
+        del arguments, kwargs
+        nested_calls.append(str(procedure_id))
+        return ProcedureResult(
+            success=True,
+            data={},
+            error=None,
+            metadata={},
+            research_credits_charged=0.0,
+        )
+
+    contractor_harness.deps.invoke_nested_procedure = _nested
+    contractor_harness.llm.queue_json(
+        {
+            "report": "x",
+            "procedures": [{"procedure_id": "builtin.calculate", "arguments": {"expression": "1+1"}}],
+            "return": "should-not-matter",
+        }
+    )
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="强制返回含尝试工具",
+        caller_protocol="json_envelope",
+        credit_budget=0.0,
+    )
+    assert result.success is True
+    assert result.metadata["termination_reason"] == "insufficient_funds"
+    assert nested_calls == []
+    assert "builtin.calculate" in str(result.data["result"])
+
+
+@pytest.mark.asyncio
 async def test_contractor_budget_zero_runs_one_turn_then_force_returns_if_spend(
     contractor_harness: ContractorHarness,
 ) -> None:
