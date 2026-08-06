@@ -95,13 +95,17 @@ async def test_contractor_stub_returns_runtime_missing_without_deps() -> None:
 
 
 def test_contractor_disabled_by_override_removed_from_snapshot() -> None:
+    """procedures."builtin.contractor".enabled=false → 目录省略；同批兄弟不受影响。"""
     registry = ProcedureRegistry()
-    registry.replace_provider("builtin", contractor_procedure_definitions())
+    registry.replace_provider("builtin", BundledProcedureProvider(object()).describe())
     enabled = registry.snapshot({})
     assert enabled.get(CONTRACTOR_PROCEDURE_ID) is not None
+    sibling_id = "builtin.calculate"
+    assert enabled.get(sibling_id) is not None
 
     disabled = registry.snapshot({CONTRACTOR_PROCEDURE_ID: ProcedureOverride(enabled=False)})
     assert disabled.get(CONTRACTOR_PROCEDURE_ID) is None
+    assert disabled.get(sibling_id) is not None
 
 
 def test_config_default_toml_lists_all_bundled_procedure_toggles() -> None:

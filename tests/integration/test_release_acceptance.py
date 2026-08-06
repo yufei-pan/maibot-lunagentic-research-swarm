@@ -67,6 +67,7 @@ EXPECTED_BUNDLED_PROCEDURES = {
     "builtin.convert_units",
     "builtin.normalize_urls",
     "builtin.organize_provenance",
+    "builtin.contractor",
 }
 
 

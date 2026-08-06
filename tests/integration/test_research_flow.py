@@ -135,6 +135,9 @@ async def test_fakes_match_turn_worker_and_procedure_executor_contracts(runtime_
         "branch_id": "branch-a",
         "turn_id": "turn-1",
         "agent_id": "builtin.researcher",
+        "credit_budget": 0.0,
+        "caller_protocol": "json_envelope",
+        "caller_agent_id": "builtin.researcher",
     }
 
 
