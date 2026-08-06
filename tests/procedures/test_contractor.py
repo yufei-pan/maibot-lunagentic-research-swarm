@@ -284,3 +284,85 @@ async def test_run_contractor_missing_agent_fails(contractor_harness: Contractor
     assert result.success is False
     assert result.error is not None
     assert result.error["code"] in {"invalid_arguments", "agent_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_contractor_llm_failure_is_not_returned_success(contractor_harness: ContractorHarness) -> None:
+    contractor_harness.llm.enqueue(
+        FakeLLMResponse(
+            text="",
+            success=False,
+            error_code="upstream_timeout",
+            error_message="上游超时",
+            usage={"prompt_tokens": 10, "completion_tokens": 0},
+        )
+    )
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="失败路径",
+        caller_protocol="json_envelope",
+        credit_budget=10.0,
+    )
+    assert result.success is False
+    assert result.error is not None
+    assert result.error["code"] in {"llm_generation_failed", "upstream_timeout"}
+    assert result.metadata.get("termination_reason") != "returned"
+    assert float(result.research_credits_charged) == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_contractor_prefers_frozen_round_snapshot_over_live_deps() -> None:
+    """有 task_id 对应的冻结 round snapshot 时，人设/计价不得读 live registry。"""
+
+    live_agent = bundled_agent_definitions()[0].model_copy(
+        update={"character_prompt": "LIVE_PERSONALITY_MUST_NOT_APPEAR"}
+    )
+    frozen_agent = bundled_agent_definitions()[0].model_copy(
+        update={"character_prompt": "FROZEN_ROUND_PERSONALITY"}
+    )
+    live_prices = _FakePrices(per_turn=99.0)
+    frozen_prices = _FakePrices(per_turn=1.25)
+
+    class _FakeEntry:
+        def __init__(self, definition: Any) -> None:
+            self.definition = definition
+
+    class _FakeAgentCatalog:
+        def get(self, agent_id: str) -> Any:
+            if agent_id == frozen_agent.agent_id:
+                return _FakeEntry(frozen_agent)
+            return None
+
+        def resolve_allowed_procedures(self, agent_id: str, procedures: Any) -> tuple[str, ...]:
+            del agent_id, procedures
+            return ()
+
+    frozen_snapshot = SimpleNamespace(
+        agent_catalog=_FakeAgentCatalog(),
+        procedure_catalog=SimpleNamespace(ids=(), get=lambda _pid: None),
+        price_catalog=frozen_prices,
+    )
+    llm = FakeLLMGateway()
+    llm.queue_json({"return": "ok"})
+    deps = ContractorDeps(
+        llm=llm,
+        prices=live_prices,
+        resolve_agent=lambda _aid: live_agent,
+        round_snapshot_for_task=lambda task_id: frozen_snapshot if task_id == "task-frozen" else None,
+    )
+    result = await run_contractor(
+        arguments={"agent_id": frozen_agent.agent_id, "question": "旁路"},
+        scoped_metadata={
+            "task_id": "task-frozen",
+            "credit_budget": 5.0,
+            "caller_protocol": "json_envelope",
+        },
+        deps=deps,
+    )
+    assert result.success is True
+    assert float(result.research_credits_charged) == pytest.approx(1.25)
+    assert len(frozen_prices.calls) == 1
+    assert live_prices.calls == []
+    blob = json.dumps(llm.calls[0]["messages"], ensure_ascii=False)
+    assert "FROZEN_ROUND_PERSONALITY" in blob
+    assert "LIVE_PERSONALITY_MUST_NOT_APPEAR" not in blob

@@ -29,13 +29,18 @@ _RESULT_SCHEMA: dict[str, Any] = {
 
 @dataclass
 class ContractorDeps:
-    """承包商运行时依赖。"""
+    """承包商运行时依赖。
+
+    ``round_snapshot_for_task`` 在有冻结 round 时优先于 live ``resolve_agent`` /
+    ``prices`` / ``resolve_procedure_catalog``（按 ``scoped_metadata.task_id`` 查找）。
+    """
 
     llm: Any = None
     prices: Any = None
     resolve_agent: Callable[[str], Any] | None = None
     invoke_nested_procedure: Callable[..., Awaitable[ProcedureResult]] | None = None
     resolve_procedure_catalog: Callable[[str], Sequence[Mapping[str, Any]]] | None = None
+    round_snapshot_for_task: Callable[[str], Any | None] | None = None
 
 
 class ContractorTurnEnvelope(BaseModel):
@@ -83,12 +88,21 @@ CONTRACTOR_NATIVE_TOOLS: list[dict[str, Any]] = [
 ]
 
 
-def _failure(code: str, message: str, *, metadata: Mapping[str, Any] | None = None) -> ProcedureResult:
+def _failure(
+    code: str,
+    message: str,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    charged: float = 0.0,
+) -> ProcedureResult:
+    charged_value = max(0.0, float(charged))
+    meta = {**dict(metadata or {}), "research_credits_charged": charged_value}
     return ProcedureResult(
         success=False,
         data=None,
         error={"code": code, "message": message},
-        metadata=dict(metadata or {}),
+        metadata=meta,
+        research_credits_charged=charged_value,
     )
 
 
@@ -307,15 +321,84 @@ async def _reject_nested_procedures(
     return notes
 
 
-def _meter_turn(*, deps: ContractorDeps, model_name: str, usage: Any) -> float:
+def _meter_turn(*, prices: Any, model_name: str, usage: Any) -> float:
     return research_credits_for_summarizer_usage(
-        catalog=deps.prices,
+        catalog=prices,
         model_name=str(model_name or ""),
         usage=usage,
     )
 
 
-def _procedure_catalog_for_agent(deps: ContractorDeps, agent_id: str, agent: Any) -> list[dict[str, Any]]:
+def _lookup_round_snapshot(deps: ContractorDeps, scoped_metadata: Mapping[str, Any]) -> Any | None:
+    task_id = str(scoped_metadata.get("task_id") or "").strip()
+    if not task_id or deps.round_snapshot_for_task is None:
+        return None
+    try:
+        return deps.round_snapshot_for_task(task_id)
+    except Exception:
+        return None
+
+
+def _resolve_agent_from_deps(
+    deps: ContractorDeps,
+    agent_id: str,
+    *,
+    snapshot: Any | None,
+) -> Any | None:
+    if snapshot is not None:
+        catalog = getattr(snapshot, "agent_catalog", None)
+        if catalog is not None:
+            entry = catalog.get(agent_id) if hasattr(catalog, "get") else None
+            if entry is None:
+                return None
+            return getattr(entry, "definition", entry)
+        # 有 snapshot 但无 agent_catalog 时不回落 live，避免混用冻结边界
+        return None
+    if deps.resolve_agent is None:
+        return None
+    return deps.resolve_agent(agent_id)
+
+
+def _prices_from_deps(deps: ContractorDeps, *, snapshot: Any | None) -> Any:
+    if snapshot is not None:
+        catalog = getattr(snapshot, "price_catalog", None)
+        if catalog is not None:
+            return catalog
+    return deps.prices
+
+
+def _procedure_catalog_for_agent(
+    deps: ContractorDeps,
+    agent_id: str,
+    agent: Any,
+    *,
+    snapshot: Any | None = None,
+) -> list[dict[str, Any]]:
+    if snapshot is not None:
+        agent_catalog = getattr(snapshot, "agent_catalog", None)
+        proc_catalog = getattr(snapshot, "procedure_catalog", None)
+        if agent_catalog is not None and proc_catalog is not None and hasattr(agent_catalog, "resolve_allowed_procedures"):
+            try:
+                allowed = agent_catalog.resolve_allowed_procedures(agent_id, proc_catalog)
+            except Exception:
+                allowed = ()
+            items: list[dict[str, Any]] = []
+            for procedure_id in allowed:
+                if procedure_id == CONTRACTOR_PROCEDURE_ID:
+                    continue
+                entry = proc_catalog.get(procedure_id) if hasattr(proc_catalog, "get") else None
+                if entry is None:
+                    items.append({"procedure_id": str(procedure_id), "description": ""})
+                    continue
+                definition = getattr(entry, "definition", entry)
+                items.append(
+                    {
+                        "procedure_id": str(procedure_id),
+                        "display_name": str(_agent_attr(definition, "display_name", "") or ""),
+                        "description": str(_agent_attr(definition, "description", "") or ""),
+                    }
+                )
+            return items
     if deps.resolve_procedure_catalog is not None:
         try:
             items = deps.resolve_procedure_catalog(agent_id)
@@ -336,7 +419,7 @@ async def run_contractor(
 ) -> ProcedureResult:
     """承包商 outsider 多轮循环：新鲜上下文、调用方协议、计量与返回。"""
 
-    if deps.llm is None or deps.resolve_agent is None:
+    if deps.llm is None or (deps.resolve_agent is None and deps.round_snapshot_for_task is None):
         return _failure("contractor_runtime_missing", "承包商运行时依赖尚未注入，暂无法执行。")
 
     agent_id = str(arguments.get("agent_id") or "").strip()
@@ -344,9 +427,12 @@ async def run_contractor(
     if not agent_id or not question:
         return _failure("invalid_arguments", "agent_id 与 question 均为必填。")
 
-    agent = deps.resolve_agent(agent_id)
+    snapshot = _lookup_round_snapshot(deps, scoped_metadata)
+    agent = _resolve_agent_from_deps(deps, agent_id, snapshot=snapshot)
     if agent is None:
         return _failure("agent_unavailable", f"智能体不在目录中：{agent_id}")
+
+    prices = _prices_from_deps(deps, snapshot=snapshot)
 
     protocol = str(scoped_metadata.get("caller_protocol") or "json_envelope").strip() or "json_envelope"
     if protocol not in {"json_envelope", "native_tools"}:
@@ -374,7 +460,7 @@ async def run_contractor(
             return _failure("invalid_arguments", "temperature 必须是数字。")
 
     time_budget_seconds = float(arguments.get("time_budget_seconds") or 0.0)
-    catalog = _procedure_catalog_for_agent(deps, agent_id, agent)
+    catalog = _procedure_catalog_for_agent(deps, agent_id, agent, snapshot=snapshot)
     system = _build_system_prompt(personality=personality, procedure_catalog=catalog, protocol=protocol)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
@@ -386,6 +472,7 @@ async def run_contractor(
     last_text = ""
     tools = CONTRACTOR_NATIVE_TOOLS if protocol == "native_tools" else None
     termination_reason = "returned"
+    llm_failure: tuple[str, str] | None = None
 
     try:
         while turn_count < _MAX_TURNS:
@@ -399,15 +486,15 @@ async def run_contractor(
             result = await deps.llm.generate(request)
             usage = getattr(result, "usage", None)
             model_name = str(getattr(result, "model_name", "") or "")
-            turn_charge = _meter_turn(deps=deps, model_name=model_name, usage=usage)
+            turn_charge = _meter_turn(prices=prices, model_name=model_name, usage=usage)
             total_charged += turn_charge
 
             success = bool(getattr(result, "success", True))
             if not success:
                 err = getattr(result, "error", None)
-                message = getattr(err, "message", None) if err is not None else None
-                last_text = str(message or "LLM 调用失败")
-                termination_reason = "returned"
+                code = str(getattr(err, "code", None) or "llm_generation_failed")
+                message = str(getattr(err, "message", None) or "LLM 调用失败")
+                llm_failure = (code, message)
                 break
 
             response_text = str(getattr(result, "response", "") or "")
@@ -457,20 +544,29 @@ async def run_contractor(
     finally:
         charged = float(total_charged)
 
+    common_meta = {
+        "agent_id": agent_id,
+        "caller_agent_id": caller_agent_id,
+        "caller_protocol": protocol,
+        "turn_count": turn_count,
+        "time_budget_seconds": time_budget_seconds,
+        "budget_hint": credit_budget,
+        "credit_budget": credit_budget,
+    }
+    if llm_failure is not None:
+        code, message = llm_failure
+        return _failure(
+            code,
+            message,
+            metadata={**common_meta, "termination_reason": "llm_failed"},
+            charged=charged,
+        )
+
     return _success(
         last_text or "",
         charged=charged,
         termination_reason=termination_reason,
-        metadata={
-            "agent_id": agent_id,
-            "caller_agent_id": caller_agent_id,
-            "caller_protocol": protocol,
-            "turn_count": turn_count,
-            "time_budget_seconds": time_budget_seconds,
-            "budget_hint": credit_budget,
-            # Task 7：soft timeout / insufficient_funds 钩子占位
-            "credit_budget": credit_budget,
-        },
+        metadata=common_meta,
     )
 
 
@@ -485,7 +581,9 @@ def make_contractor_handler(deps: ContractorDeps | None = None) -> Handler:
         *,
         scoped_metadata: Mapping[str, Any] | None = None,
     ) -> ProcedureResult:
-        if bound is None or bound.llm is None or bound.resolve_agent is None:
+        if bound is None or bound.llm is None or (
+            bound.resolve_agent is None and bound.round_snapshot_for_task is None
+        ):
             return _failure(
                 "contractor_runtime_missing",
                 "承包商运行时依赖尚未注入，暂无法执行。",

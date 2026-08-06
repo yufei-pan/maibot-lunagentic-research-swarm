@@ -439,14 +439,26 @@ class LRSServiceContainer:
         return {"builtin.invoke_procedure": bundled_procedure_invoker(provider)}
 
     def _bind_contractor_runtime(self, *, gateway: Any, price_catalog: Any) -> None:
-        """把 LLM / 价格目录 / agent 解析注入 builtin.contractor。"""
+        """把 LLM / 冻结 round 查找 / live 回落解析注入 builtin.contractor。"""
 
         provider = self._bundled_procedure_provider
         if provider is None:
             return
         from lunagentic_research_swarm.procedures.bundled.contractor import ContractorDeps
 
+        def round_snapshot_for_task(task_id: str) -> Any | None:
+            """按 task_id 取 ResearchManager 冻结的 round snapshot（若有）。"""
+
+            manager = self.manager
+            if manager is None or not task_id:
+                return None
+            snapshots = getattr(manager, "_round_snapshots", None)
+            if not isinstance(snapshots, Mapping):
+                return None
+            return snapshots.get(task_id)
+
         def resolve_agent(agent_id: str) -> Any:
+            # 仅在无冻结 snapshot 时作为回落（单测 / 无 task 上下文）。
             snapshot = self.agent_registry.snapshot(self._next_round_state.detached_agent_overrides())
             entry = snapshot.get(agent_id)
             return None if entry is None else entry.definition
@@ -479,6 +491,7 @@ class LRSServiceContainer:
                 resolve_agent=resolve_agent,
                 invoke_nested_procedure=None,
                 resolve_procedure_catalog=resolve_procedure_catalog,
+                round_snapshot_for_task=round_snapshot_for_task,
             )
         )
 

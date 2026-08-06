@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from lunagentic_research_swarm.llm.gateway import GenerationRequest, GenerationResult
+from lunagentic_research_swarm.llm.gateway import GenerationError, GenerationRequest, GenerationResult
 from lunagentic_research_swarm.llm.pricing import TokenUsage
 from lunagentic_research_swarm.llm.summarizer import SummaryResult
 from lunagentic_research_swarm.models import (
@@ -53,6 +53,9 @@ class FakeLLMResponse:
     model: str = "gpt-5.6-luna-max"
     usage: dict[str, int] = field(default_factory=lambda: {"prompt_tokens": 10, "completion_tokens": 10})
     tool_calls: list[dict[str, Any]] | None = None
+    success: bool = True
+    error_code: str = "llm_generation_failed"
+    error_message: str = "LLM 调用失败"
 
 
 class FakeLLMGateway:
@@ -120,7 +123,9 @@ class FakeLLMGateway:
                 cache_miss_tokens=int(response.usage.get("cache_miss_tokens", 0)),
                 source="actual",
             )
-            return GenerationResult(rendered, response.tool_calls, response.model, usage, True, None, 0.0)
+            ok = bool(response.success)
+            error = None if ok else GenerationError(response.error_code, response.error_message)
+            return GenerationResult(rendered, response.tool_calls, response.model, usage, ok, error, 0.0)
         return response
 
 
