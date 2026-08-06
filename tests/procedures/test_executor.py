@@ -171,6 +171,22 @@ async def test_non_idempotent_timeout_is_not_retried() -> None:
 
 
 @pytest.mark.asyncio
+async def test_timeout_seconds_zero_disables_hard_wait() -> None:
+    async def slow() -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return {"success": True, "data": {"ok": True}, "error": None, "metadata": {}}
+
+    api = FakeAPI({"builtin.slow": slow})
+    executor = ProcedureExecutor(catalog(definition("builtin.slow", timeout_seconds=0.0)), api=api)
+
+    event = await executor.invoke_many(effect([ProcedureRequest(procedure_id="builtin.slow")]))
+
+    assert len(api.calls) == 1
+    assert event.results[0].result.success
+    assert event.results[0].result.error is None
+
+
+@pytest.mark.asyncio
 async def test_invalid_provider_result_is_structured_without_raw_payload() -> None:
     api = FakeAPI({"builtin.bad": {"success": "yes", "secret": "do-not-persist"}})
     executor = ProcedureExecutor(catalog(definition("builtin.bad")), api=api)

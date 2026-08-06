@@ -198,7 +198,9 @@ class AgentOverride(PluginConfigBase):
 
 class ProcedureOverride(PluginConfigBase):
     enabled: bool | None = _ui_field(None, label="启用状态", hint="留空时继承全局设置。")
-    timeout_seconds: float | None = _ui_field(None, label="超时（秒）", hint="留空时使用任务时间预算。", gt=0.0)
+    timeout_seconds: float | None = _ui_field(
+        None, label="超时（秒）", hint="0 表示禁用硬超时；留空继承定义。", ge=0.0
+    )
 
 
 class LRSConfig(PluginConfigBase):

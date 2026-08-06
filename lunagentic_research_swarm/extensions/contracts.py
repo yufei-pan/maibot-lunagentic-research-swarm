@@ -103,7 +103,7 @@ class ProcedureDefinition(_StrictContract):
     arguments_schema: dict[str, Any]
     result_schema: dict[str, Any]
     idempotent: StrictBool = False
-    timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    timeout_seconds: float = Field(default=30.0, ge=0.0, le=600.0)
     external_cost_kind: Literal["none", "provider_metered"] = "none"
     enabled: StrictBool = True
 

@@ -560,10 +560,11 @@ class ProcedureExecutor:
         while True:
             attempts += 1
             try:
-                raw = await asyncio.wait_for(
-                    self._api_call(entry, procedure_id, invocation),
-                    timeout=timeout_seconds,
-                )
+                call = self._api_call(entry, procedure_id, invocation)
+                if timeout_seconds > 0:
+                    raw = await asyncio.wait_for(call, timeout=timeout_seconds)
+                else:
+                    raw = await call
             except asyncio.TimeoutError:
                 duration_ms = int((time.perf_counter() - started) * 1000)
                 result = _structured_error(

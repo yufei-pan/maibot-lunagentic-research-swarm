@@ -105,10 +105,15 @@ def test_procedure_schemas_must_be_object_schemas(field: str, schema: object) ->
         ProcedureDefinition.model_validate(procedure_payload(**{field: schema}))
 
 
-@pytest.mark.parametrize("timeout", [0, -1, 600.1, "30"])
+@pytest.mark.parametrize("timeout", [-1, 600.1, "30"])
 def test_procedure_timeout_is_strictly_bounded(timeout: object) -> None:
     with pytest.raises(ValidationError):
         ProcedureDefinition.model_validate(procedure_payload(timeout_seconds=timeout))
+
+
+def test_procedure_timeout_zero_means_disabled() -> None:
+    definition = ProcedureDefinition.model_validate(procedure_payload(timeout_seconds=0.0))
+    assert definition.timeout_seconds == 0.0
 
 
 def test_procedure_defaults_and_public_fields_are_exact() -> None:
