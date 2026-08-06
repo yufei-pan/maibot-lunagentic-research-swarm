@@ -76,6 +76,12 @@ def test_auto_compact_honors_override_precedence_and_model_window() -> None:
     )
 
 
+def test_config_model_context_window_defaults_unset() -> None:
+    from lunagentic_research_swarm.config import LRSConfig
+
+    assert LRSConfig().context.model_context_window is None
+
+
 def test_branch_finalization_releases_raw_messages() -> None:
     branch = BranchRuntime(
         branch_id="branch",

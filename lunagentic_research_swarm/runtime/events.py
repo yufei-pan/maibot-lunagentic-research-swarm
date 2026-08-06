@@ -263,6 +263,9 @@ class ChildMaterialized(Event):
     depth: int = 0
     retire_parent: bool = False
     pool_return: float = 0.0
+    # When the parent stays alive (checkpoint/grace release), set its new leaf
+    # balance so child allocations remain a transfer rather than minting credits.
+    parent_credits_after: float | None = None
 
 
 @_register

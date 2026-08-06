@@ -570,6 +570,43 @@ async def test_materialize_child_commits_before_enqueuing_agent(harness) -> None
 
 
 @pytest.mark.asyncio
+async def test_held_release_transfers_parent_credits_without_minting(harness) -> None:
+    from lunagentic_research_swarm.runtime.reducer import NotifyToolWaiter
+
+    manager, _, _, scheduler, *_ = harness
+    result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120, effort_level=1.0)
+    await manager.wait_idle(result["task_id"])
+    status = await manager.status(result["task_id"])
+    task_id = result["task_id"]
+    parent_id = status["active_leaves"][0]["branch_id"]
+    assert status["active_leaves"][0]["credits"] == pytest.approx(100.0)
+
+    scheduler.enqueued.clear()
+    await manager._release_held_delegations(
+        task_id,
+        parent_id,
+        (
+            {"branch_id": f"{parent_id}:1", "agent_id": "child", "task": "a", "credits": 60.0},
+            {"branch_id": f"{parent_id}:2", "agent_id": "child", "task": "b", "credits": 40.0},
+        ),
+    )
+    materialize = [
+        item
+        for item in scheduler.enqueued
+        if isinstance(item, NotifyToolWaiter) and item.payload.get("action") == "materialize_child"
+    ]
+    assert len(materialize) == 2
+    assert materialize[0].payload["parent_credits_after"] == 0.0
+    assert materialize[1].payload["parent_credits_after"] is None
+    for item in materialize:
+        await manager.materialize_child_effect(item)
+    leaves = dict(manager._controllers[task_id].state.active_leaves)
+    assert leaves[parent_id] == 0.0
+    assert leaves[f"{parent_id}:1"] + leaves[f"{parent_id}:2"] == pytest.approx(100.0)
+    assert sum(leaves.values()) == pytest.approx(100.0)
+
+
+@pytest.mark.asyncio
 async def test_branch_summary_effect_finalizes_coordinator_branch_and_releases_messages(harness) -> None:
     from lunagentic_research_swarm.models import BranchLifecycle
     from lunagentic_research_swarm.runtime.reducer import PerformBranchSummary

@@ -394,22 +394,27 @@ class VectorIndex:
         if prepared.kind == "bootstrap":
             job_id = prepared.job_id
             try:
-                rebuild = await self._rebuild_unlocked(force=True)
-            except EmbeddingGenerationMismatch as exc:
-                await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-                return VectorOpResult.fail(exc)
-            except VectorRebuildFailed as exc:
-                await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-                return VectorOpResult.fail(exc)
-            if not rebuild.success:
-                await self._fail_job(
-                    job_id,
-                    rebuild.error.code if rebuild.error else "rebuild_failed",
-                    rebuild.error.message if rebuild.error else "重建失败",
-                )
-                return rebuild
-            await self._complete_job(job_id, generation=int((await self.status()).active_generation or 0))
-            return VectorOpResult.ok(code="indexed")
+                try:
+                    rebuild = await self._rebuild_unlocked(force=True)
+                except EmbeddingGenerationMismatch as exc:
+                    await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
+                    return VectorOpResult.fail(exc)
+                except VectorRebuildFailed as exc:
+                    await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
+                    return VectorOpResult.fail(exc)
+                if not rebuild.success:
+                    await self._fail_job(
+                        job_id,
+                        rebuild.error.code if rebuild.error else "rebuild_failed",
+                        rebuild.error.message if rebuild.error else "重建失败",
+                    )
+                    return rebuild
+                await self._complete_job(job_id, generation=int((await self.status()).active_generation or 0))
+                return VectorOpResult.ok(code="indexed")
+            finally:
+                async with self._lock:
+                    status_after = await self.status()
+                    self._rebuilding = bool(status_after.candidate_active)
 
         assert prepared.kind == "embed"
         try:
@@ -721,6 +726,9 @@ class VectorIndex:
             )
 
         if status.active_generation is None:
+            # Serialize cold-index bootstrap like rebuild(): claim `_rebuilding`
+            # before releasing `_lock` so concurrent first enqueues fail fast.
+            self._rebuilding = True
             return SimpleNamespace(kind="bootstrap", job_id=job_id)
 
         return SimpleNamespace(

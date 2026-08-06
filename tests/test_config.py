@@ -18,6 +18,7 @@ def test_config_defaults_match_approved_spec() -> None:
     assert config.timing.feedback_wait_seconds == 600
     assert config.budget.default_effort_credits == 100.0
     assert config.context.auto_compact_tokens == 258000
+    assert config.context.model_context_window is None
     assert config.protocol.default_mode == "json_envelope"
     assert config.protocol.max_correction_turns == 1
     assert not config.storage.store_agent_transcripts

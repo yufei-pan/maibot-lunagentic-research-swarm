@@ -1370,11 +1370,17 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             return _invalid(state, event, "ChildMaterialized identity 不能为空")
         if event.depth < 0 or event.credits < 0 or event.pool_return < 0:
             return _invalid(state, event, "ChildMaterialized depth/credits 无效")
+        if event.parent_credits_after is not None and (
+            event.retire_parent or event.parent_credits_after < 0
+        ):
+            return _invalid(state, event, "ChildMaterialized parent_credits_after 无效")
         leaves = _state_leaves(state)
         pool = _state_credit_pool(state)
         if event.retire_parent:
             leaves.pop(event.parent_branch_id, None)
             pool += float(event.pool_return)
+        elif event.parent_credits_after is not None:
+            leaves[event.parent_branch_id] = float(event.parent_credits_after)
         leaves[event.branch_id] = float(event.credits)
         commands: list[StoreCommand] = [
             _command(
@@ -1402,6 +1408,17 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                         "pool_return": event.pool_return,
                         "lifecycle": "FINALIZED",
                         "finalized_at": event.occurred_at.timestamp(),
+                    },
+                )
+            )
+        elif event.parent_credits_after is not None:
+            commands.append(
+                _command(
+                    "update_branch_balance",
+                    {
+                        "branch_id": event.parent_branch_id,
+                        "credit_balance": float(event.parent_credits_after),
+                        "lifecycle": "READY",
                     },
                 )
             )

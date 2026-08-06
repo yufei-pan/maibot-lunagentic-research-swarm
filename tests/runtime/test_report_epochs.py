@@ -194,3 +194,54 @@ async def test_failed_branch_summary_is_durable_and_final_coverage_degrades(repo
     assert summaries[-1]["status"] == "FAILED"
     assert summaries[-1]["error_code"] == "provider_unavailable"
     assert report_harness.coordinator.reports[-1].status == "DEGRADED"
+
+
+@pytest.mark.asyncio
+async def test_synthesis_finished_stays_false_during_completion_callback(report_harness: ReportHarness) -> None:
+    """A3: concurrent terminals must not observe synthesis_finished mid-callback."""
+
+    seen_finished: list[bool] = []
+
+    async def on_complete(record) -> None:
+        current = report_harness.coordinator.current_epoch
+        assert current is not None
+        seen_finished.append(bool(current.synthesis_finished))
+
+    report_harness.coordinator.on_synthesis_complete = on_complete
+    await report_harness.coordinator.on_branch_safe_point("A", checkpoint=True)
+    await report_harness.coordinator.wait_for_synthesis()
+
+    assert seen_finished == [False]
+    assert report_harness.coordinator.current_epoch is not None
+    assert report_harness.coordinator.current_epoch.synthesis_finished is True
+
+
+@pytest.mark.asyncio
+async def test_non_frontier_last_leaf_opens_final_after_prior_epoch(report_harness: ReportHarness) -> None:
+    """Grace/next-epoch children sit outside the frozen frontier; last one must open FINAL."""
+
+    await report_harness.coordinator.on_branch_safe_point("A", checkpoint=True)
+    await report_harness.coordinator.wait_for_synthesis()
+    intermediate = report_harness.coordinator.current_epoch
+    assert intermediate is not None
+    assert intermediate.synthesis_finished is True
+
+    # Simulate a next-epoch child that never joined the prior frontier.
+    child = BranchRuntime(
+        branch_id="next",
+        task=report_harness.branch("A").task,
+        catalog_fingerprint="catalog",
+        generation=0,
+        messages=[{"role": "assistant", "content": "next evidence"}],
+        credits=1.0,
+        depth=1,
+    )
+    report_harness.coordinator.branches["next"] = child
+    report_harness.coordinator.branches["A"].lifecycle = BranchLifecycle.FINALIZED
+
+    epoch = await report_harness.coordinator.on_branch_safe_point("next", terminal=True)
+    await report_harness.coordinator.wait_for_synthesis()
+
+    assert epoch is not None
+    assert epoch.kind is ReportKind.FINAL
+    assert report_harness.coordinator.reports[-1].kind is ReportKind.FINAL

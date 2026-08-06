@@ -245,6 +245,11 @@ class ReportCoordinator:
             # FINAL coverage and deliver it immediately.
             if self.current_epoch is None:
                 return await self.open_epoch()
+            # Next-epoch / grace children are outside the frozen frontier.
+            # Once the prior epoch has fully committed and no live branches
+            # remain, open FINAL (same outcome as the in-frontier empty path).
+            if self.current_epoch.synthesis_finished and not self.active_branch_ids():
+                return await self.open_epoch()
             return self.current_epoch
 
         active_epoch = self.current_epoch
@@ -389,12 +394,15 @@ class ReportCoordinator:
             error_code, error_message,
         )
         self.reports.append(record)
-        report_epoch.synthesis_finished = True
         self.deadline_at = created_at + self.time_budget_seconds
         if self.on_synthesis_complete is not None:
             completed = self.on_synthesis_complete(record)
             if hasattr(completed, "__await__"):
                 await completed
+        # Mark finished only after the completion callback so concurrent
+        # terminals cannot open the next FINAL epoch while status is still
+        # mid-REPORTING (A3).
+        report_epoch.synthesis_finished = True
         # A synthesis that was necessarily intermediate at its frozen start
         # may finish after every branch has become terminal.  Do not mutate
         # that immutable record; open a distinct final epoch instead.

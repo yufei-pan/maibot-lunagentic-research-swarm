@@ -715,15 +715,6 @@ class ResearchManager:
             )
         )
         messages = tuple(dict(item) for item in branch.get("messages", ()))
-        coordinator = self.report_coordinators.get(effect.task_id)
-        if coordinator is not None:
-            pending = coordinator.pending_summary_messages(branch_id)
-            if pending:
-                messages = messages + tuple(dict(item) for item in pending)
-                branch["messages"] = [dict(item) for item in messages]
-                runtime = coordinator.branches.get(branch_id)
-                if runtime is not None:
-                    runtime.messages = [dict(item) for item in messages]
         protocol = str(getattr(definition, "protocol", "json_envelope"))
         call_id = str(effect.payload.get("call_id") or new_call_id())
         # Authoritative balance lives on active_leaves; branch cache is status-only.
@@ -753,6 +744,23 @@ class ResearchManager:
             estimated_charge=estimated_charge,
             resolved=resolved,
         )
+        # Inject coverage broadcasts after compact so `_seen` cannot strand them
+        # inside a rewritten `[formalized, compact]` history.
+        coordinator = self.report_coordinators.get(effect.task_id)
+        if coordinator is not None:
+            pending = coordinator.pending_summary_messages(branch_id)
+            if pending:
+                messages = messages + tuple(dict(item) for item in pending)
+                branch["messages"] = [dict(item) for item in messages]
+                runtime = coordinator.branches.get(branch_id)
+                if runtime is not None:
+                    runtime.messages = [dict(item) for item in messages]
+                estimated_charge, prompt_tokens, cache_hit, cache_miss, resolved = self._estimate_agent_reservation(
+                    snapshot=snapshot,
+                    selector=selector,
+                    messages=messages,
+                    protocol=protocol,
+                )
         credits_after_reservation = balance_before - estimated_charge
         usage_id = f"usage_{call_id}"
         ledger_id = f"ledger_{call_id}"
@@ -883,10 +891,13 @@ class ResearchManager:
         reserved_output = int(self._runtime_limits.get("reserved_output_tokens", 8192))
         safety_margin = int(self._runtime_limits.get("safety_margin_tokens", 8192))
         model_limit = None
+        configured_window = self._runtime_limits.get("model_context_window")
+        if configured_window is not None:
+            model_limit = int(configured_window)
         if resolved is not None:
-            model_limit = getattr(getattr(resolved, "profile", None), "context_window", None)
-            if model_limit is not None:
-                model_limit = int(model_limit)
+            profile_window = getattr(getattr(resolved, "profile", None), "context_window", None)
+            if profile_window is not None:
+                model_limit = int(profile_window)
         if not should_auto_compact(
             int(prompt_tokens),
             agent_override=int(agent_override) if agent_override is not None else None,
@@ -1004,6 +1015,9 @@ class ResearchManager:
         parent_id = str(payload["parent_branch_id"])
         credits = float(payload.get("credits", 0.0))
         depth = int(payload.get("depth", 0))
+        parent_credits_after = payload.get("parent_credits_after")
+        if parent_credits_after is not None:
+            parent_credits_after = float(parent_credits_after)
         await self._submit(
             controller,
             ChildMaterialized(
@@ -1011,8 +1025,10 @@ class ResearchManager:
                 branch_id=branch_id, parent_branch_id=parent_id, agent_id=agent_id,
                 credits=credits, depth=depth, retire_parent=bool(payload.get("retire_parent", False)),
                 pool_return=float(payload.get("pool_return", 0.0)),
+                parent_credits_after=parent_credits_after,
             ),
         )
+        self._sync_branch_credits(effect.task_id, controller)
         messages = [dict(item) for item in payload.get("messages", ())]
         self._branches[effect.task_id][branch_id] = {
             "credits": credits, "pending_context": [], "agent_id": agent_id,
@@ -1020,11 +1036,17 @@ class ResearchManager:
         }
         if payload.get("retire_parent"):
             self._branches[effect.task_id].pop(parent_id, None)
+        elif parent_credits_after is not None:
+            parent_branch = self._branches[effect.task_id].get(parent_id)
+            if parent_branch is not None:
+                parent_branch["credits"] = float(parent_credits_after)
         coordinator = self.report_coordinators.get(effect.task_id)
         if coordinator is not None:
             if payload.get("retire_parent") and parent_id in coordinator.branches:
                 coordinator.branches[parent_id].lifecycle = BranchLifecycle.FINALIZED
                 coordinator.branches[parent_id].messages.clear()
+            elif parent_credits_after is not None and parent_id in coordinator.branches:
+                coordinator.branches[parent_id].credits = float(parent_credits_after)
             coordinator.branches[branch_id] = BranchRuntime(
                 branch_id, coordinator.formalized_task, snapshot.agent_catalog.fingerprint,
                 effect.generation, messages, credits, depth, parent_branch_id=parent_id,
@@ -1425,6 +1447,22 @@ class ResearchManager:
                 _event_id(), task_id, state.active_round_id or "", state.generation, report_id=record.report_id
             )
         await self._submit(controller, event)
+        state = controller.state
+        # Spec §13.1: re-arm the wall-clock timer after each intermediate return to RUNNING.
+        if (
+            record.kind is not ReportKind.FINAL
+            and state.status is TaskStatus.RUNNING
+            and state.active_round_id
+        ):
+            coordinator = self.report_coordinators.get(task_id)
+            due_at = getattr(coordinator, "deadline_at", None) if coordinator is not None else None
+            if due_at is not None:
+                self._arm_deadline_timer(
+                    task_id,
+                    due_at=float(due_at),
+                    round_id=str(state.active_round_id or ""),
+                    generation=state.generation,
+                )
 
     def _register_report_coordinator(
         self,
@@ -1629,6 +1667,10 @@ class ResearchManager:
                         ),
                         "retire_parent": False,
                         "pool_return": 0.0,
+                        # First child carries the parent's post-transfer remainder.
+                        "parent_credits_after": (
+                            float(allocation.returned_to_pool) if index == 0 else None
+                        ),
                     },
                 )
             )

@@ -44,6 +44,9 @@ max_agent_calls_per_task = 256
 auto_compact_tokens = 258000
 reserved_output_tokens = 8192
 safety_margin_tokens = 8192
+# 可选：已知模型上下文窗口（token）。设置后自动压缩会同时参考
+# context_window - reserved_output - safety_margin。
+# model_context_window = 128000
 
 [protocol]
 default_mode = "json_envelope"

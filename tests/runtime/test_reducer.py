@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 import pytest
@@ -419,3 +420,37 @@ def test_final_epoch_committed_bumps_epoch_while_already_finalizing() -> None:
     assert transition.next_state.status is TaskStatus.FINALIZING
     assert transition.next_state.report_epoch == 1
     assert transition.effects == ()
+
+
+def test_child_materialized_can_debit_living_parent_without_retire() -> None:
+    from lunagentic_research_swarm.runtime.events import ChildMaterialized
+
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.RUNNING,
+        generation=0,
+        active_round_id="round-1",
+        active_leaves={"parent": 100.0},
+        credit_pool=0.0,
+    )
+    transition = reduce_event(
+        state,
+        ChildMaterialized(
+            "evt-child",
+            "task-1",
+            "round-1",
+            0,
+            branch_id="parent:1",
+            parent_branch_id="parent",
+            agent_id="child",
+            credits=60.0,
+            depth=1,
+            retire_parent=False,
+            pool_return=0.0,
+            parent_credits_after=40.0,
+        ),
+    )
+
+    assert transition.next_state.active_leaves == {"parent": 40.0, "parent:1": 60.0}
+    assert transition.next_state.credit_pool == 0.0
+    assert math.fsum(transition.next_state.active_leaves.values()) == pytest.approx(100.0)

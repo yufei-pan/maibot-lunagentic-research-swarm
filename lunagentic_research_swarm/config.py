@@ -98,6 +98,12 @@ class ContextSection(PluginConfigBase):
     auto_compact_tokens: int = _ui_field(258000, label="自动压缩阈值", hint="上下文达到此 token 数时自动压缩。", ge=1)
     reserved_output_tokens: int = _ui_field(8192, label="预留输出 token", hint="为最终输出保留的 token 数。", ge=0)
     safety_margin_tokens: int = _ui_field(8192, label="安全余量 token", hint="上下文窗口的安全余量。", ge=0)
+    model_context_window: int | None = _ui_field(
+        None,
+        label="模型上下文窗口",
+        hint="可选。已知物理 context window（token）时与自动压缩阈值一并生效；留空则仅用阈值。",
+        ge=1,
+    )
 
 
 class ProtocolSection(PluginConfigBase):

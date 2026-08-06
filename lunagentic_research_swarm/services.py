@@ -188,7 +188,7 @@ class LRSServiceContainer:
         }
 
     @staticmethod
-    def _extract_safety_limits(config: LRSConfig) -> dict[str, int | float]:
+    def _extract_safety_limits(config: LRSConfig) -> dict[str, int | float | None]:
         return {
             "default_time_budget_seconds": int(config.timing.default_time_budget_seconds),
             "grace_period_seconds": int(config.timing.grace_period_seconds),
@@ -203,11 +203,16 @@ class LRSServiceContainer:
             "auto_compact_tokens": int(config.context.auto_compact_tokens),
             "reserved_output_tokens": int(config.context.reserved_output_tokens),
             "safety_margin_tokens": int(config.context.safety_margin_tokens),
+            "model_context_window": (
+                int(config.context.model_context_window)
+                if config.context.model_context_window is not None
+                else None
+            ),
             "max_correction_turns": int(config.protocol.max_correction_turns),
         }
 
     @property
-    def safety_limits(self) -> Mapping[str, int | float]:
+    def safety_limits(self) -> Mapping[str, int | float | None]:
         return dict(self._safety_limits)
 
     @property
