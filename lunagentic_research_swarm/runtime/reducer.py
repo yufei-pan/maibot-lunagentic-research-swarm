@@ -1317,32 +1317,47 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             )
 
         # 仅顶层批结果扣调用方；按条目写 procedure_charge，避免与 manager 双写。
+        # ledger.call_id 必须用 turn 级 event.call_id（与 reserve/reconcile 对齐）；
+        # 请求 correlator 只放 metadata.request_call_id。
         charge_items: list[tuple[Any, float]] = []
         for item in event.results:
             charged = extract_research_credits_charged(getattr(item, "result", None))
             if charged > 0.0:
                 charge_items.append((item, charged))
         if charge_items:
+            turn_call_id = str(event.call_id or "")
             running_balance = float(event.credits_after) + sum(amount for _, amount in charge_items)
             for item, charged in charge_items:
                 running_balance -= charged
                 procedure_id = str(getattr(item, "procedure_id", "") or "")
                 request_id = str(getattr(item, "request_id", "") or "")
-                item_call_id = str(getattr(item, "call_id", "") or event.call_id or "")
+                request_call_id = str(getattr(item, "call_id", "") or "")
+                result_obj = getattr(item, "result", None)
+                result_meta = getattr(result_obj, "metadata", None)
+                budget_hint: float | None = None
+                if isinstance(result_meta, Mapping) and "budget_hint" in result_meta:
+                    try:
+                        budget_hint = float(result_meta["budget_hint"])
+                    except (TypeError, ValueError):
+                        budget_hint = None
+                meta: dict[str, Any] = {
+                    "procedure_id": procedure_id,
+                    "call_id": turn_call_id,
+                    "request_id": request_id,
+                }
+                if request_call_id:
+                    meta["request_call_id"] = request_call_id
                 charge = charge_procedure_usage(
                     charged,
                     task_id=event.task_id,
                     round_id=event.round_id,
                     branch_id=event.branch_id,
-                    call_id=item_call_id,
+                    call_id=turn_call_id,
                     procedure_id=procedure_id,
                     request_id=request_id,
+                    budget_hint=budget_hint,
                     balance_after=running_balance,
-                    metadata={
-                        "procedure_id": procedure_id,
-                        "call_id": item_call_id,
-                        "request_id": request_id,
-                    },
+                    metadata=meta,
                     created_at=event.occurred_at,
                 )
                 commands.extend(charge.commands)

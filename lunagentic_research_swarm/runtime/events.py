@@ -227,6 +227,7 @@ class ProcedureBatchCompleted(Event):
                             api_version=str(item.get("api_version", "1")),
                             attempts=int(item.get("attempts", 1)),
                             duration_ms=int(item.get("duration_ms", 0)),
+                            call_id=str(item.get("call_id", "") or ""),
                         )
                     )
                     continue

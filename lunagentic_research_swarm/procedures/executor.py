@@ -632,6 +632,30 @@ class ProcedureExecutor:
                 procedure_id, request_id, result, provider_id, api_name, api_version, attempts, duration_ms
             )
 
+    @staticmethod
+    def _stamp_request_billing_fields(item: ProcedureExecutionResult, request: Any) -> ProcedureExecutionResult:
+        """把 request.credits 盖章为结果 metadata.budget_hint，并透传 request call_id。"""
+
+        budget = float(_request_value(request, "credits", 0.0) or 0.0)
+        result = item.result
+        metadata = dict(getattr(result, "metadata", {}) or {})
+        metadata["budget_hint"] = budget
+        stamped = ProcedureResult.model_validate(
+            {
+                "success": result.success,
+                "data": result.data,
+                "error": result.error,
+                "metadata": metadata,
+                "research_credits_charged": float(getattr(result, "research_credits_charged", 0.0) or 0.0),
+            },
+            strict=True,
+        )
+        return dataclasses_replace(
+            item,
+            result=stamped,
+            call_id=str(_request_value(request, "call_id", "") or ""),
+        )
+
     async def _maybe_save_payload(
         self,
         *,
@@ -692,10 +716,9 @@ class ProcedureExecutor:
         results = list(
             await asyncio.gather(*(self._invoke_one(request, context, index) for index, request in enumerate(ordinary)))
         )
-        # 把智能体自带的可选 call_id 透传回结果，供它把结果对回自己的请求。
+        # 透传智能体 request call_id（结果对账），并盖章 request.credits → budget_hint 供账本使用。
         results = [
-            dataclasses_replace(item, call_id=str(_request_value(request, "call_id", "") or ""))
-            for item, request in zip(results, ordinary)
+            self._stamp_request_billing_fields(item, request) for item, request in zip(results, ordinary)
         ]
         parent_messages = tuple(dict(item) for item in payload.get("messages", ()) if isinstance(item, Mapping))
         # spec §8.2/§9.1：本 turn 的 envelope `report` 是该智能体的工作输出（明确

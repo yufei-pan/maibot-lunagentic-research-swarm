@@ -141,6 +141,8 @@ def test_charge_procedure_usage_debits_with_negative_amount() -> None:
 
 
 def test_procedure_batch_completed_persists_procedure_charge_ledger() -> None:
+    import json
+
     state = RuntimeState(
         "task-1",
         TaskStatus.RUNNING,
@@ -155,17 +157,18 @@ def test_procedure_batch_completed_persists_procedure_charge_ledger() -> None:
         0,
         occurred_at=NOW,
         branch_id="branch-1",
-        call_id="call-1",
+        call_id="turn-call-1",
         result_id="result-1",
         results=(
             {
                 "procedure_id": "builtin.search",
                 "request_id": "req-1",
+                "call_id": "request-correlator-9",
                 "result": ProcedureResult(
                     success=True,
                     data={},
                     error=None,
-                    metadata={"agent_id": "agent.reader"},
+                    metadata={"agent_id": "agent.reader", "budget_hint": 4.0},
                     research_credits_charged=3.5,
                 ).model_dump(mode="json"),
                 "provider_plugin_id": "provider.tools",
@@ -187,4 +190,81 @@ def test_procedure_batch_completed_persists_procedure_charge_ledger() -> None:
     assert ledger[0].values["entry_kind"] == "procedure_charge"
     assert ledger[0].values["amount"] == pytest.approx(-3.5)
     assert ledger[0].values["balance_after"] == pytest.approx(6.5)
+    assert ledger[0].values["call_id"] == "turn-call-1"
+    meta = json.loads(ledger[0].values["metadata_json"])
+    assert meta["budget_hint"] == pytest.approx(4.0)
+    assert meta["request_call_id"] == "request-correlator-9"
+    assert meta["call_id"] == "turn-call-1"
     assert transition.next_state.active_leaves["branch-1"] == pytest.approx(6.5)
+
+
+@pytest.mark.asyncio
+async def test_procedure_batch_sums_charges_across_multiple_results() -> None:
+    class _MultiAPI:
+        def __init__(self) -> None:
+            self.by_id = {
+                "builtin.a": {
+                    "success": True,
+                    "data": {},
+                    "error": None,
+                    "metadata": {},
+                    "research_credits_charged": 1.5,
+                },
+                "builtin.b": {
+                    "success": True,
+                    "data": {},
+                    "error": None,
+                    "metadata": {},
+                    "research_credits_charged": 2.0,
+                },
+            }
+
+        async def call(self, name: str, *, version: str = "", **kwargs: Any) -> Any:
+            del name, version
+            return self.by_id[str(kwargs["procedure_id"])]
+
+    executor = ProcedureExecutor(_catalog("builtin.a", "builtin.b"), api=_MultiAPI())
+    effect = PerformProcedureBatch(
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        payload={
+            "branch_id": "branch-1",
+            "call_id": "call-1",
+            "turn_id": "turn-1",
+            "agent_id": "agent.reader",
+            "credits_after": 10.0,
+            "requests": [
+                ProcedureRequest(procedure_id="builtin.a", credits=2.0),
+                ProcedureRequest(procedure_id="builtin.b", credits=3.0),
+            ],
+        },
+    )
+
+    completed = await TurnWorker(object(), executor).perform_procedure_batch(effect)
+
+    assert completed.credits_after == pytest.approx(6.5)
+    assert float(completed.results[0].result.metadata["budget_hint"]) == pytest.approx(2.0)
+    assert float(completed.results[1].result.metadata["budget_hint"]) == pytest.approx(3.0)
+
+
+@pytest.mark.asyncio
+async def test_executor_stamps_budget_hint_from_request_credits() -> None:
+    api = _FakeAPI({"success": True, "data": {}, "error": None, "metadata": {}})
+    executor = ProcedureExecutor(_catalog("builtin.search"), api=api)
+    effect = PerformProcedureBatch(
+        task_id="task-1",
+        round_id="round-1",
+        generation=0,
+        payload={
+            "branch_id": "branch-1",
+            "call_id": "call-1",
+            "turn_id": "turn-1",
+            "agent_id": "agent.reader",
+            "requests": [ProcedureRequest(procedure_id="builtin.search", credits=4.0)],
+        },
+    )
+
+    completed = await executor.invoke_many(effect)
+
+    assert float(completed.results[0].result.metadata["budget_hint"]) == pytest.approx(4.0)
