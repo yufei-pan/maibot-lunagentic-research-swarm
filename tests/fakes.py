@@ -237,6 +237,14 @@ class FakeSummarizer:
         self.task_gate.set()
         self.formalization_gate = asyncio.Event()
         self.formalization_text = "正式任务"
+        # Fail hooks (§23.2): unsuccessful SummaryResult without inventing prose.
+        # ``branch_failure`` / ``task_failure`` are error-like objects with .code/.message
+        # (GenerationError or SimpleNamespace). ``fail_branch_history_markers`` selects
+        # which branches fail when BranchFinalizationRequest has no branch_id — match
+        # against seeded history content (RuntimeHarness uses "{id} evidence").
+        self.branch_failure: Any | None = None
+        self.task_failure: Any | None = None
+        self.fail_branch_history_markers: set[str] = set()
 
     async def formalize_task(self, request: Any) -> SummaryResult:
         await self.formalization_gate.wait()
@@ -247,11 +255,23 @@ class FakeSummarizer:
         await self.branch_gate.wait()
         history = request.branch_history
         tail = history[-1].get("content", "") if history else "empty"
+        marker_hit = any(
+            marker in str(item.get("content", ""))
+            for marker in self.fail_branch_history_markers
+            for item in (history or ())
+        )
+        if self.branch_failure is not None or marker_hit:
+            error = self.branch_failure
+            if error is None:
+                error = GenerationError("summary_unavailable", "branch summary unavailable")
+            return SummaryResult(False, "", "gpt-5.6-luna-max", None, error)
         return SummaryResult(True, f"branch-summary:{tail}", "gpt-5.6-luna-max", None, None)
 
     async def finalize_task(self, request: Any) -> SummaryResult:
         self.task_requests.append(request)
         await self.task_gate.wait()
+        if self.task_failure is not None:
+            return SummaryResult(False, "", "gpt-5.6-luna-max", None, self.task_failure)
         return SummaryResult(True, "task-summary", "gpt-5.6-luna-max", None, None)
 
 
@@ -346,7 +366,7 @@ class _PriceCatalog:
 class RuntimeHarness:
     """以真实 reducer-adjacent report/store APIs 驱动的 deterministic harness。"""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, runtime_limits: dict[str, Any] | None = None) -> None:
         self.root = Path(root)
         self.clock = FakeClock()
         self.llm = FakeLLMGateway()
@@ -364,6 +384,16 @@ class RuntimeHarness:
         self._root_branch_id = ""
         self._status = TaskStatus.FORMALIZING
         self._started = False
+        # Mirrored into ResearchManager; deliver_* must be set before formalize
+        # (ReportCoordinator reads them at registration).
+        self._runtime_limits: dict[str, Any] = dict(runtime_limits or {})
+
+    def configure_runtime_limits(self, **limits: Any) -> None:
+        """Merge into manager ``_runtime_limits`` (call before :meth:`formalize`)."""
+
+        self._runtime_limits.update(limits)
+        if self.manager is not None:
+            self.manager._runtime_limits.update(limits)
 
     async def open(self) -> RuntimeHarness:
         await self.store.open()
@@ -397,6 +427,7 @@ class RuntimeHarness:
             snapshot_provider=snapshot_provider,
             grace_period_seconds=60,
             report_coordinator_factory=coordinator_factory,
+            runtime_limits=dict(self._runtime_limits),
         )
         self._started = True
         return self

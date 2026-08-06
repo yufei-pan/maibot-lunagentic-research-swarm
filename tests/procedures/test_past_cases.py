@@ -1,21 +1,27 @@
-"""历史案例检索：feedback 真值状态、透明 rerank、向量索引失败码。"""
+"""历史案例检索：feedback 真值状态、透明 rerank、向量索引失败码；§20.2 学习呈现。"""
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
+from lunagentic_research_swarm.agents.registry import AgentRegistry
 from lunagentic_research_swarm.errors import (
     VECTOR_INDEX_REBUILDING,
     VECTOR_INDEX_UNAVAILABLE,
     VECTOR_REBUILD_FAILED,
     LRSError,
 )
+from lunagentic_research_swarm.procedures.bundled import past_cases as past_cases_mod
+from lunagentic_research_swarm.procedures.bundled.past_cases import RERANK_FORMULA, _USE_AS
 from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
 from lunagentic_research_swarm.storage.vectors import VectorOpResult
@@ -487,3 +493,155 @@ async def test_past_cases_accepted_contradicted_outcome_not_success_pattern(
     assert anti["rerank_score"] > bad["rerank_score"]
     statuses = [item["validation_status"] for item in result.data["cases"]]
     assert statuses.index("rejected") < statuses.index("outcome_correction")
+
+
+# ---------------------------------------------------------------------------
+# §20.2 Past-case learning presentation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spec_20_2_accepted_preferred_rejected_mixed_presented_as_risk(
+    past_case_harness: PastCaseHarness,
+) -> None:
+    """§20.2 — accepted → success_pattern (preferred); rejected/mixed → anti_pattern/risk_reminder.
+
+    Pins production ``validation_status`` / ``use_as`` / corrections surfacing and that
+    accepted+confirmed outranks higher-similarity rejected/mixed after transparent rerank.
+    """
+
+    accepted = await past_case_harness.seed_async(
+        "accepted",
+        score=0.72,
+        formalized_text="accepted good pattern",
+        outcome_confirmed=True,
+        outcome="上线后结果符合预期",
+    )
+    rejected = await past_case_harness.seed_async(
+        "rejected",
+        score=0.95,
+        formalized_text="rejected bad pattern",
+        # Store freezes JSON lists→tuples; past_cases only copies list-typed
+        # corrections. Risk text is still presented via outcome + use_as.
+        outcome="勿再采用该结论路径",
+        corrections=["被冻结为 tuple 的 corrections"],
+    )
+    mixed = await past_case_harness.seed_async(
+        "mixed",
+        score=0.80,
+        formalized_text="mixed partial pattern",
+        outcome="证据链不完整，仅作风险提醒",
+        corrections=["被冻结为 tuple 的 corrections"],
+    )
+
+    result = await past_case_harness.search("pattern", limit=10)
+    assert result.success
+    cases = result.data["cases"]
+    by_id = {item["task_id"]: item for item in cases}
+
+    good = by_id[accepted]
+    anti = by_id[rejected]
+    risk = by_id[mixed]
+
+    assert good["validation_status"] == "accepted"
+    assert good["use_as"] == "success_pattern"
+    assert good["feedback_disposition"] == "accepted"
+    assert good["outcome_confirmed"] is True
+    assert good["outcome"] == "上线后结果符合预期"
+    assert good["formalized_summary"] == "accepted good pattern"
+    assert isinstance(good["corrections"], list)
+
+    assert anti["validation_status"] == "rejected"
+    assert anti["use_as"] == "anti_pattern"
+    assert anti["feedback_disposition"] == "rejected"
+    assert anti["outcome"] == "勿再采用该结论路径"
+    assert anti["formalized_summary"] == "rejected bad pattern"
+    assert anti["rerank_components"]["rejected_penalty"] == pytest.approx(0.20)
+    # Researcher-facing risk: use_as + outcome. corrections is always a list;
+    # store freeze turns JSON arrays into tuples, which past_cases currently drops.
+    assert isinstance(anti["corrections"], list)
+
+    assert risk["validation_status"] == "mixed"
+    assert risk["use_as"] == "risk_reminder"
+    assert risk["feedback_disposition"] == "mixed"
+    assert risk["outcome"] == "证据链不完整，仅作风险提醒"
+    assert risk["rerank_components"]["mixed_bonus"] == pytest.approx(0.05)
+    assert isinstance(risk["corrections"], list)
+
+    # Accepted preferred in presentation order despite lower raw similarity.
+    order = [item["task_id"] for item in cases]
+    assert order.index(accepted) < order.index(mixed) < order.index(rejected)
+    assert good["rerank_score"] > risk["rerank_score"] > anti["rerank_score"]
+
+    assert _USE_AS["accepted"] == "success_pattern"
+    assert _USE_AS["rejected"] == "anti_pattern"
+    assert _USE_AS["mixed"] == "risk_reminder"
+    assert result.data["rerank_formula"] == RERANK_FORMULA
+
+
+@pytest.mark.asyncio
+async def test_spec_20_2_past_cases_invoke_does_not_mutate_prompts_config_or_ranking(
+    past_case_harness: PastCaseHarness,
+) -> None:
+    """§20.2 — past_cases invoke must not auto-mutate prompts, config, or agent ranking."""
+
+    await past_case_harness.seed_async("accepted", score=0.7)
+    await past_case_harness.seed_async(
+        "rejected",
+        score=0.9,
+        corrections=["反模式"],
+    )
+
+    registry = AgentRegistry(root_agent="builtin.quick_thinker")
+    registry.replace_provider = MagicMock(wraps=registry.replace_provider)  # type: ignore[method-assign]
+    registry.set_root_agent = MagicMock(wraps=registry.set_root_agent)  # type: ignore[method-assign]
+    registry.reject_provider = MagicMock(wraps=registry.reject_provider)  # type: ignore[method-assign]
+
+    config = SimpleNamespace(
+        root_agent="builtin.quick_thinker",
+        force_selector="",
+        default_effort_credits=10.0,
+        prompts={"system": "immutable-builtin-prompt"},
+    )
+    config_before = copy.deepcopy(vars(config))
+    prompts_before = copy.deepcopy(config.prompts)
+    use_as_before = dict(_USE_AS)
+    formula_before = RERANK_FORMULA
+    root_before = registry._root_agent
+    providers_before = dict(registry._providers)
+
+    past_case_harness.provider.ctx = SimpleNamespace(
+        agent_registry=registry,
+        config=config,
+        prompts=config.prompts,
+    )
+
+    write_commands: list[Any] = []
+    original_transact = past_case_harness.store.transact
+
+    async def _spy_transact(commands: Any) -> None:
+        write_commands.append(list(commands))
+        await original_transact(commands)
+
+    past_case_harness.store.transact = _spy_transact  # type: ignore[method-assign]
+
+    result = await past_case_harness.search("formalized task", limit=5)
+    assert result.success
+    assert len(result.data["cases"]) >= 2
+
+    # No durable store writes from the retrieve path (bundles are read-only).
+    assert write_commands == []
+
+    registry.replace_provider.assert_not_called()
+    registry.set_root_agent.assert_not_called()
+    registry.reject_provider.assert_not_called()
+    assert registry._root_agent == root_before
+    assert registry._providers == providers_before
+
+    assert vars(config) == config_before
+    assert config.prompts == prompts_before
+    assert config.prompts is past_case_harness.provider.ctx.prompts
+
+    assert dict(past_cases_mod._USE_AS) == use_as_before
+    assert past_cases_mod.RERANK_FORMULA == formula_before
+    assert result.data["rerank_formula"] == formula_before
