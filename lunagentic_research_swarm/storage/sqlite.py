@@ -78,6 +78,18 @@ class SummaryLayer:
     supplied_context: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PastCaseBundle:
+    """Lean past-case payload for ``builtin.past_cases`` (one lock round-trip)."""
+
+    task_id: str
+    created_at: float
+    formalized_task: FormalizedTask | None
+    summaries: tuple[Mapping[str, Any], ...]
+    reports: tuple[Mapping[str, Any], ...]
+    feedback: tuple[Mapping[str, Any], ...]
+
+
 ACTIVE_STATUSES = (
     TaskStatus.FORMALIZING,
     TaskStatus.RUNNING,
@@ -86,6 +98,9 @@ ACTIVE_STATUSES = (
     TaskStatus.PAUSED,
     TaskStatus.FINALIZING,
 )
+
+# Non-paused active statuses used by `/swarm` overview "running" listings.
+BUSY_STATUSES = tuple(status for status in ACTIVE_STATUSES if status is not TaskStatus.PAUSED)
 
 
 class MissingStoreTargetError(LookupError):
@@ -209,6 +224,14 @@ class SQLiteStateStore:
 
     async def load_summary_layer(self, task_id: str) -> SummaryLayer | None:
         return await self._call(self._load_summary_layer_sync, task_id)
+
+    async def load_past_case_bundles(self, task_ids: Sequence[str]) -> dict[str, PastCaseBundle]:
+        """Batch-load the lean fields past_cases needs under one store lock."""
+
+        unique = tuple(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+        if not unique:
+            return {}
+        return await self._call(self._load_past_case_bundles_sync, unique)
 
     async def mark_active_rounds_interrupted(self, now: float) -> int:
         return await self._call(self._mark_active_rounds_interrupted_sync, now)
@@ -995,6 +1018,79 @@ class SQLiteStateStore:
             feedback=tuple(feedback),
             supplied_context=tuple(supplied_context),
         )
+
+    def _load_past_case_bundles_sync(self, task_ids: tuple[str, ...]) -> dict[str, PastCaseBundle]:
+        connection = self._require_connection()
+        placeholders = ",".join("?" * len(task_ids))
+        task_rows = connection.execute(
+            f"""
+            SELECT task_id, formalized_text, formalized_sha256, created_at
+            FROM tasks
+            WHERE task_id IN ({placeholders})
+            """,
+            task_ids,
+        ).fetchall()
+        if not task_rows:
+            return {}
+
+        report_rows = connection.execute(
+            f"""
+            SELECT report_id, task_id, round_id, epoch, kind, text, status,
+                   running_branch_count, stats_json, created_at
+            FROM reports
+            WHERE task_id IN ({placeholders})
+            ORDER BY created_at, report_id
+            """,
+            task_ids,
+        ).fetchall()
+        summary_rows = connection.execute(
+            f"""
+            SELECT summary_id, task_id, round_id, branch_id, kind, report_epoch,
+                   text, status, error_code, created_at
+            FROM summaries
+            WHERE task_id IN ({placeholders})
+            ORDER BY created_at, summary_id
+            """,
+            task_ids,
+        ).fetchall()
+        feedback_rows = connection.execute(
+            f"""
+            SELECT feedback_id, task_id, round_id, disposition, payload_json, created_at
+            FROM feedback_events
+            WHERE task_id IN ({placeholders})
+            ORDER BY created_at, feedback_id
+            """,
+            task_ids,
+        ).fetchall()
+
+        reports_by_task: dict[str, list[Mapping[str, Any]]] = {str(row["task_id"]): [] for row in task_rows}
+        for row in report_rows:
+            item = dict(row)
+            item["stats"] = _freeze_json(json.loads(item.pop("stats_json")))
+            reports_by_task.setdefault(str(row["task_id"]), []).append(MappingProxyType(item))
+
+        summaries_by_task: dict[str, list[Mapping[str, Any]]] = {str(row["task_id"]): [] for row in task_rows}
+        for row in summary_rows:
+            summaries_by_task.setdefault(str(row["task_id"]), []).append(MappingProxyType(dict(row)))
+
+        feedback_by_task: dict[str, list[Mapping[str, Any]]] = {str(row["task_id"]): [] for row in task_rows}
+        for row in feedback_rows:
+            item = dict(row)
+            item["payload"] = _freeze_json(json.loads(item.pop("payload_json")))
+            feedback_by_task.setdefault(str(row["task_id"]), []).append(MappingProxyType(item))
+
+        bundles: dict[str, PastCaseBundle] = {}
+        for row in task_rows:
+            task_id = str(row["task_id"])
+            bundles[task_id] = PastCaseBundle(
+                task_id=task_id,
+                created_at=float(row["created_at"]),
+                formalized_task=self._formalized_task(row["formalized_text"], row["formalized_sha256"]),
+                summaries=tuple(summaries_by_task.get(task_id, ())),
+                reports=tuple(reports_by_task.get(task_id, ())),
+                feedback=tuple(feedback_by_task.get(task_id, ())),
+            )
+        return bundles
 
     def _mark_active_rounds_interrupted_sync(self, now: float) -> int:
         connection = self._require_connection()

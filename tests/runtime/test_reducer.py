@@ -7,6 +7,7 @@ import pytest
 from lunagentic_research_swarm.models import TaskSnapshot, TaskStatus
 from lunagentic_research_swarm.runtime.events import (
     AllInflightSettled,
+    FinalEpochCommitted,
     FinalReportCompleted,
     FinalReportFailed,
     FormalizationFailed,
@@ -340,13 +341,15 @@ def test_report_completed_with_empty_leaves_enters_finalizing() -> None:
     assert transition.next_state.status is TaskStatus.FINALIZING
 
 
-def test_report_deadline_with_final_kind_enters_finalizing() -> None:
+def test_report_deadline_with_empty_leaves_enters_finalizing() -> None:
+    """Wall-clock deadline with no live leaves opens a FINAL epoch (not INTERMEDIATE)."""
+
     state = RuntimeState(
         "task-1",
         TaskStatus.RUNNING,
         generation=0,
         active_round_id="round-1",
-        active_leaves={"stale-leaf": 1.0},
+        active_leaves={},
     )
     event = ReportDeadlineReached(
         "evt-deadline",
@@ -354,7 +357,6 @@ def test_report_deadline_with_final_kind_enters_finalizing() -> None:
         "round-1",
         0,
         epoch=1,
-        report_kind="FINAL",
     )
 
     transition = reduce_event(state, event)
@@ -365,7 +367,37 @@ def test_report_deadline_with_final_kind_enters_finalizing() -> None:
     assert transition.effects[0].payload["kind"] == "FINAL"
 
 
-def test_report_deadline_commits_epoch_while_already_finalizing() -> None:
+def test_final_report_completed_requires_finalizing() -> None:
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.REPORTING, generation=0, active_round_id="round-1", report_epoch=1),
+        FinalReportCompleted("evt-final", "task-1", "round-1", 0, report_id="rpt-1"),
+    )
+    assert transition.error is not None
+    assert transition.error.code == "invalid_state"
+
+
+def test_final_epoch_committed_same_epoch_from_reporting() -> None:
+    """Post-synthesis same-epoch FINAL freeze reuses FINALIZING entry (no OpenReportEpoch)."""
+
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.REPORTING, generation=0, active_round_id="round-1", report_epoch=1),
+        FinalEpochCommitted("evt-commit", "task-1", "round-1", 0, epoch=1),
+    )
+    assert transition.next_state.status is TaskStatus.FINALIZING
+    assert transition.next_state.report_epoch == 1
+    assert transition.effects == ()
+
+
+def test_stop_accepted_from_finalizing() -> None:
+    transition = reduce_event(
+        RuntimeState("task-1", TaskStatus.FINALIZING, generation=0, active_round_id="round-1"),
+        StopRequested("evt-stop", "task-1", "round-1", 0),
+    )
+    assert transition.next_state.status is TaskStatus.STOPPED
+    assert transition.next_state.generation == 1
+
+
+def test_final_epoch_committed_bumps_epoch_while_already_finalizing() -> None:
     state = RuntimeState(
         "task-1",
         TaskStatus.FINALIZING,
@@ -374,13 +406,12 @@ def test_report_deadline_commits_epoch_while_already_finalizing() -> None:
         report_epoch=0,
         active_leaves={},
     )
-    event = ReportDeadlineReached(
-        "evt-deadline",
+    event = FinalEpochCommitted(
+        "evt-commit",
         "task-1",
         "round-1",
         0,
         epoch=1,
-        report_kind="FINAL",
     )
 
     transition = reduce_event(state, event)

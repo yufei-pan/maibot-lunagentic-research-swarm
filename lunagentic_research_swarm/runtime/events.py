@@ -298,11 +298,21 @@ class BranchFinalized(Event):
 @_register
 @dataclass(frozen=True, slots=True)
 class ReportDeadlineReached(Event):
+    """Wall-clock report budget elapsed; opens the next report epoch."""
+
     epoch: int | None = None
-    # ``FINAL`` commits a final-report epoch as FINALIZING; ``INTERMEDIATE`` or
-    # unset follows the normal deadline → REPORTING path (empty leaves alone
-    # also select FINAL so terminal-only wrap-up stays deadline-free).
-    report_kind: str | None = None
+
+
+@_register
+@dataclass(frozen=True, slots=True)
+class FinalEpochCommitted(Event):
+    """Commit FINALIZING + optional report_epoch after final synthesis (not a deadline).
+
+    ``epoch == current``: same-epoch FINAL freeze (status only).
+    ``epoch == current + 1``: bump durable report_epoch without reopening a frontier.
+    """
+
+    epoch: int | None = None
 
 
 @_register
@@ -412,7 +422,7 @@ class PersistenceFailed(Event):
 RuntimeEvent: TypeAlias = (
     TaskCreated | FormalizationSucceeded | FormalizationFailed | AgentCallRequested | AgentCallReserved | AgentCallCompleted
     | AgentCallFailed | ProcedureBatchCompleted | ChildMaterialized | SummaryCompleted | SummaryFailed | BranchCheckpointed | BranchFinalized
-    | ReportDeadlineReached | GraceExpired | ReportCompleted | FinalReportCompleted | FinalReportFailed | AllInflightSettled
+    | ReportDeadlineReached | FinalEpochCommitted | GraceExpired | ReportCompleted | FinalReportCompleted | FinalReportFailed | AllInflightSettled
     | PauseRequested | PauseExpired | PauseExpiryReached | ContinueRequested | StopRequested | ContextSupplied | FeedbackSubmitted | OutboxDelivered | PersistenceFailed
 )
 

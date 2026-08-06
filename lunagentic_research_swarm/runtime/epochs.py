@@ -11,13 +11,21 @@ import asyncio
 import json
 import logging
 import re
-import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from lunagentic_research_swarm.llm.summarizer import BranchFinalizationRequest, SummaryResult, TaskFinalizationRequest
-from lunagentic_research_swarm.models import BranchLifecycle, BranchRuntime, FormalizedTask, ReportKind, SummaryKind
+from lunagentic_research_swarm.models import (
+    BranchLifecycle,
+    BranchRuntime,
+    FormalizedTask,
+    ReportKind,
+    SummaryKind,
+    new_outbox_id,
+    new_report_id,
+    new_summary_id,
+)
 from lunagentic_research_swarm.reporting import (
     CoverageSet,
     CoverageSummary,
@@ -31,10 +39,6 @@ from lunagentic_research_swarm.statistics import StatisticsService, compute_task
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
 
 _LOG = logging.getLogger(__name__)
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 def _history_copy(messages: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
@@ -125,6 +129,9 @@ class ReportCoordinator:
         clock: Callable[[], float],
         launch_delegation: Callable[[str, Mapping[str, Any]], Awaitable[None] | None] | None = None,
         broadcast_summary: Callable[[CoverageSummary], Awaitable[None] | None] | None = None,
+        release_held_delegations: (
+            Callable[[str, Sequence[Mapping[str, Any]]], Awaitable[None] | None] | None
+        ) = None,
         on_synthesis_complete: Callable[[ReportRecord], Awaitable[None] | None] | None = None,
         time_budget_seconds: int = 120,
         grace_period_seconds: int = 60,
@@ -139,7 +146,9 @@ class ReportCoordinator:
         self.task_id, self.round_id, self.formalized_task = task_id, round_id, formalized_task
         self.branches = dict(branches)
         self.store, self.summarizer, self.clock = store, summarizer, clock
-        self.launch_delegation, self.broadcast_summary = launch_delegation, broadcast_summary
+        self.launch_delegation = launch_delegation
+        self.broadcast_summary = broadcast_summary
+        self.release_held_delegations = release_held_delegations
         self.on_synthesis_complete = on_synthesis_complete
         self.time_budget_seconds, self.grace_period_seconds = time_budget_seconds, grace_period_seconds
         self.credit_pool = float(credit_pool)
@@ -357,7 +366,7 @@ class ReportCoordinator:
                 if frozen_kind is ReportKind.FINAL:
                     body = "最终报告总结器不可用；以下为已提交终结 coverage。"
         created_at = float(self.clock())
-        report_id = _new_id("rpt")
+        report_id = new_report_id()
         credit_balance = sum(
             branch.credits
             for branch in self.branches.values()
@@ -421,7 +430,7 @@ class ReportCoordinator:
         if branch_id not in self.branches:
             raise KeyError(branch_id)
         kind = SummaryKind.CHECKPOINT if checkpoint else SummaryKind.BRANCH_FINAL
-        summary_id = _new_id("sum")
+        summary_id = new_summary_id()
         result = await self.summarizer.finalize_branch(
             BranchFinalizationRequest(self.formalized_task, _history_copy(history), checkpoint=checkpoint)
         )
@@ -539,7 +548,7 @@ class ReportCoordinator:
                 StoreCommand(
                     "insert_outbox",
                     {
-                        "outbox_id": _new_id("out"),
+                        "outbox_id": new_outbox_id(),
                         "task_id": self.task_id,
                         "round_id": self.round_id,
                         "report_id": report_id,
@@ -601,7 +610,12 @@ class ReportCoordinator:
             branch = self.branches.get(branch_id)
             if branch is not None and branch.lifecycle is BranchLifecycle.WAITING_REPORT_WITH_CHECKPOINT:
                 branch.lifecycle = BranchLifecycle.READY
-            await self._launch(delegations, branch_id, report_epoch=self.current_epoch.epoch + 1)
+            if self.release_held_delegations is not None:
+                returned = self.release_held_delegations(branch_id, delegations)
+                if hasattr(returned, "__await__"):
+                    await returned
+            else:
+                await self._launch(delegations, branch_id, report_epoch=self.current_epoch.epoch + 1)
 
     async def _launch(
         self,

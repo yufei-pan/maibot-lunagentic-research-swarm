@@ -128,7 +128,7 @@ class FairScheduler:
         self._global_llm_active = 0
         self._task_llm_active: Counter[str] = Counter()
         self._task_procedure_active: Counter[str] = Counter()
-        self._errors: list[dict[str, str]] = []
+        self._errors: deque[dict[str, str]] = deque(maxlen=32)
 
         self._started = False
         self._closing = False
@@ -136,6 +136,7 @@ class FairScheduler:
         self._wake: asyncio.Event | None = None
         self._dispatcher: asyncio.Task[Any] | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._adapted_signatures: dict[int, inspect.Signature | None] = {}
 
     @staticmethod
     def _validate_limit(value: int, name: str) -> int:
@@ -439,6 +440,32 @@ class FairScheduler:
         else:
             await asyncio.wait_for(_wait(), timeout=timeout)
 
+    def task_inflight_count(self, task_id: str) -> int:
+        """Active work plus pause-runnable queued work for one task."""
+
+        task_id = str(task_id)
+        active = sum(1 for item in self._active.values() if str(item.entry.effect.task_id) == task_id)
+        return active + int(self._pause_runnable_queued_counts().get(task_id, 0))
+
+    async def wait_task_idle(self, task_id: str, timeout: float | None = None) -> None:
+        """Wait until a paused task has no active or pause-runnable queued work."""
+
+        task_id = str(task_id)
+
+        async def _wait() -> None:
+            while self.task_inflight_count(task_id):
+                if self._wake is None:
+                    await asyncio.sleep(0)
+                    continue
+                self._wake.clear()
+                if self.task_inflight_count(task_id):
+                    await self._wake.wait()
+
+        if timeout is None:
+            await _wait()
+        else:
+            await asyncio.wait_for(_wait(), timeout=timeout)
+
     async def _dispatch_loop(self) -> None:
         assert self._wake is not None
         try:
@@ -508,11 +535,18 @@ class FairScheduler:
         if inspect.isawaitable(value):
             await value
 
-    @staticmethod
-    def _call_adapted(target: Callable[..., Any], effect: Effect, token: GenerationToken) -> Any:
-        try:
-            signature = inspect.signature(target)
-        except (TypeError, ValueError):
+    def _signature_for(self, target: Callable[..., Any]) -> inspect.Signature | None:
+        key = id(target)
+        if key not in self._adapted_signatures:
+            try:
+                self._adapted_signatures[key] = inspect.signature(target)
+            except (TypeError, ValueError):
+                self._adapted_signatures[key] = None
+        return self._adapted_signatures[key]
+
+    def _call_adapted(self, target: Callable[..., Any], effect: Effect, token: GenerationToken) -> Any:
+        signature = self._signature_for(target)
+        if signature is None:
             return target(effect, token)
         for args, kwargs in (
             ((effect,), {"generation": token}),
@@ -527,11 +561,9 @@ class FairScheduler:
             return target(*args, **kwargs)
         raise TypeError("worker 签名必须接受 effect 或 effect+generation token")
 
-    @staticmethod
-    def _call_adapted_callback(callback: Callable[..., Any], effect: Effect, result: Any, token: GenerationToken) -> Any:
-        try:
-            signature = inspect.signature(callback)
-        except (TypeError, ValueError):
+    def _call_adapted_callback(self, callback: Callable[..., Any], effect: Effect, result: Any, token: GenerationToken) -> Any:
+        signature = self._signature_for(callback)
+        if signature is None:
             return callback(effect, result, token)
         for args in ((effect, result, token), (effect, result), (result,)):
             try:

@@ -36,6 +36,7 @@ from lunagentic_research_swarm.runtime.events import (
     BranchFinalized,
     ChildMaterialized,
     ContinueRequested,
+    FinalEpochCommitted,
     FinalReportCompleted,
     FinalReportFailed,
     FormalizationFailed,
@@ -580,6 +581,49 @@ def _transition_status(
     return Transition(next_state, tuple(commands), tuple(effects))
 
 
+def _resolve_report_epoch_update(state: Any, requested: int | None) -> tuple[int | None, str | None]:
+    """Map a requested epoch onto (report_epoch change, ignore reason).
+
+    ``None`` / current → no counter change.
+    ``current + 1`` → bump.
+    Otherwise → ignore reason for stale/future.
+    """
+
+    current = _state_report_epoch(state)
+    if requested is None or requested == current:
+        return None, None
+    if requested == current + 1:
+        return requested, None
+    if requested <= current:
+        return None, "stale_report_epoch"
+    return None, "future_report_epoch"
+
+
+def _enter_finalizing(
+    state: Any,
+    event: RuntimeEvent,
+    *,
+    report_epoch: int | None = None,
+    open_epoch: bool = False,
+    extra_commands: Sequence[StoreCommand] = (),
+    **state_changes: Any,
+) -> Transition:
+    """Shared FINALIZING entry used by wall-clock FINAL deadlines and post-synthesis commits."""
+
+    changes: dict[str, Any] = dict(state_changes)
+    if report_epoch is not None:
+        changes["report_epoch"] = report_epoch
+    effects: tuple[Effect, ...] = ()
+    if open_epoch:
+        epoch = report_epoch if report_epoch is not None else _state_report_epoch(state)
+        effects = (
+            _effect(OpenReportEpoch, event, priority="barrier", payload={"epoch": epoch, "kind": "FINAL"}),
+        )
+    return _transition_status(
+        state, event, TaskStatus.FINALIZING, effects=effects, extra_commands=extra_commands, **changes
+    )
+
+
 def _formalization_succeeded(state: Any, event: FormalizationSucceeded) -> Transition:
     try:
         formalized = FormalizedTask(event.formalized_text, event.formalized_sha256)
@@ -818,7 +862,14 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         )
 
     if isinstance(event, StopRequested):
-        if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.PAUSED}:
+        if status not in {
+            TaskStatus.FORMALIZING,
+            TaskStatus.RUNNING,
+            TaskStatus.REPORTING,
+            TaskStatus.PAUSING,
+            TaskStatus.PAUSED,
+            TaskStatus.FINALIZING,
+        }:
             return _invalid(state, event, "StopRequested 只能用于活跃 round")
         next_generation = _state_generation(state) + 1
         commands = (
@@ -839,34 +890,33 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         )
 
     if isinstance(event, ReportDeadlineReached):
+        if status is not TaskStatus.RUNNING:
+            return _invalid(state, event, "ReportDeadlineReached 只能用于 RUNNING")
         current_epoch = _state_report_epoch(state)
         epoch = event.epoch if event.epoch is not None else current_epoch + 1
         if epoch <= current_epoch:
             return Transition.from_ignored(state, reason="stale_report_epoch")
         if epoch != current_epoch + 1:
             return Transition.from_ignored(state, reason="future_report_epoch")
-        report_kind = str(getattr(event, "report_kind", None) or "").upper() or None
-        leaves_empty = not _state_leaves(state)
-        is_final = report_kind == "FINAL" or (report_kind is None and leaves_empty)
-        if report_kind == "INTERMEDIATE":
-            is_final = False
-        if status is TaskStatus.FINALIZING:
-            # Synthesis already moved the task into FINALIZING (last leaf done);
-            # only commit the final epoch counter before FinalReportCompleted.
-            if not is_final:
-                return _invalid(state, event, "FINALIZING 时 ReportDeadlineReached 只能提交最终报告 epoch")
-            return _transition_status(state, event, TaskStatus.FINALIZING, report_epoch=epoch)
-        if status is not TaskStatus.RUNNING:
-            return _invalid(state, event, "ReportDeadlineReached 只能用于 RUNNING 或 FINALIZING")
-        if is_final:
-            effects = (
-                _effect(OpenReportEpoch, event, priority="barrier", payload={"epoch": epoch, "kind": "FINAL"}),
-            )
-            return _transition_status(state, event, TaskStatus.FINALIZING, effects=effects, report_epoch=epoch)
+        # Empty frontier at deadline → final wrap-up; otherwise intermediate report.
+        if not _state_leaves(state):
+            return _enter_finalizing(state, event, report_epoch=epoch, open_epoch=True)
         effects = (
             _effect(OpenReportEpoch, event, priority="barrier", payload={"epoch": epoch, "kind": "INTERMEDIATE"}),
         )
         return _transition_status(state, event, TaskStatus.REPORTING, effects=effects, report_epoch=epoch)
+
+    if isinstance(event, FinalEpochCommitted):
+        # Post-synthesis bookkeeping (and same-epoch FINAL freeze). Reuses
+        # `_enter_finalizing` so wall-clock FINAL and this path stay aligned.
+        if status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.FINALIZING}:
+            return _invalid(state, event, "FinalEpochCommitted 只能用于 RUNNING/REPORTING/FINALIZING")
+        epoch_update, ignore_reason = _resolve_report_epoch_update(state, event.epoch)
+        if ignore_reason is not None:
+            return Transition.from_ignored(state, reason=ignore_reason)
+        if status is TaskStatus.FINALIZING and epoch_update is None:
+            return Transition(state)
+        return _enter_finalizing(state, event, report_epoch=epoch_update, open_epoch=False)
 
     if isinstance(event, ReportCompleted):
         if status is not TaskStatus.REPORTING:
@@ -874,7 +924,7 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         # Intermediate report done with no live leaves: enter FINALIZING so the
         # immediate follow-up FINAL epoch is observable (design §13.4).
         if not _state_leaves(state):
-            return _transition_status(state, event, TaskStatus.FINALIZING)
+            return _enter_finalizing(state, event, open_epoch=False)
         return _transition_status(state, event, TaskStatus.RUNNING)
 
     if isinstance(event, GraceExpired):
@@ -893,8 +943,8 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         return Transition(state)
 
     if isinstance(event, FinalReportCompleted):
-        if status not in {TaskStatus.FINALIZING, TaskStatus.REPORTING}:
-            return _invalid(state, event, "FinalReportCompleted 只能用于活跃报告 round")
+        if status is not TaskStatus.FINALIZING:
+            return _invalid(state, event, "FinalReportCompleted 只能用于 FINALIZING")
         return _transition_status(
             state,
             event,
@@ -903,8 +953,8 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
         )
 
     if isinstance(event, FinalReportFailed):
-        if status not in {TaskStatus.FINALIZING, TaskStatus.REPORTING}:
-            return _invalid(state, event, "FinalReportFailed 只能用于活跃报告 round")
+        if status is not TaskStatus.FINALIZING:
+            return _invalid(state, event, "FinalReportFailed 只能用于 FINALIZING")
         return _transition_status(
             state,
             event,
@@ -1278,11 +1328,24 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             except (TypeError, ValueError) as exc:
                 return _invalid(next_state, event, f"ProcedureBatchCompleted delegation 无效：{exc}")
             next_state = _replace_state(next_state, agent_calls_started=calls_after_reservation)
-            return Transition(
-                next_state,
-                commands=tuple(commands),
-                effects=materialization_effects,
-            )
+            effects: list[Effect] = list(materialization_effects)
+            if status is TaskStatus.REPORTING:
+                # Spec §13.1: grace-window return also needs an immediate frontier
+                # checkpoint clone; children already materialize above.
+                effects.append(
+                    _effect(
+                        PerformBranchSummary,
+                        event,
+                        priority="barrier",
+                        payload={
+                            "branch_id": event.branch_id,
+                            "reason": "grace_clone",
+                            "held_delegations": (),
+                            "messages": tuple(event.parent_messages),
+                        },
+                    )
+                )
+            return Transition(next_state, commands=tuple(commands), effects=tuple(effects))
         return Transition(
             next_state,
             commands=tuple(commands),
@@ -1360,14 +1423,14 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
                 "finalized_at": event.occurred_at.timestamp(),
             },
         )
-        # Spec §13.4: when every active leaf is finalized, enter FINALIZING
-        # immediately.  Do not leave REPORTING (an intermediate epoch may still
-        # be committing); only RUNNING → FINALIZING here.
+        # Spec §13.4: last leaf finalized → FINALIZING.  During REPORTING an
+        # intermediate epoch may still be committing, so only leave RUNNING here;
+        # ReportCompleted / FinalEpochCommitted cover the REPORTING wrap-up paths.
         if not leaves and status is TaskStatus.RUNNING:
-            return _transition_status(
+            return _enter_finalizing(
                 state,
                 event,
-                TaskStatus.FINALIZING,
+                open_epoch=False,
                 extra_commands=(settle,),
                 active_leaves=leaves,
                 credit_pool=pool,

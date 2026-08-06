@@ -315,27 +315,25 @@ async def _past_cases(ctx: Any, arguments: Mapping[str, Any]) -> ProcedureResult
                 bucket["source_ids"].append(source_id)
 
     cases: list[dict[str, Any]] = []
+    bundles = await store.load_past_case_bundles(tuple(by_task))
     for task_id, bucket in by_task.items():
-        layer = await store.load_summary_layer(task_id)
-        if layer is None:
+        bundle = bundles.get(task_id)
+        if bundle is None:
             continue
-        created_at = None
-        task_row = await store.load_task(task_id)
-        if task_row is not None:
-            created_at = float(task_row.created_at)
-        if parsed["created_after"] is not None and created_at is not None and created_at < parsed["created_after"]:
+        created_at = float(bundle.created_at)
+        if parsed["created_after"] is not None and created_at < parsed["created_after"]:
             continue
-        if parsed["created_before"] is not None and created_at is not None and created_at > parsed["created_before"]:
+        if parsed["created_before"] is not None and created_at > parsed["created_before"]:
             continue
 
-        feedback = _latest_feedback(layer.feedback)
+        feedback = _latest_feedback(bundle.feedback)
         status = _validation_status(feedback)
         confirmed = _outcome_confirmed(feedback)
         comps = _rerank_components(float(bucket["similarity"]), status, outcome_confirmed=confirmed)
 
         formalized = ""
-        if layer.formalized_task is not None:
-            formalized = str(layer.formalized_task.text)
+        if bundle.formalized_task is not None:
+            formalized = str(bundle.formalized_task.text)
 
         payload = _payload_of(feedback)
         corrections = list(payload.get("corrections") or []) if isinstance(payload.get("corrections"), list) else []
@@ -343,7 +341,7 @@ async def _past_cases(ctx: Any, arguments: Mapping[str, Any]) -> ProcedureResult
 
         fingerprints: dict[str, Any] = {}
         # 报告 stats / 生命周期里若有指纹则透传
-        for report in layer.reports:
+        for report in bundle.reports:
             stats = report.get("stats") if isinstance(report, Mapping) else None
             if isinstance(stats, Mapping):
                 for key in ("agent_fingerprint", "model_fingerprint", "procedure_fingerprint"):
@@ -364,7 +362,7 @@ async def _past_cases(ctx: Any, arguments: Mapping[str, Any]) -> ProcedureResult
                         "text": row.get("text"),
                         "status": row.get("status"),
                     }
-                    for row in layer.summaries
+                    for row in bundle.summaries
                 ],
                 "reports": [
                     {
@@ -373,7 +371,7 @@ async def _past_cases(ctx: Any, arguments: Mapping[str, Any]) -> ProcedureResult
                         "text": row.get("text"),
                         "status": row.get("status"),
                     }
-                    for row in layer.reports
+                    for row in bundle.reports
                 ],
                 "feedback_disposition": (_normalize_disposition(feedback.get("disposition")) if feedback else None),
                 "corrections": corrections,

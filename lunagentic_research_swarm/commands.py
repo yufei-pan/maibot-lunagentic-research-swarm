@@ -8,8 +8,11 @@ from typing import Any
 
 from maibot_sdk import Command
 
+from lunagentic_research_swarm.storage.sqlite import BUSY_STATUSES
+
 _FETCH_PROCEDURE_ID = "fetch_url.fetch"
 _FETCH_PROVIDER_ID = "com.0-hz.fetch-url"
+_BUSY_STATUS_VALUES = frozenset(status.value for status in BUSY_STATUSES)
 
 
 def _groups(kwargs: Mapping[str, Any]) -> dict[str, str]:
@@ -600,7 +603,7 @@ class SwarmCommandsMixin:
                     item
                     for item in tasks
                     if isinstance(item, Mapping)
-                    and str(item.get("status") or "") in {"FORMALIZING", "RUNNING", "REPORTING", "PAUSING", "FINALIZING"}
+                    and str(item.get("status") or "") in _BUSY_STATUS_VALUES
                 ]
                 health = services.health() if services is not None and hasattr(services, "health") else {}
                 root = ""

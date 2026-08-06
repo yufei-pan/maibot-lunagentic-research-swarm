@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TypeVar
 
 from lunagentic_research_swarm.config import EmbeddingSection
@@ -367,11 +368,67 @@ class VectorIndex:
         return await self._store.run_locked(_list)
 
     async def enqueue(self, *, source_kind: str, source_id: str) -> VectorOpResult:
-        # 探测/写入在锁内；mismatch auto-rebuild 调度为后台任务（不占 `_lock` 做全量
-        # re-embed）。调度前先置 `_rebuilding`，并发 enqueue 观察后快速失败；触发方
-        # 立即返回 `vector_index_rebuilding`，不 await 整库重建。
+        # Hold `_lock` only around metadata/job mutations. Host embedding and
+        # empty-index bootstrap run outside the lock (auto-rebuild already does).
         async with self._lock:
-            result, pending = await self._enqueue_unlocked(source_kind=source_kind, source_id=source_id)
+            prepared = await self._enqueue_prepare(source_kind=source_kind, source_id=source_id)
+        if prepared.kind == "done":
+            result, pending = prepared.result, prepared.pending
+            if pending is not None:
+                async with self._lock:
+                    selector, job_id, pending_kind, pending_id = pending
+                    self._schedule_auto_rebuild(
+                        selector,
+                        job_id=job_id,
+                        source_kind=pending_kind,
+                        source_id=pending_id,
+                    )
+                return VectorOpResult.fail(
+                    LRSError(
+                        VECTOR_INDEX_REBUILDING,
+                        "向量索引正在重建",
+                        {"queued": True, "job_id": pending[1], "source_id": pending[3]},
+                    )
+                )
+            return result
+        if prepared.kind == "bootstrap":
+            job_id = prepared.job_id
+            try:
+                rebuild = await self._rebuild_unlocked(force=True)
+            except EmbeddingGenerationMismatch as exc:
+                await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
+                return VectorOpResult.fail(exc)
+            except VectorRebuildFailed as exc:
+                await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
+                return VectorOpResult.fail(exc)
+            if not rebuild.success:
+                await self._fail_job(
+                    job_id,
+                    rebuild.error.code if rebuild.error else "rebuild_failed",
+                    rebuild.error.message if rebuild.error else "重建失败",
+                )
+                return rebuild
+            await self._complete_job(job_id, generation=int((await self.status()).active_generation or 0))
+            return VectorOpResult.ok(code="indexed")
+
+        assert prepared.kind == "embed"
+        try:
+            vectors, actual_model = await self._embed_texts([prepared.source.text], selector=prepared.selector)
+        except EmbeddingGenerationMismatch as exc:
+            await self._fail_job(prepared.job_id, exc.code, exc.message, metadata=exc.metadata)
+            return VectorOpResult.fail(exc)
+
+        async with self._lock:
+            result, pending = await self._enqueue_after_embed(
+                job_id=prepared.job_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                source=prepared.source,
+                selector=prepared.selector,
+                status=prepared.status,
+                vectors=vectors,
+                actual_model=actual_model,
+            )
             if pending is None:
                 return result
             selector, job_id, pending_kind, pending_id = pending
@@ -391,7 +448,11 @@ class VectorIndex:
 
     async def rebuild(self, *, force: bool = False) -> VectorOpResult:
         await self._await_background_rebuild()
+        # Do not refuse on `_rebuilding` alone: a stranded `building` candidate
+        # leaves that flag true and force=False must still clear it.
         async with self._lock:
+            self._rebuilding = True
+        try:
             try:
                 result = await self._rebuild_unlocked(force=force)
             except VectorRebuildFailed as exc:
@@ -409,6 +470,10 @@ class VectorIndex:
             elif result.error is not None:
                 self._last_rebuild_error = result.error
             return result
+        finally:
+            async with self._lock:
+                status_after = await self.status()
+                self._rebuilding = bool(status_after.candidate_active)
 
     async def search(self, query: str, *, limit: int = 10) -> VectorOpResult:
         status = await self.status()
@@ -479,16 +544,19 @@ class VectorIndex:
 
         await self._await_background_rebuild()
         async with self._lock:
+            self._rebuilding = True
+            status = await self.status()
+            needs_force = bool(status.candidate_active or status.rebuilding)
+            empty_ok = status.active_generation is None
+        try:
             try:
-                status = await self.status()
-                if status.candidate_active or self._rebuilding:
-                    # 指纹仍匹配时 force=False 即可清 stranded，避免无谓全量重嵌
+                if needs_force:
                     soft = await self._rebuild_unlocked(force=False)
                     if soft.success and not (await self.status()).candidate_active:
                         result = soft
                     else:
                         result = await self._rebuild_unlocked(force=True)
-                elif status.active_generation is None:
+                elif empty_ok:
                     sources = await self._list_indexable_sources()
                     if not sources:
                         result = VectorOpResult.ok(code="empty")
@@ -511,6 +579,10 @@ class VectorIndex:
             elif result.error is not None:
                 self._last_rebuild_error = result.error
             return result
+        finally:
+            async with self._lock:
+                status_after = await self.status()
+                self._rebuilding = bool(status_after.candidate_active)
 
     async def wait_rebuild(self, timeout: float | None = None) -> None:
         """测试/运维：等待后台 auto-rebuild 结束（若有）。"""
@@ -609,10 +681,10 @@ class VectorIndex:
                 self._rebuilding = False
                 _LOG.exception("LRS 向量后台重建收尾读取 status 失败")
 
-    async def _enqueue_unlocked(
+    async def _enqueue_prepare(
         self, *, source_kind: str, source_id: str
-    ) -> tuple[VectorOpResult, tuple[ModelSelector, str, str, str] | None]:
-        """返回 (结果, 待 auto-rebuild 上下文)。仅 fingerprint/维度/schema mismatch 才请求重建。"""
+    ) -> Any:
+        """Lock-held enqueue setup. Returns a phase object for the outer method."""
 
         now = time.time()
         job_id = f"vec_{uuid.uuid4().hex}"
@@ -627,51 +699,59 @@ class VectorIndex:
         source = await self._resolve_source(source_kind, source_id)
         if source is None:
             await self._fail_job(job_id, "source_not_found", "索引源不存在或不在白名单")
-            return VectorOpResult.fail(LRSError("source_not_found", "索引源不存在或不在白名单")), None
+            return SimpleNamespace(
+                kind="done",
+                result=VectorOpResult.fail(LRSError("source_not_found", "索引源不存在或不在白名单")),
+                pending=None,
+            )
 
         try:
             selector = self._require_task_selector()
         except LRSError as exc:
             await self._fail_job(job_id, exc.code, exc.message)
-            return VectorOpResult.fail(exc), None
+            return SimpleNamespace(kind="done", result=VectorOpResult.fail(exc), pending=None)
 
         status = await self.status()
         if status.rebuilding:
             await self._fail_job(job_id, VECTOR_INDEX_REBUILDING, "向量索引正在重建")
-            return (
-                VectorOpResult.fail(LRSError(VECTOR_INDEX_REBUILDING, "向量索引正在重建")),
-                None,
+            return SimpleNamespace(
+                kind="done",
+                result=VectorOpResult.fail(LRSError(VECTOR_INDEX_REBUILDING, "向量索引正在重建")),
+                pending=None,
             )
 
         if status.active_generation is None:
-            # 空库：第一条白名单源触发 generation（失败返回结果，不 raise）
-            try:
-                rebuild = await self._rebuild_unlocked(force=True)
-            except EmbeddingGenerationMismatch as exc:
-                await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-                return VectorOpResult.fail(exc), None
-            except VectorRebuildFailed as exc:
-                await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-                return VectorOpResult.fail(exc), None
-            if not rebuild.success:
-                await self._fail_job(
-                    job_id,
-                    rebuild.error.code if rebuild.error else "rebuild_failed",
-                    rebuild.error.message if rebuild.error else "重建失败",
-                )
-                return rebuild, None
-            await self._complete_job(job_id, generation=int((await self.status()).active_generation or 0))
-            return VectorOpResult.ok(code="indexed"), None
+            return SimpleNamespace(kind="bootstrap", job_id=job_id)
 
-        try:
-            vectors, actual_model = await self._embed_texts([source.text], selector=selector)
-        except EmbeddingGenerationMismatch as exc:
-            # 单次 embedding 响应非法 ≠ generation fingerprint 变更；不触发全量重建
-            await self._fail_job(job_id, exc.code, exc.message, metadata=exc.metadata)
-            return VectorOpResult.fail(exc), None
+        return SimpleNamespace(
+            kind="embed",
+            job_id=job_id,
+            source=source,
+            selector=selector,
+            status=status,
+        )
+
+    async def _enqueue_after_embed(
+        self,
+        *,
+        job_id: str,
+        source_kind: str,
+        source_id: str,
+        source: IndexableSource,
+        selector: ModelSelector,
+        status: Any,
+        vectors: Sequence[Sequence[float]],
+        actual_model: str,
+    ) -> tuple[VectorOpResult, tuple[ModelSelector, str, str, str] | None]:
+        """Lock-held enqueue finish after Host embedding returns."""
 
         vector = vectors[0]
         fingerprint = compute_model_fingerprint(selector.raw, actual_model, len(vector), self._schema_version)
+        # Re-read status: another worker may have started rebuilding while we embedded.
+        status = await self.status()
+        if status.rebuilding:
+            await self._fail_job(job_id, VECTOR_INDEX_REBUILDING, "向量索引正在重建")
+            return VectorOpResult.fail(LRSError(VECTOR_INDEX_REBUILDING, "向量索引正在重建")), None
         mismatch = await self._detect_mismatch(
             status,
             selector_raw=selector.raw,
@@ -681,11 +761,13 @@ class VectorIndex:
         )
         if mismatch is not None:
             await self._fail_job(job_id, mismatch.code, mismatch.message, metadata=mismatch.metadata)
-            # 仅真正的 fingerprint/维度/schema mismatch 才 auto-rebuild；
-            # VectorIndexUnavailable（瞬态 IO）只失败 job，不动 active generation。
             if self._config.auto_rebuild and isinstance(mismatch, EmbeddingGenerationMismatch):
                 return VectorOpResult.fail(mismatch), (selector, job_id, source_kind, source_id)
             return VectorOpResult.fail(mismatch), None
+
+        if status.active_generation is None or status.table_name is None:
+            await self._fail_job(job_id, VECTOR_INDEX_UNAVAILABLE, "向量索引在 embedding 期间失效")
+            return VectorOpResult.fail(LRSError(VECTOR_INDEX_UNAVAILABLE, "向量索引在 embedding 期间失效")), None
 
         try:
             await self._append_to_active(
@@ -707,6 +789,48 @@ class VectorIndex:
 
         await self._complete_job(job_id, generation=int(status.active_generation))
         return VectorOpResult.ok(code="indexed"), None
+
+    async def _enqueue_unlocked(
+        self, *, source_kind: str, source_id: str
+    ) -> tuple[VectorOpResult, tuple[ModelSelector, str, str, str] | None]:
+        """兼容旧调用：整段仍可在已持锁上下文中同步跑完（仅测试/内部）。"""
+
+        prepared = await self._enqueue_prepare(source_kind=source_kind, source_id=source_id)
+        if prepared.kind == "done":
+            return prepared.result, prepared.pending
+        if prepared.kind == "bootstrap":
+            try:
+                rebuild = await self._rebuild_unlocked(force=True)
+            except EmbeddingGenerationMismatch as exc:
+                await self._fail_job(prepared.job_id, exc.code, exc.message, metadata=exc.metadata)
+                return VectorOpResult.fail(exc), None
+            except VectorRebuildFailed as exc:
+                await self._fail_job(prepared.job_id, exc.code, exc.message, metadata=exc.metadata)
+                return VectorOpResult.fail(exc), None
+            if not rebuild.success:
+                await self._fail_job(
+                    prepared.job_id,
+                    rebuild.error.code if rebuild.error else "rebuild_failed",
+                    rebuild.error.message if rebuild.error else "重建失败",
+                )
+                return rebuild, None
+            await self._complete_job(prepared.job_id, generation=int((await self.status()).active_generation or 0))
+            return VectorOpResult.ok(code="indexed"), None
+        try:
+            vectors, actual_model = await self._embed_texts([prepared.source.text], selector=prepared.selector)
+        except EmbeddingGenerationMismatch as exc:
+            await self._fail_job(prepared.job_id, exc.code, exc.message, metadata=exc.metadata)
+            return VectorOpResult.fail(exc), None
+        return await self._enqueue_after_embed(
+            job_id=prepared.job_id,
+            source_kind=source_kind,
+            source_id=source_id,
+            source=prepared.source,
+            selector=prepared.selector,
+            status=prepared.status,
+            vectors=vectors,
+            actual_model=actual_model,
+        )
 
     async def _rebuild_unlocked(self, *, force: bool) -> VectorOpResult:
         try:
@@ -889,23 +1013,26 @@ class VectorIndex:
                     )
                     if cursor.rowcount != 1:
                         raise RuntimeError("候选 generation 激活失败")
-                    for row in prepared_rows:
-                        connection.execute(
+                    if prepared_rows:
+                        connection.executemany(
                             """
                             INSERT OR REPLACE INTO vector_documents(
                                 source_kind, source_id, generation, actual_model_name,
                                 model_fingerprint, dimension, indexed_at
                             ) VALUES (?, ?, ?, ?, ?, ?, ?)
                             """,
-                            (
-                                row["source_kind"],
-                                row["source_id"],
-                                generation,
-                                actual_model,
-                                fingerprint,
-                                dimension,
-                                activated_at,
-                            ),
+                            [
+                                (
+                                    row["source_kind"],
+                                    row["source_id"],
+                                    generation,
+                                    actual_model,
+                                    fingerprint,
+                                    dimension,
+                                    activated_at,
+                                )
+                                for row in prepared_rows
+                            ],
                         )
                     connection.commit()
                 except BaseException:
@@ -1390,9 +1517,102 @@ def _load_indexable_sources(connection: Any) -> list[IndexableSource]:
 
 
 def _load_single_source(connection: Any, source_kind: str, source_id: str) -> IndexableSource | None:
-    for source in _load_indexable_sources(connection):
-        if source.source_kind == source_kind and source.source_id == source_id:
-            return source
+    """Resolve one indexable source without scanning the full corpus."""
+
+    status_list = sorted(INDEXABLE_CONTENT_STATUSES)
+    status_placeholders = ",".join("?" * len(status_list))
+
+    if source_kind == SOURCE_KIND_FORMALIZED:
+        row = connection.execute(
+            """
+            SELECT task_id, formalized_text
+            FROM tasks
+            WHERE task_id = ?
+              AND formalized_text IS NOT NULL AND TRIM(formalized_text) != ''
+            """,
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return IndexableSource(
+            source_kind=SOURCE_KIND_FORMALIZED,
+            source_id=str(row["task_id"]),
+            text=str(row["formalized_text"]),
+            task_id=str(row["task_id"]),
+        )
+
+    summary_kind = next(
+        (kind for kind, mapped in _SUMMARY_KIND_TO_SOURCE.items() if mapped == source_kind),
+        None,
+    )
+    if summary_kind is not None:
+        row = connection.execute(
+            f"""
+            SELECT summary_id, task_id, kind, text
+            FROM summaries
+            WHERE summary_id = ?
+              AND kind = ?
+              AND status IN ({status_placeholders})
+              AND text IS NOT NULL AND TRIM(text) != ''
+            """,
+            (source_id, summary_kind, *status_list),
+        ).fetchone()
+        if row is None:
+            return None
+        return IndexableSource(
+            source_kind=source_kind,
+            source_id=str(row["summary_id"]),
+            text=str(row["text"]),
+            task_id=str(row["task_id"]),
+        )
+
+    report_kind = next(
+        (kind for kind, mapped in _REPORT_KIND_TO_SOURCE.items() if mapped == source_kind),
+        None,
+    )
+    if report_kind is not None:
+        row = connection.execute(
+            f"""
+            SELECT report_id, task_id, kind, text
+            FROM reports
+            WHERE report_id = ?
+              AND kind = ?
+              AND status IN ({status_placeholders})
+              AND text IS NOT NULL AND TRIM(text) != ''
+            """,
+            (source_id, report_kind, *status_list),
+        ).fetchone()
+        if row is None:
+            return None
+        return IndexableSource(
+            source_kind=source_kind,
+            source_id=str(row["report_id"]),
+            text=str(row["text"]),
+            task_id=str(row["task_id"]),
+        )
+
+    if source_kind == SOURCE_KIND_FEEDBACK_LESSON:
+        row = connection.execute(
+            """
+            SELECT feedback_id, task_id, disposition, payload_json
+            FROM feedback_events
+            WHERE feedback_id = ?
+            """,
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        lesson = _extract_feedback_lesson(row["payload_json"])
+        if not lesson:
+            return None
+        return IndexableSource(
+            source_kind=SOURCE_KIND_FEEDBACK_LESSON,
+            source_id=str(row["feedback_id"]),
+            text=lesson,
+            task_id=str(row["task_id"]),
+            feedback_disposition=str(row["disposition"]),
+        )
+
     return None
 
 

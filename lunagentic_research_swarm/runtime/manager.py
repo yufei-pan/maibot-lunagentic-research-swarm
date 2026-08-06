@@ -15,6 +15,7 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
+from collections.abc import Mapping, Sequence
 
 from lunagentic_research_swarm.llm.gateway import resolve_generation_selector
 from lunagentic_research_swarm.llm.pricing import TokenUsage, charge
@@ -31,9 +32,14 @@ from lunagentic_research_swarm.models import (
     new_round_id,
     new_task_id,
 )
-from lunagentic_research_swarm.runtime.context import RuntimeHeader, StablePromptBuilder, release_raw_context
+from lunagentic_research_swarm.runtime.context import (
+    RuntimeHeader,
+    StablePromptBuilder,
+    release_raw_context,
+    should_auto_compact,
+)
 from lunagentic_research_swarm.runtime.controller import TaskController
-from lunagentic_research_swarm.runtime.credits import meter_summarizer_usage, reserve_input
+from lunagentic_research_swarm.runtime.credits import allocate_children, meter_summarizer_usage, reserve_input
 from lunagentic_research_swarm.runtime.epochs import ReportCoordinator, ReportRecord
 from lunagentic_research_swarm.runtime.events import (
     AgentCallReserved,
@@ -41,6 +47,7 @@ from lunagentic_research_swarm.runtime.events import (
     BranchFinalized,
     ChildMaterialized,
     ContinueRequested,
+    FinalEpochCommitted,
     FinalReportCompleted,
     FinalReportFailed,
     FormalizationFailed,
@@ -64,6 +71,7 @@ from lunagentic_research_swarm.runtime.reducer import (
     ReleaseRawContext,
     RuntimeState,
 )
+from lunagentic_research_swarm.procedures.core import CORE_COMPACT_ID, CoreProcedureContext, execute_core_procedure
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
 
 _LOG = logging.getLogger(__name__)
@@ -403,7 +411,14 @@ class ResearchManager:
         await self._assert_stream_owner(task_id, stream_id)
         controller = self._controller(task_id)
         state = controller.state
-        if state.status not in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.PAUSING, TaskStatus.PAUSED}:
+        if state.status not in {
+            TaskStatus.FORMALIZING,
+            TaskStatus.RUNNING,
+            TaskStatus.REPORTING,
+            TaskStatus.PAUSING,
+            TaskStatus.PAUSED,
+            TaskStatus.FINALIZING,
+        }:
             raise ValueError("task 不在可停止状态")
         await self._submit(
             controller,
@@ -411,6 +426,11 @@ class ResearchManager:
         )
         self.scheduler.cancel_generation(task_id, state.generation)
         self._cancel_timer_jobs(task_id)
+        coordinator = self.report_coordinators.get(task_id)
+        if coordinator is not None:
+            for task in tuple(getattr(coordinator, "_synthesis_tasks", ()) or ()):
+                if not task.done():
+                    task.cancel()
         self._branches[task_id].clear()
         return self._status(controller)
 
@@ -695,6 +715,15 @@ class ResearchManager:
             )
         )
         messages = tuple(dict(item) for item in branch.get("messages", ()))
+        coordinator = self.report_coordinators.get(effect.task_id)
+        if coordinator is not None:
+            pending = coordinator.pending_summary_messages(branch_id)
+            if pending:
+                messages = messages + tuple(dict(item) for item in pending)
+                branch["messages"] = [dict(item) for item in messages]
+                runtime = coordinator.branches.get(branch_id)
+                if runtime is not None:
+                    runtime.messages = [dict(item) for item in messages]
         protocol = str(getattr(definition, "protocol", "json_envelope"))
         call_id = str(effect.payload.get("call_id") or new_call_id())
         # Authoritative balance lives on active_leaves; branch cache is status-only.
@@ -707,6 +736,22 @@ class ResearchManager:
             selector=selector,
             messages=messages,
             protocol=protocol,
+        )
+        messages, prompt_tokens, cache_hit, cache_miss, estimated_charge, resolved = await self._maybe_auto_compact(
+            effect=effect,
+            controller=controller,
+            snapshot=snapshot,
+            definition=definition,
+            selector=selector,
+            protocol=protocol,
+            messages=messages,
+            branch=branch,
+            branch_id=branch_id,
+            prompt_tokens=prompt_tokens,
+            cache_hit=cache_hit,
+            cache_miss=cache_miss,
+            estimated_charge=estimated_charge,
+            resolved=resolved,
         )
         credits_after_reservation = balance_before - estimated_charge
         usage_id = f"usage_{call_id}"
@@ -793,19 +838,17 @@ class ResearchManager:
         resolved = None
         estimated_charge = 0.0
         if catalog is not None:
-            try:
-                resolved = catalog.estimate_model_for_selector(selector)
-                usage = TokenUsage(
-                    token_est.prompt_tokens,
-                    0,
-                    token_est.cache_hit_tokens,
-                    token_est.cache_miss_tokens,
-                    source="estimated",
-                )
-                estimated_charge = float(charge(resolved.profile, usage))
-            except Exception:
-                estimated_charge = 0.0
-                resolved = None
+            # Missing Host prices resolve to an explicit free profile inside the
+            # catalog. Unexpected estimator failures must not silently under-reserve.
+            resolved = catalog.estimate_model_for_selector(selector)
+            usage = TokenUsage(
+                token_est.prompt_tokens,
+                0,
+                token_est.cache_hit_tokens,
+                token_est.cache_miss_tokens,
+                source="estimated",
+            )
+            estimated_charge = float(charge(resolved.profile, usage))
         return (
             estimated_charge,
             int(token_est.prompt_tokens),
@@ -813,6 +856,89 @@ class ResearchManager:
             int(token_est.cache_miss_tokens),
             resolved,
         )
+
+    async def _maybe_auto_compact(
+        self,
+        *,
+        effect: PerformAgentCall,
+        controller: TaskController,
+        snapshot: Any,
+        definition: Any,
+        selector: str,
+        protocol: str,
+        messages: tuple[dict[str, Any], ...],
+        branch: dict[str, Any],
+        branch_id: str,
+        prompt_tokens: int,
+        cache_hit: int,
+        cache_miss: int,
+        estimated_charge: float,
+        resolved: Any,
+    ) -> tuple[tuple[dict[str, Any], ...], int, int, int, float, Any]:
+        """Compact before the agent call when configured thresholds are crossed."""
+
+        agent_override = getattr(definition, "auto_compact_tokens", None)
+        definition_threshold = agent_override
+        global_threshold = int(self._runtime_limits.get("auto_compact_tokens", 258_000))
+        reserved_output = int(self._runtime_limits.get("reserved_output_tokens", 8192))
+        safety_margin = int(self._runtime_limits.get("safety_margin_tokens", 8192))
+        model_limit = None
+        if resolved is not None:
+            model_limit = getattr(getattr(resolved, "profile", None), "context_window", None)
+            if model_limit is not None:
+                model_limit = int(model_limit)
+        if not should_auto_compact(
+            int(prompt_tokens),
+            agent_override=int(agent_override) if agent_override is not None else None,
+            definition=int(definition_threshold) if definition_threshold is not None else None,
+            global_threshold=global_threshold,
+            model_context_limit=model_limit,
+            reserved_output_tokens=reserved_output,
+            safety_margin_tokens=safety_margin,
+        ):
+            return messages, prompt_tokens, cache_hit, cache_miss, estimated_charge, resolved
+        formalized = controller.state.formalized_task
+        compact_result = await execute_core_procedure(
+            CORE_COMPACT_ID,
+            {},
+            summarizer=self.summarizer,
+            context=CoreProcedureContext(
+                formalized_task=formalized.text if formalized is not None else None,
+                branch_history=messages,
+            ),
+        )
+        data = getattr(compact_result, "data", None)
+        if not bool(getattr(compact_result, "success", False)) or not isinstance(data, Mapping) or not data.get("compacted"):
+            raise RuntimeError("自动 compact 失败，拒绝在超限上下文上继续调用")
+        summary = str(data.get("summary") or "").strip()
+        if not summary:
+            raise RuntimeError("自动 compact 未返回可用摘要")
+        rewritten: list[dict[str, Any]] = []
+        if formalized is not None:
+            rewritten.append({"role": "user", "content": formalized.text})
+        rewritten.append({"role": "assistant", "content": summary})
+        messages = tuple(rewritten)
+        branch["messages"] = [dict(item) for item in messages]
+        coordinator = self.report_coordinators.get(effect.task_id)
+        if coordinator is not None and branch_id in coordinator.branches:
+            coordinator.branches[branch_id].messages = [dict(item) for item in messages]
+        estimated_charge, prompt_tokens, cache_hit, cache_miss, resolved = self._estimate_agent_reservation(
+            snapshot=snapshot,
+            selector=selector,
+            messages=messages,
+            protocol=protocol,
+        )
+        if should_auto_compact(
+            int(prompt_tokens),
+            agent_override=int(agent_override) if agent_override is not None else None,
+            definition=int(definition_threshold) if definition_threshold is not None else None,
+            global_threshold=global_threshold,
+            model_context_limit=model_limit,
+            reserved_output_tokens=reserved_output,
+            safety_margin_tokens=safety_margin,
+        ):
+            raise RuntimeError("自动 compact 后上下文仍超过安全窗口，终止该分支调用")
+        return messages, prompt_tokens, cache_hit, cache_miss, estimated_charge, resolved
 
     async def prepare_procedure_effect(self, effect: Any) -> Any:
         """Attach the procedure catalog frozen for this task round."""
@@ -934,15 +1060,28 @@ class ResearchManager:
                 parent_branch_id=str(payload.get("parent_branch_id") or "") or None,
             )
         reason = str(payload.get("reason", "no_further_work"))
-        checkpoint = reason == "checkpoint"
+        held = tuple(payload.get("held_delegations", ()))
+        if reason == "checkpoint":
+            await coordinator.on_branch_safe_point(
+                branch_id, checkpoint=True, terminal=False, delegations=held
+            )
+            return
+        if reason == "grace_clone":
+            # Children already materialize via reducer; only clone frontier coverage.
+            if payload.get("messages"):
+                branch = coordinator.branches.get(branch_id)
+                if branch is not None:
+                    branch.messages = [dict(item) for item in payload.get("messages", ())]
+            await coordinator.on_branch_safe_point(
+                branch_id, checkpoint=False, terminal=False, delegations=()
+            )
+            return
         await coordinator.on_branch_safe_point(
             branch_id,
-            checkpoint=checkpoint,
-            terminal=not checkpoint,
-            delegations=tuple(payload.get("held_delegations", ())),
+            checkpoint=False,
+            terminal=True,
+            delegations=(),
         )
-        if checkpoint:
-            return
         branch = coordinator.branches[branch_id]
         release_raw_context(branch)
         await self.handle_runtime_event(
@@ -964,7 +1103,7 @@ class ResearchManager:
         controller = self._controllers.get(event.task_id)
         if controller is None or event.generation != controller.state.generation or event.round_id != controller.state.active_round_id:
             return
-        if controller.state.status not in {TaskStatus.RUNNING, TaskStatus.FINALIZING}:
+        if controller.state.status is not TaskStatus.RUNNING:
             return
         await self._submit(controller, event)
         if controller.state.status not in {TaskStatus.REPORTING, TaskStatus.FINALIZING}:
@@ -1219,18 +1358,25 @@ class ResearchManager:
 
     @staticmethod
     async def _sleep_until(due_at: float, *, clock: Any) -> None:
-        """Sleep until ``clock()`` reaches ``due_at``, re-checking in short slices.
+        """Sleep until ``clock()`` reaches ``due_at``, re-checking in slices.
 
         Production uses wall-clock ``time.time``. Integration harnesses may swap
-        in a fake clock; short sleeps keep the wait cancellable without requiring
-        tests to inject deadline events for proving arming exists.
+        in a fake clock; sleeps stay cancellable without requiring tests to
+        inject deadline events for proving arming exists. Long waits use coarser
+        slices to avoid 50ms timer churn over minutes-long budgets.
         """
 
         while True:
             remaining = float(due_at) - float(clock())
             if remaining <= 0:
                 return
-            await asyncio.sleep(min(remaining, 0.05))
+            if remaining > 5.0:
+                slice_s = 1.0
+            elif remaining > 1.0:
+                slice_s = 0.25
+            else:
+                slice_s = 0.05
+            await asyncio.sleep(min(remaining, slice_s))
 
     async def _on_report_synthesis_complete(self, task_id: str, record: ReportRecord) -> None:
         """Return a committed coordinator report to the sole state controller."""
@@ -1240,25 +1386,24 @@ class ResearchManager:
             return
         state = controller.state
         if record.kind is ReportKind.FINAL:
-            if state.status in {TaskStatus.RUNNING, TaskStatus.FINALIZING}:
-                # Commit the final epoch (RUNNING→FINALIZING, or bump epoch while
-                # already FINALIZING after the last leaf settled) before publishing
-                # the completed event, preserving transaction-before-effect.
-                if record.epoch != state.report_epoch + 1:
+            if state.status in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.FINALIZING}:
+                # Shared FinalEpochCommitted path: same-epoch freeze or +1 bump.
+                if record.epoch not in {state.report_epoch, state.report_epoch + 1}:
+                    return
+                if state.status is TaskStatus.REPORTING and record.epoch != state.report_epoch:
                     return
                 await self._submit(
                     controller,
-                    ReportDeadlineReached(
+                    FinalEpochCommitted(
                         _event_id(),
                         task_id,
                         state.active_round_id or "",
                         state.generation,
                         epoch=record.epoch,
-                        report_kind="FINAL",
                     ),
                 )
                 state = controller.state
-            if state.status not in {TaskStatus.REPORTING, TaskStatus.FINALIZING}:
+            if state.status is not TaskStatus.FINALIZING:
                 return
             if record.status == "SUCCEEDED":
                 event = FinalReportCompleted(
@@ -1309,6 +1454,14 @@ class ResearchManager:
         async def on_synthesis_complete(record: ReportRecord) -> None:
             await self._on_report_synthesis_complete(task_id, record)
 
+        async def release_held(parent_branch_id: str, delegations: Sequence[Mapping[str, Any]]) -> None:
+            await self._release_held_delegations(task_id, parent_branch_id, delegations)
+
+        async def launch_one(parent_branch_id: str, child: Mapping[str, Any]) -> None:
+            await self._release_held_delegations(task_id, parent_branch_id, (child,))
+
+        controller = self._controllers.get(task_id)
+        initial_pool = float(controller.state.credit_pool) if controller is not None else 0.0
         self.report_coordinators[task_id] = self._report_coordinator_factory(
             task_id=task_id,
             round_id=round_id,
@@ -1317,10 +1470,12 @@ class ResearchManager:
             store=self.store,
             summarizer=self.summarizer,
             clock=_now,
+            launch_delegation=launch_one,
+            release_held_delegations=release_held,
             on_synthesis_complete=on_synthesis_complete,
             time_budget_seconds=time_budget_seconds,
             grace_period_seconds=self._grace_period_seconds,
-            credit_pool=0.0,
+            credit_pool=initial_pool,
             statistics=self.statistics,
             price_catalog=getattr(self._round_snapshots.get(task_id), "price_catalog", None),
             summarizer_selector=self._summarizer_selector,
@@ -1396,15 +1551,87 @@ class ResearchManager:
         return 0
 
     def _sync_branch_credits(self, task_id: str, controller: TaskController) -> None:
-        """Mirror reducer-owned balances into the status-only branch cache."""
+        """Mirror reducer-owned balances into status cache and report coordinator."""
 
         branches = self._branches.get(task_id)
-        if branches is None:
+        if branches is not None:
+            for branch_id, credits in controller.state.active_leaves.items():
+                branch = branches.get(branch_id)
+                if branch is not None:
+                    branch["credits"] = float(credits)
+        coordinator = self.report_coordinators.get(task_id)
+        if coordinator is None:
             return
+        coordinator.credit_pool = float(controller.state.credit_pool)
         for branch_id, credits in controller.state.active_leaves.items():
-            branch = branches.get(branch_id)
-            if branch is not None:
-                branch["credits"] = float(credits)
+            runtime = coordinator.branches.get(branch_id)
+            if runtime is not None:
+                runtime.credits = float(credits)
+
+    async def _release_held_delegations(
+        self,
+        task_id: str,
+        parent_branch_id: str,
+        delegations: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Allocate and materialize children held behind a manual checkpoint."""
+
+        controller = self._controllers.get(task_id)
+        snapshot = self._round_snapshots.get(task_id)
+        if controller is None or snapshot is None or not delegations:
+            return
+        parent = self._branches.get(task_id, {}).get(parent_branch_id) or {}
+        coordinator = self.report_coordinators.get(task_id)
+        parent_runtime = coordinator.branches.get(parent_branch_id) if coordinator is not None else None
+        parent_messages = [
+            dict(item)
+            for item in (
+                parent.get("messages")
+                or (parent_runtime.messages if parent_runtime is not None else ())
+            )
+        ]
+        parent_depth = int(parent.get("depth", parent_runtime.depth if parent_runtime is not None else 0))
+        parent_credits = float(
+            controller.state.active_leaves.get(
+                parent_branch_id,
+                parent.get("credits", parent_runtime.credits if parent_runtime is not None else 0.0),
+            )
+        )
+        allocatable: list[tuple[str, float]] = []
+        normalized: list[tuple[str, str, str, float]] = []
+        for index, raw in enumerate(delegations):
+            agent_id = str(raw.get("agent_id") or "")
+            assignment = str(raw.get("task") or raw.get("assignment") or "")
+            requested = float(raw.get("credits", 0.0) or 0.0)
+            branch_id = str(raw.get("branch_id") or f"{parent_branch_id}:{index + 1}")
+            normalized.append((branch_id, agent_id, assignment, requested))
+            allocatable.append((str(index), requested))
+        allocation = allocate_children(parent_credits, allocatable)
+        for index, (branch_id, agent_id, assignment, _requested) in enumerate(normalized):
+            credits = float(allocation.allocations.get(str(index), 0.0))
+            await self.scheduler.enqueue(
+                NotifyToolWaiter(
+                    task_id,
+                    controller.state.active_round_id or "",
+                    controller.state.generation,
+                    priority="barrier",
+                    payload={
+                        "action": "materialize_child",
+                        "branch_id": branch_id,
+                        "parent_branch_id": parent_branch_id,
+                        "agent_id": agent_id,
+                        "assignment": assignment,
+                        "credits": credits,
+                        "depth": parent_depth + 1,
+                        "messages": (
+                            *parent_messages,
+                            {"role": "user", "content": f"assignment: {assignment}"},
+                        ),
+                        "retire_parent": False,
+                        "pool_return": 0.0,
+                    },
+                )
+            )
 
     async def wait_idle(self, task_id: str) -> None:
         while True:

@@ -45,6 +45,7 @@ async def test_checkpoint_holds_children_until_report_epoch(runtime_harness) -> 
     async def launch(_parent: str, child: dict[str, object]) -> None:
         launched.append(dict(child))
 
+    harness.coordinator.release_held_delegations = None
     harness.coordinator.launch_delegation = launch
     await harness.coordinator.on_branch_safe_point(
         "A", checkpoint=True, delegations=({"branch_id": "A-child", "agent_id": "sibling"},)
