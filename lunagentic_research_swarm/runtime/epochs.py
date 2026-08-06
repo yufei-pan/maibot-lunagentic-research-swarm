@@ -564,6 +564,7 @@ class ReportCoordinator:
                     credit_pool=self.credit_pool,
                     pending_work=tuple(self._held),
                     stats=bounded_stats,
+                    report_id=report_id,
                 ),
                 self.max_report_chars,
             )

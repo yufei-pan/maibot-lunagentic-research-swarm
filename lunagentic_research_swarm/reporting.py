@@ -115,15 +115,22 @@ def render_report(
     credit_pool: float,
     pending_work: Sequence[str] = (),
     stats: dict[str, Any] | None = None,
+    report_id: str = "",
 ) -> str:
-    """Add the deterministic user-facing header around a synthesized body."""
+    """Add the deterministic user-facing header around a synthesized body.
+
+    ``report_id`` is embedded in the header when provided so Maisaka consumers can
+    dedupe duplicate appends after a crash (design §17.2).
+    """
 
     rendered_stats = "；".join(f"{key}={value}" for key, value in sorted((stats or {}).items()))
+    report_id_line = f"report_id：{report_id}\n" if report_id else ""
     if kind is ReportKind.INTERMEDIATE:
         # design §13.3: an intermediate report also carries token / cache
         # hit-miss / credits / failure figures, not just branch counts.
         header = (
             "中间报告\n"
+            f"{report_id_line}"
             f"task/round/epoch：{task_id}/{round_id}/{epoch}\n"
             f"仍运行/排队分支：{max(0, running_branch_count)}/{max(0, queued_branch_count)}\n"
             f"coverage 不可用：{max(0, unavailable_count)}\n"
@@ -133,7 +140,12 @@ def render_report(
             f"主要未决工作：{'；'.join(pending_work) if pending_work else '无'}"
         )
     else:
-        header = f"最终结论\ntask/round/epoch：{task_id}/{round_id}/{epoch}\n统计：{rendered_stats or '无'}"
+        header = (
+            "最终结论\n"
+            f"{report_id_line}"
+            f"task/round/epoch：{task_id}/{round_id}/{epoch}\n"
+            f"统计：{rendered_stats or '无'}"
+        )
     return f"{header}\n\n{body.strip()}" if body.strip() else header
 
 

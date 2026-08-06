@@ -1,8 +1,7 @@
 """Design §17.2 — report_id contract pins (Maisaka delivery + body dedupe).
 
-Current production contract: append ``message_id`` and trigger ``metadata["report_id"]``
-share the same stable report id. Spec also wants that id consumer-visible in the
-report body for crash/dedupe; ``render_report`` does not yet embed it.
+Append ``message_id``, trigger ``metadata["report_id"]``, and the rendered report
+header all share the same stable report id so consumers can dedupe after a crash.
 """
 
 from __future__ import annotations
@@ -125,20 +124,10 @@ async def test_spec_17_2_harness_delivery_surfaces_share_persisted_report_id(run
     assert append["message_id"].removeprefix("lrs-report:") == trigger_meta["report_id"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="spec §17.2: report body should carry stable report_id",
-)
 def test_spec_17_2_render_report_body_carries_stable_report_id_for_dedupe() -> None:
-    """§17.2 — consumer-visible body should embed report_id for crash/dedupe.
-
-    Production ``render_report`` has no ``report_id`` parameter and does not
-    write the id into header/body; Maisaka metadata carries it instead.
-    This xfail documents the spec mismatch without changing production.
-    """
+    """§17.2 — consumer-visible body should embed report_id for crash/dedupe."""
 
     report_id = "rpt_body_dedupe_should_appear"
-    # Production render_report has no report_id parameter; body/header omit the id.
     text = render_report(
         kind=ReportKind.INTERMEDIATE,
         body="证据摘要",
@@ -153,15 +142,13 @@ def test_spec_17_2_render_report_body_carries_stable_report_id_for_dedupe() -> N
         credit_balance=5.0,
         credit_pool=0.0,
         pending_work=(),
+        report_id=report_id,
     )
 
+    assert f"report_id：{report_id}" in text
     assert report_id in text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="spec §17.2: report body should carry stable report_id",
-)
 @pytest.mark.asyncio
 async def test_spec_17_2_persisted_report_text_embeds_report_id(runtime_harness) -> None:
     """§17.2 — durable report text (Maisaka visible_text) should include report_id."""
@@ -180,4 +167,5 @@ async def test_spec_17_2_persisted_report_text_embeds_report_id(runtime_harness)
     report_id = str(report["report_id"])
     text = str(report["text"])
 
+    assert f"report_id：{report_id}" in text
     assert report_id in text

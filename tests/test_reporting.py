@@ -39,10 +39,32 @@ def test_report_header_marks_intermediate_with_required_runtime_statistics() -> 
         credit_balance=9.5,
         credit_pool=-1.0,
         pending_work=("核实来源",),
+        report_id="rpt_header_1",
     )
 
     assert "中间报告" in text
+    assert "report_id：rpt_header_1" in text
     assert "task-1/round-1/3" in text
     assert "仍运行/排队分支：2/1" in text
     assert "coverage 不可用：4" in text
     assert "目前证据" in text
+
+
+def test_report_header_omits_report_id_line_when_empty() -> None:
+    text = render_report(
+        kind=ReportKind.FINAL,
+        body="结论",
+        task_id="task-1",
+        round_id="round-1",
+        epoch=1,
+        running_branch_count=0,
+        queued_branch_count=0,
+        unavailable_count=0,
+        elapsed_seconds=1,
+        next_interval_seconds=0,
+        credit_balance=0.0,
+        credit_pool=0.0,
+    )
+
+    assert "最终结论" in text
+    assert "report_id：" not in text
