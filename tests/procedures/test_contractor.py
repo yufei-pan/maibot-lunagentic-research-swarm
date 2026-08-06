@@ -23,7 +23,9 @@ from lunagentic_research_swarm.procedures.bundled.contractor import (
     run_contractor,
 )
 from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
+from lunagentic_research_swarm.procedures.executor import ProcedureExecutor
 from lunagentic_research_swarm.procedures.registry import ProcedureRegistry
+from lunagentic_research_swarm.runtime.reducer import PerformProcedureBatch
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 _CONFIG_DEFAULT = _PLUGIN_ROOT / "config.default.toml"
@@ -106,6 +108,43 @@ def test_contractor_disabled_by_override_removed_from_snapshot() -> None:
     disabled = registry.snapshot({CONTRACTOR_PROCEDURE_ID: ProcedureOverride(enabled=False)})
     assert disabled.get(CONTRACTOR_PROCEDURE_ID) is None
     assert disabled.get(sibling_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_disabled_contractor_unavailable_via_registry_snapshot() -> None:
+    """enabled=false 省略目录后，经 executor 调用仍返回 procedure_unavailable（非静默成功）。"""
+    registry = ProcedureRegistry()
+    registry.replace_provider("builtin", BundledProcedureProvider(object()).describe())
+    disabled_catalog = registry.snapshot({CONTRACTOR_PROCEDURE_ID: ProcedureOverride(enabled=False)})
+    assert disabled_catalog.get(CONTRACTOR_PROCEDURE_ID) is None
+    assert disabled_catalog.get("builtin.calculate") is not None
+
+    executor = ProcedureExecutor(disabled_catalog, api=object())
+    completed = await executor.invoke_many(
+        PerformProcedureBatch(
+            task_id="task-contractor-disabled",
+            round_id="round-1",
+            generation=0,
+            payload={
+                "branch_id": "branch-1",
+                "call_id": "call-1",
+                "turn_id": "turn-1",
+                "agent_id": "builtin.quick_thinker",
+                "requests": [
+                    {
+                        "procedure_id": CONTRACTOR_PROCEDURE_ID,
+                        "arguments": {
+                            "agent_id": "builtin.quick_thinker",
+                            "question": "不应执行",
+                        },
+                    }
+                ],
+            },
+        )
+    )
+    assert completed.results[0].success is False
+    assert completed.results[0].result.error["code"] == "procedure_unavailable"
+    assert completed.results[0].result.data in (None, {})
 
 
 def test_config_default_toml_lists_all_bundled_procedure_toggles() -> None:
@@ -548,6 +587,59 @@ async def test_nested_settlement_overspend_force_returns_without_next_turn(
     assert len(contractor_harness.llm.calls) == 1
     assert float(result.research_credits_charged) >= nested_charge
     assert float(result.research_credits_charged) == pytest.approx(0.5 + nested_charge)
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_nested_then_return_sums_charges(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """多轮：turn1 嵌套计费 + turn2 return → research_credits_charged 为 turn+nested+turn 之和。"""
+
+    nested_charge = 0.5
+    turn_charges = [0.5, 0.3]
+
+    @dataclass
+    class _ScheduledPrices:
+        remaining: list[float] = field(default_factory=lambda: list(turn_charges))
+        calls: list[dict[str, Any]] = field(default_factory=list)
+
+        def charge_actual(self, **kwargs: Any) -> SimpleNamespace:
+            self.calls.append(dict(kwargs))
+            return SimpleNamespace(credits=float(self.remaining.pop(0)))
+
+    async def _nested(procedure_id: str, arguments: Any = None, **kwargs: Any) -> ProcedureResult:
+        del procedure_id, arguments, kwargs
+        return ProcedureResult(
+            success=True,
+            data={"ok": True},
+            error=None,
+            metadata={},
+            research_credits_charged=nested_charge,
+        )
+
+    prices = _ScheduledPrices()
+    contractor_harness.deps.prices = prices
+    contractor_harness.deps.invoke_nested_procedure = _nested
+    contractor_harness.llm.queue_json(
+        {
+            "report": "先查工具",
+            "procedures": [{"procedure_id": "builtin.calculate", "arguments": {"expression": "1"}}],
+        }
+    )
+    contractor_harness.llm.queue_json({"return": "合计完成"})
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="多轮计费求和",
+        caller_protocol="json_envelope",
+        credit_budget=100.0,
+    )
+    assert result.success is True
+    assert result.data["result"] == "合计完成"
+    assert result.metadata["termination_reason"] == "returned"
+    assert len(contractor_harness.llm.calls) == 2
+    assert len(prices.calls) == 2
+    expected = turn_charges[0] + nested_charge + turn_charges[1]
+    assert float(result.research_credits_charged) == pytest.approx(expected)
 
 
 @pytest.mark.asyncio
