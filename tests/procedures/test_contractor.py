@@ -13,6 +13,7 @@ import pytest
 
 from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
 from lunagentic_research_swarm.config import ProcedureOverride
+from lunagentic_research_swarm.extensions.contracts import ProcedureResult
 from lunagentic_research_swarm.procedures.bundled.contractor import (
     CONTRACTOR_PROCEDURE_ID,
     ContractorDeps,
@@ -253,25 +254,134 @@ async def test_contractor_native_contractor_return(contractor_harness: Contracto
 
 
 @pytest.mark.asyncio
-async def test_contractor_nested_procedures_rejected_into_transcript(
+async def test_contractor_budget_zero_runs_one_turn_then_force_returns_if_spend(
     contractor_harness: ContractorHarness,
 ) -> None:
+    """credit_budget=0 仍跑 ≥1 轮；turn 花费 >0 → insufficient_funds 强制返回。"""
+
+    contractor_harness.llm.queue_json({"return": "本应返回的答案"})
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="零预算",
+        caller_protocol="json_envelope",
+        credit_budget=0.0,
+    )
+    assert result.success is True
+    assert result.metadata["termination_reason"] == "insufficient_funds"
+    assert float(result.research_credits_charged) > 0
+    text = str(result.data["result"])
+    assert "额度" in text or "不足" in text or "insufficient" in text.lower()
+    assert len(contractor_harness.llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_contractor_soft_time_budget_force_returns(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """极小 time_budget_seconds：第一轮请求工具后软超时强制返回。"""
+
     contractor_harness.llm.queue_json(
-        {"report": "先查一下", "procedures": [{"procedure_id": "builtin.web_search", "arguments": {"query": "x"}}]}
+        {
+            "report": "还要再想",
+            "procedures": [{"procedure_id": "builtin.web_search", "arguments": {"query": "x"}}],
+        }
+    )
+    nested_calls: list[str] = []
+
+    async def _nested(procedure_id: str, arguments: Any, **kwargs: Any) -> ProcedureResult:
+        nested_calls.append(str(procedure_id))
+        return ProcedureResult(
+            success=True,
+            data={"ok": True},
+            error=None,
+            metadata={},
+            research_credits_charged=0.0,
+        )
+
+    contractor_harness.deps.invoke_nested_procedure = _nested
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="赶时间",
+        caller_protocol="json_envelope",
+        credit_budget=100.0,
+        time_budget_seconds=1e-9,
+    )
+    assert result.success is True
+    assert result.metadata["termination_reason"] == "timeout"
+    text = str(result.data["result"])
+    assert "超时" in text or "timeout" in text.lower() or "时间" in text
+
+
+@pytest.mark.asyncio
+async def test_contractor_rejects_nested_contractor_and_controls(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """禁止嵌套 builtin.contractor / core.terminate / core.checkpoint；错误写入 transcript。"""
+
+    contractor_harness.llm.queue_json(
+        {
+            "report": "尝试控制",
+            "procedures": [
+                {"procedure_id": "builtin.contractor", "arguments": {"agent_id": "x", "question": "y"}},
+                {"procedure_id": "core.terminate", "arguments": {}},
+                {"procedure_id": "core.checkpoint", "arguments": {}},
+            ],
+        }
     )
     contractor_harness.llm.queue_json({"return": "在拒绝后给出答案"})
     result = await contractor_harness.invoke(
         agent_id="builtin.quick_thinker",
-        question="需要工具吗",
+        question="控制类",
         caller_protocol="json_envelope",
         credit_budget=10.0,
     )
     assert result.success is True
     assert result.data["result"] == "在拒绝后给出答案"
+    assert result.metadata["termination_reason"] == "returned"
     assert len(contractor_harness.llm.calls) == 2
     second_blob = json.dumps(contractor_harness.llm.calls[1]["messages"], ensure_ascii=False)
-    assert "builtin.web_search" in second_blob
-    assert "不允许" in second_blob or "拒绝" in second_blob or "不可" in second_blob
+    for pid in ("builtin.contractor", "core.terminate", "core.checkpoint"):
+        assert pid in second_blob
+    assert "不允许" in second_blob or "拒绝" in second_blob or "禁止" in second_blob
+
+
+@pytest.mark.asyncio
+async def test_contractor_nested_compact_adds_to_bill(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """嵌套 core.compact 的 research_credits_charged 折入承包商总账单（不经外层二次扣）。"""
+
+    nested_calls: list[dict[str, Any]] = []
+
+    async def _nested(procedure_id: str, arguments: Any, **kwargs: Any) -> ProcedureResult:
+        nested_calls.append({"procedure_id": procedure_id, "arguments": arguments, **kwargs})
+        return ProcedureResult(
+            success=True,
+            data={"summary": "压缩后"},
+            error=None,
+            metadata={"research_credits_charged": 2.0},
+            research_credits_charged=2.0,
+        )
+
+    contractor_harness.deps.invoke_nested_procedure = _nested
+    contractor_harness.llm.queue_json(
+        {"report": "压缩", "procedures": [{"procedure_id": "core.compact", "arguments": {}, "credits": 0}]}
+    )
+    contractor_harness.llm.queue_json({"return": "压缩后继续"})
+    result = await contractor_harness.invoke(
+        agent_id="builtin.quick_thinker",
+        question="需要 compact",
+        caller_protocol="json_envelope",
+        credit_budget=50.0,
+    )
+    assert result.success is True
+    assert result.metadata["termination_reason"] == "returned"
+    assert len(nested_calls) == 1
+    assert nested_calls[0]["procedure_id"] == "core.compact"
+    # turn1 0.5 + nested 2.0 + turn2 0.5 = 3.0
+    assert float(result.research_credits_charged) == pytest.approx(3.0)
+    second_blob = json.dumps(contractor_harness.llm.calls[1]["messages"], ensure_ascii=False)
+    assert "core.compact" in second_blob or "压缩" in second_blob
 
 
 @pytest.mark.asyncio

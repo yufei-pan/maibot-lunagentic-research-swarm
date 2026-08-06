@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,12 +13,23 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition, ProcedureResult
 from lunagentic_research_swarm.llm.gateway import GenerationRequest
 from lunagentic_research_swarm.llm.protocol import ProcedureRequest
+from lunagentic_research_swarm.procedures.billing import extract_research_credits_charged
 from lunagentic_research_swarm.procedures.core import research_credits_for_summarizer_usage
 
 Handler = Callable[..., Awaitable[ProcedureResult]]
 
 CONTRACTOR_PROCEDURE_ID = "builtin.contractor"
+_FORBIDDEN_NESTED_PROCEDURE_IDS = frozenset(
+    {
+        CONTRACTOR_PROCEDURE_ID,
+        "core.checkpoint",
+        "core.terminate",
+    }
+)
 _NESTED_REJECT_MESSAGE = "嵌套 Procedure 调用被拒绝（当前承包商不允许执行该 procedure_id）：{procedure_id}"
+_NESTED_RUNTIME_MISSING = "嵌套 Procedure 调用失败：运行时未注入 invoke_nested_procedure（{procedure_id}）"
+_FORCE_RETURN_INSUFFICIENT = "【终止说明】研究额度不足，承包商强制返回（insufficient_funds）。"
+_FORCE_RETURN_TIMEOUT = "【终止说明】软时间预算已耗尽，承包商强制返回（timeout）。"
 _MAX_TURNS = 16
 
 _RESULT_SCHEMA: dict[str, Any] = {
@@ -304,21 +316,74 @@ def _interpret_native_turn(response: str, tool_calls: Sequence[Mapping[str, Any]
     return outcome
 
 
-async def _reject_nested_procedures(
+def _format_attempted_tools(requests: Sequence[ProcedureRequest]) -> str:
+    if not requests:
+        return ""
+    lines = []
+    for req in requests:
+        args = dict(req.arguments or {})
+        lines.append(f"- {req.procedure_id}: {json.dumps(args, ensure_ascii=False)}")
+    return "尝试的工具调用：\n" + "\n".join(lines)
+
+
+def _compose_force_return_text(
+    *,
+    last_text: str,
+    attempted: Sequence[ProcedureRequest],
+    note: str,
+) -> str:
+    parts: list[str] = []
+    body = str(last_text or "").strip()
+    if body:
+        parts.append(body)
+    tools = _format_attempted_tools(attempted)
+    if tools:
+        parts.append(tools)
+    parts.append(note)
+    return "\n\n".join(parts)
+
+
+def _is_forbidden_nested(procedure_id: str) -> bool:
+    return str(procedure_id) in _FORBIDDEN_NESTED_PROCEDURE_IDS
+
+
+async def _run_nested_procedures(
     requests: Sequence[ProcedureRequest],
     *,
     deps: ContractorDeps,
-) -> list[str]:
-    """Task 6 stub：全部拒绝；Task 7 再打开 allowlist。"""
+) -> tuple[list[str], float]:
+    """执行 allowlist 内嵌套调用；禁止项写入错误；返回 (transcript notes, nested_charge_sum)。"""
 
     notes: list[str] = []
+    nested_charged = 0.0
     for req in requests:
         pid = str(req.procedure_id)
-        if deps.invoke_nested_procedure is not None:
-            # 预留 Task 7 钩子：即便注入了 invoker，本任务仍统一拒绝。
-            pass
-        notes.append(_NESTED_REJECT_MESSAGE.format(procedure_id=pid))
-    return notes
+        if _is_forbidden_nested(pid):
+            notes.append(_NESTED_REJECT_MESSAGE.format(procedure_id=pid))
+            continue
+        if deps.invoke_nested_procedure is None:
+            notes.append(_NESTED_RUNTIME_MISSING.format(procedure_id=pid))
+            continue
+        try:
+            result = await deps.invoke_nested_procedure(
+                pid,
+                dict(req.arguments or {}),
+                credits=float(req.credits or 0.0),
+                call_id=req.call_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — 嵌套失败写入 transcript，不中断承包商
+            notes.append(f"嵌套 Procedure 执行异常（{pid}）：{type(exc).__name__}: {exc}")
+            continue
+        charge = extract_research_credits_charged(result)
+        nested_charged += charge
+        if getattr(result, "success", False):
+            data = getattr(result, "data", None)
+            payload = json.dumps(data, ensure_ascii=False) if data is not None else "null"
+            notes.append(f"{pid} → success charge={charge}: {payload}")
+        else:
+            err = getattr(result, "error", None) or {}
+            notes.append(f"{pid} → error charge={charge}: {err}")
+    return notes, nested_charged
 
 
 def _meter_turn(*, prices: Any, model_name: str, usage: Any) -> float:
@@ -468,14 +533,31 @@ async def run_contractor(
     ]
 
     total_charged = 0.0
+    internal_balance = float(credit_budget)
     turn_count = 0
     last_text = ""
     tools = CONTRACTOR_NATIVE_TOOLS if protocol == "native_tools" else None
     termination_reason = "returned"
     llm_failure: tuple[str, str] | None = None
+    force_return_text: str | None = None
+    loop_started = time.monotonic()
 
     try:
         while turn_count < _MAX_TURNS:
+            # Soft timeout：在下一轮模型调用前检查（保证至少能跑完已开始的一轮结算）。
+            if (
+                turn_count > 0
+                and time_budget_seconds > 0
+                and (time.monotonic() - loop_started) >= time_budget_seconds
+            ):
+                termination_reason = "timeout"
+                force_return_text = _compose_force_return_text(
+                    last_text=last_text,
+                    attempted=(),
+                    note=_FORCE_RETURN_TIMEOUT,
+                )
+                break
+
             turn_count += 1
             request = GenerationRequest(
                 selector=selector,
@@ -488,6 +570,7 @@ async def run_contractor(
             model_name = str(getattr(result, "model_name", "") or "")
             turn_charge = _meter_turn(prices=prices, model_name=model_name, usage=usage)
             total_charged += turn_charge
+            internal_balance -= turn_charge
 
             success = bool(getattr(result, "success", True))
             if not success:
@@ -518,14 +601,37 @@ async def run_contractor(
                 )
             messages.append({"role": "assistant", "content": assistant_content})
 
+            # 4. 余额不足 → 立即强制返回（即使同轮有 return / procedures，也不执行嵌套）
+            if internal_balance < 0:
+                termination_reason = "insufficient_funds"
+                force_return_text = _compose_force_return_text(
+                    last_text=last_text,
+                    attempted=outcome.procedure_requests,
+                    note=_FORCE_RETURN_INSUFFICIENT,
+                )
+                break
+
+            # 5. 显式 return
             if outcome.explicit_return is not None:
                 last_text = str(outcome.explicit_return)
                 termination_reason = "returned"
                 break
 
             notes: list[str] = list(outcome.native_call_notes)
-            if outcome.procedure_requests:
-                notes.extend(await _reject_nested_procedures(outcome.procedure_requests, deps=deps))
+
+            # 6. 无工具 / 无 procedure → 末条正文返回
+            if not outcome.procedure_requests:
+                termination_reason = "returned"
+                break
+
+            # 7. 嵌套 procedures（allowlist + 计费折入）
+            nested_notes, nested_charge = await _run_nested_procedures(
+                outcome.procedure_requests,
+                deps=deps,
+            )
+            notes.extend(nested_notes)
+            total_charged += nested_charge
+            internal_balance -= nested_charge
 
             if notes:
                 messages.append(
@@ -534,11 +640,25 @@ async def run_contractor(
                         "content": "procedure_results:\n" + "\n".join(f"- {note}" for note in notes),
                     }
                 )
-                continue
 
-            # 无工具 / 无 procedure → 末条正文返回
-            termination_reason = "returned"
-            break
+            if internal_balance < 0:
+                termination_reason = "insufficient_funds"
+                force_return_text = _compose_force_return_text(
+                    last_text=last_text,
+                    attempted=outcome.procedure_requests,
+                    note=_FORCE_RETURN_INSUFFICIENT,
+                )
+                break
+
+            # 8. Soft timeout：嵌套结算后、进入下一轮前再检查一次
+            if time_budget_seconds > 0 and (time.monotonic() - loop_started) >= time_budget_seconds:
+                termination_reason = "timeout"
+                force_return_text = _compose_force_return_text(
+                    last_text=last_text,
+                    attempted=outcome.procedure_requests,
+                    note=_FORCE_RETURN_TIMEOUT,
+                )
+                break
         else:
             termination_reason = "returned"
     finally:
@@ -562,8 +682,9 @@ async def run_contractor(
             charged=charged,
         )
 
+    result_text = force_return_text if force_return_text is not None else (last_text or "")
     return _success(
-        last_text or "",
+        result_text,
         charged=charged,
         termination_reason=termination_reason,
         metadata=common_meta,
