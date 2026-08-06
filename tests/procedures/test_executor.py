@@ -221,6 +221,69 @@ async def test_timeout_seconds_zero_disables_hard_wait() -> None:
 
 
 @pytest.mark.asyncio
+async def test_contractor_definition_hard_timeout_returns_procedure_timeout() -> None:
+    """builtin.contractor 目录硬超时：慢 API → procedure_timeout（非幂等不重试）。"""
+
+    async def hangs() -> dict[str, Any]:
+        await asyncio.sleep(0.1)
+        return {
+            "success": True,
+            "data": {"result": "late"},
+            "error": None,
+            "metadata": {},
+        }
+
+    api = FakeAPI({"builtin.contractor": hangs})
+    executor = ProcedureExecutor(
+        catalog(definition("builtin.contractor", timeout_seconds=0.01)),
+        api=api,
+    )
+
+    event = await executor.invoke_many(
+        effect([ProcedureRequest(procedure_id="builtin.contractor")])
+    )
+
+    assert len(api.calls) == 1
+    assert event.results[0].result.error["code"] == "procedure_timeout"
+
+
+@pytest.mark.asyncio
+async def test_contractor_hard_timeout_coexists_with_disabled_hard_wait() -> None:
+    """软硬共存冒烟：同一 procedure_id 上硬超时开启则超时，关闭则慢调用仍成功。"""
+
+    async def slow() -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return {
+            "success": True,
+            "data": {"result": "ok"},
+            "error": None,
+            "metadata": {},
+            "research_credits_charged": 0.0,
+        }
+
+    hard_api = FakeAPI({"builtin.contractor": slow})
+    hard_executor = ProcedureExecutor(
+        catalog(definition("builtin.contractor", timeout_seconds=0.01)),
+        api=hard_api,
+    )
+    hard_event = await hard_executor.invoke_many(
+        effect([ProcedureRequest(procedure_id="builtin.contractor")])
+    )
+    assert hard_event.results[0].result.error["code"] == "procedure_timeout"
+
+    soft_api = FakeAPI({"builtin.contractor": slow})
+    soft_executor = ProcedureExecutor(
+        catalog(definition("builtin.contractor", timeout_seconds=0.0)),
+        api=soft_api,
+    )
+    soft_event = await soft_executor.invoke_many(
+        effect([ProcedureRequest(procedure_id="builtin.contractor")])
+    )
+    assert soft_event.results[0].result.success
+    assert soft_event.results[0].result.error is None
+
+
+@pytest.mark.asyncio
 async def test_invalid_provider_result_is_structured_without_raw_payload() -> None:
     api = FakeAPI({"builtin.bad": {"success": "yes", "secret": "do-not-persist"}})
     executor = ProcedureExecutor(catalog(definition("builtin.bad")), api=api)
