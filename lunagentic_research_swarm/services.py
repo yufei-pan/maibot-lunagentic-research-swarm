@@ -497,6 +497,7 @@ class LRSServiceContainer:
             provider=provider,
             summarizer=summarizer,
             price_catalog=price_catalog,
+            round_snapshot_for_task=round_snapshot_for_task,
         )
         provider.bind_contractor_deps(
             ContractorDeps(

@@ -102,7 +102,10 @@ class StablePromptBuilder:
             "architecture_rules": {
                 "quick_thinker_role": "本轮起始协调者与普通调查智能体",
                 "delegation": "子分支继承上下文并收到明确 assignment",
-                "credits": "LLM 调用消耗研究 credits；Procedure 不消耗研究 credits；零余额仍可零额委派，负余额不得启动后代",
+                "credits": (
+                    "LLM 调用消耗研究 credits；Procedure 可通过 research_credits_charged 扣减研究 credits；"
+                    "external_cost* 仅作遥测不触碰余额；零余额仍可零额委派，负余额不得启动后代"
+                ),
                 "protocol": "每个 turn 必须提交唯一 swarm envelope",
             },
             "agents": agent_catalog,

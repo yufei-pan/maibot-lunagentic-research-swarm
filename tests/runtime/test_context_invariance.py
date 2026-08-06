@@ -78,6 +78,26 @@ def test_stable_system_prefix_is_canonical_and_runtime_header_changes_only_suffi
     assert "本 turn 后不能启动后代" in second[-1]["content"]
 
 
+def test_architecture_credits_rule_allows_procedure_debit_via_research_credits_charged() -> None:
+    """Agent-facing architecture_rules.credits 须反映 procedure 可扣费（旧「不消耗」已推翻）。"""
+
+    builder = StablePromptBuilder(
+        formalized_task=FormalizedTask.create("任务"),
+        swarm_identity="swarm",
+        bot_profile={"nickname": "n"},
+        agent_catalog={},
+        procedure_catalog={},
+        pricing={},
+    )
+    system = builder.system_message
+    assert "Procedure 不消耗研究 credits" not in system
+    assert "research_credits_charged" in system
+    assert "external_cost*" in system
+    assert "零余额仍可零额委派" in system
+    assert "负余额不得启动后代" in system
+    assert "LLM 调用消耗研究 credits" in system
+
+
 def test_auto_compact_honors_override_precedence_and_model_window() -> None:
     assert should_auto_compact(5000, agent_override=4000, definition=8000, global_threshold=9000)
     assert not should_auto_compact(5000, agent_override=None, definition=8000, global_threshold=4000)

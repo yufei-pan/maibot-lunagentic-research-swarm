@@ -409,6 +409,71 @@ async def test_contractor_nested_compact_adds_to_bill(
 
 
 @pytest.mark.asyncio
+async def test_nested_compact_prefers_frozen_round_price_catalog_over_live() -> None:
+    """嵌套 compact 与 turn metering 同源：有 round snapshot 时用冻结 catalog，忽略 live。"""
+
+    from lunagentic_research_swarm.llm.pricing import PriceCatalog, PriceProfile, TokenUsage
+    from lunagentic_research_swarm.llm.summarizer import SummaryResult
+    from test_memory import FakeCtx
+
+    compact_usage = TokenUsage(100, 50, 0, 100, source="actual")
+    frozen_charge = 0.2
+    live_charge_if_used = 2.0  # 10× frozen；若误用 live 会落到此值
+    live_catalog = PriceCatalog.from_sources(
+        {},
+        {"model:test": PriceProfile(price_in=100.0, price_out=200.0)},
+        {},
+    )
+    frozen_catalog = PriceCatalog.from_sources(
+        {},
+        {"model:test": PriceProfile(price_in=10.0, price_out=20.0)},
+        {},
+    )
+    frozen_snapshot = SimpleNamespace(price_catalog=frozen_catalog)
+
+    class _CompactSummarizer:
+        async def compact_branch(self, request: Any) -> SummaryResult:
+            del request
+            return SummaryResult(True, "冻结价摘要", "model:test", compact_usage, None)
+
+    nested = make_nested_procedure_invoker(
+        provider=BundledProcedureProvider(FakeCtx()),
+        summarizer=_CompactSummarizer(),
+        price_catalog=live_catalog,
+        round_snapshot_for_task=lambda task_id: frozen_snapshot if task_id == "task-frozen" else None,
+    )
+    result = await nested(
+        "core.compact",
+        {},
+        scoped_metadata={
+            "task_id": "task-frozen",
+            "formalized_task": "旁路问题",
+            "branch_history": [{"role": "user", "content": "旁路问题"}],
+        },
+    )
+    assert result.success is True
+    assert float(result.research_credits_charged) == pytest.approx(frozen_charge)
+    assert float(result.research_credits_charged) != pytest.approx(live_charge_if_used)
+
+    # 无 snapshot / 无 task_id 时仍回落 live
+    live_only = make_nested_procedure_invoker(
+        provider=BundledProcedureProvider(FakeCtx()),
+        summarizer=_CompactSummarizer(),
+        price_catalog=live_catalog,
+        round_snapshot_for_task=lambda _tid: None,
+    )
+    live_result = await live_only(
+        "core.compact",
+        {},
+        scoped_metadata={
+            "formalized_task": "旁路问题",
+            "branch_history": [{"role": "user", "content": "旁路问题"}],
+        },
+    )
+    assert float(live_result.research_credits_charged) == pytest.approx(live_charge_if_used)
+
+
+@pytest.mark.asyncio
 async def test_run_contractor_missing_agent_fails(contractor_harness: ContractorHarness) -> None:
     result = await run_contractor(
         arguments={"agent_id": "missing.agent", "question": "q"},

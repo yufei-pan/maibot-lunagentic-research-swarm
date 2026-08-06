@@ -353,17 +353,20 @@ async def _run_nested_procedures(
     deps: ContractorDeps,
     messages: Sequence[Mapping[str, Any]],
     outsider_task: str,
+    task_id: str = "",
 ) -> tuple[list[str], float]:
     """执行 allowlist 内嵌套调用；禁止项写入错误；返回 (transcript notes, nested_charge_sum)。
 
     嵌套 ``core.compact`` 时注入承包商 transcript 与 outsider 问题作为总结上下文
     （agent 侧常见空 arguments），使 compact 可成功并申报计费。
+    ``task_id`` 传入 nested invoker，以便 compact 计价使用冻结 round ``price_catalog``。
     """
 
     notes: list[str] = []
     nested_charged = 0.0
     transcript = [dict(item) for item in messages if isinstance(item, Mapping)]
     task_text = str(outsider_task or "").strip() or "承包商旁路问题"
+    scoped_task_id = str(task_id or "").strip()
     for req in requests:
         pid = str(req.procedure_id)
         if _is_forbidden_nested(pid):
@@ -373,11 +376,11 @@ async def _run_nested_procedures(
             notes.append(_NESTED_RUNTIME_MISSING.format(procedure_id=pid))
             continue
         scoped: dict[str, Any] = {}
+        if scoped_task_id:
+            scoped["task_id"] = scoped_task_id
         if pid == "core.compact":
-            scoped = {
-                "formalized_task": task_text,
-                "branch_history": list(transcript),
-            }
+            scoped["formalized_task"] = task_text
+            scoped["branch_history"] = list(transcript)
         try:
             result = await deps.invoke_nested_procedure(
                 pid,
@@ -645,6 +648,7 @@ async def run_contractor(
                 deps=deps,
                 messages=messages,
                 outsider_task=question,
+                task_id=str(scoped_metadata.get("task_id") or ""),
             )
             notes.extend(nested_notes)
             total_charged += nested_charge
@@ -741,10 +745,28 @@ def make_nested_procedure_invoker(
     provider: Any,
     summarizer: Any | None = None,
     price_catalog: Any | None = None,
+    round_snapshot_for_task: Callable[[str], Any | None] | None = None,
 ) -> Callable[..., Awaitable[ProcedureResult]]:
-    """构造 handler-local 嵌套 invoker：走 provider / core.compact，不经外层 batch 扣费。"""
+    """构造 handler-local 嵌套 invoker：走 provider / core.compact，不经外层 batch 扣费。
+
+    嵌套 ``core.compact`` 计价优先使用 ``round_snapshot_for_task`` 冻结的
+    ``price_catalog``（与 turn metering 同源）；无 snapshot 时才回落 live catalog。
+    """
 
     from lunagentic_research_swarm.procedures.core import CORE_COMPACT_ID, execute_core_procedure
+
+    def _resolve_compact_price_catalog(meta: Mapping[str, Any]) -> Any | None:
+        task_id = str(meta.get("task_id") or "").strip()
+        if task_id and round_snapshot_for_task is not None:
+            try:
+                snapshot = round_snapshot_for_task(task_id)
+            except Exception:
+                snapshot = None
+            if snapshot is not None:
+                frozen = getattr(snapshot, "price_catalog", None)
+                if frozen is not None:
+                    return frozen
+        return price_catalog
 
     async def _invoke(
         procedure_id: str,
@@ -778,7 +800,7 @@ def make_nested_procedure_invoker(
                 summarizer=summarizer,
                 formalized_task=formalized,
                 branch_history=history,
-                price_catalog=price_catalog,
+                price_catalog=_resolve_compact_price_catalog(meta),
                 bill_research_credits=True,
             )
         if pid.startswith("core.") or pid == CONTRACTOR_PROCEDURE_ID:

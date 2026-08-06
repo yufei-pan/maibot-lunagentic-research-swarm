@@ -8,8 +8,9 @@
 - **Host 价格优先**。仅当插件 `[pricing.models."<ModelInfo.name>"]` 存在该模型条目时，才完整覆盖 Host 同模型全部价格字段；条目内未写字段按 **0（免费）**。
 - Host 与插件均无价格 → 按免费；低预算警告阈值约 **500k cache-miss 输入 token / 50k 输出 token**（可配置），只警告不拒绝。
 - 根智能体获得 100% 初始 credits。普通智能体先付自身输入/输出，再从剩余 `R` 按比例分配子请求；`R < 0` 时 Procedure 仍完成，但不启动新委派。
-- 零余额仍可零 credits 委派；负余额触发 credits 终止。
-- **总结器与普通 Procedure 不扣研究 credits**；其 token / cost-equivalent / 外部费用另计。
+- 零余额仍可零 credits 委派；负余额触发 credits 终止（不得启动后代）。
+- **LLM turn 消耗研究 credits**。Procedure 可通过 `research_credits_charged` 扣减研究分支余额；`external_cost*` 仅作遥测，不触碰余额。
+- 自动 compact / 总结器 telemetry 不扣研究 credits；智能体请求的 `core.compact` 与其他可计费 Procedure 经 `research_credits_charged` 申报。
 
 分配是转移，不能制造 credits。账本与任务状态在同一 SQLite 事务中提交。
 
@@ -27,7 +28,7 @@
 - **pause**：在途调用到安全边界后暂停新 LLM 调度。
 - **continue**：重置计时；有叶子则重分配 pool；无叶子则只从 summary layer 开新 round。
 - **stop**：停止调度、丢弃迟到结果、不总结；可触发反馈提醒。
-- **checkpoint / compact / terminate**：core Procedure，由总结器执行；不扣研究 credits。
+- **checkpoint / terminate**：core Procedure，由总结器执行；不扣研究 credits。自动 compact 不扣；agent 请求的 `core.compact` 经 `research_credits_charged` 计费。
 
 中间报告先写入 SQLite + outbox，再 Maisaka `context.append` 与 `proactive.trigger`。最终报告正文含插件生成的**确定性统计**（不得由 LLM 臆造）。
 
