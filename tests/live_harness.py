@@ -247,6 +247,7 @@ def use_stub_procedures(harness: Any, fixtures: Mapping[str, Any]) -> None:
     fixture_map = {str(key): value for key, value in dict(fixtures or {}).items()}
     harness._stub_search_fixtures = fixture_map
     harness.stub_search_invokes = 0
+    harness._live_procedure_catalog = None
 
     async def _stub_invoke(
         *,
@@ -334,14 +335,24 @@ def use_live_procedures(harness: Any, web_search_config: Mapping[str, Any] | Non
         )
 
     harness._effect_local_invokers = {_STUB_INVOKE_API: _live_invoke}
-    # Prefer real web_search schema (engine required + enum) so the live LLM can call correctly.
-    live_entry = _web_search_catalog_entry_from_provider(provider)
-    catalog = _build_drain_procedure_catalog(include_web_search=True)
-    if live_entry is not None:
-        entries = {procedure_id: _core_catalog_entry(procedure_id) for procedure_id in _CORE_IDS}
-        entries[WEB_SEARCH_PROCEDURE_ID] = live_entry
-        catalog = _catalog_from_entries(entries)
+    # Persist intended live catalog: use_live_procedures often runs before start, when
+    # _shared_snapshot may be missing; _ensure_drain_catalogs installs it post-start.
+    catalog = _build_live_procedure_catalog(provider)
+    harness._live_procedure_catalog = catalog
     _install_procedure_catalog(harness, catalog)
+
+
+def _build_live_procedure_catalog(provider: Any) -> Any:
+    """Drain catalog with real ``builtin.web_search`` schema (required engine+query)."""
+
+    entries: dict[str, Any] = {procedure_id: _core_catalog_entry(procedure_id) for procedure_id in _CORE_IDS}
+    live_entry = _web_search_catalog_entry_from_provider(provider)
+    if live_entry is not None:
+        entries[WEB_SEARCH_PROCEDURE_ID] = live_entry
+    else:
+        # Provider omitted web_search (no engines); still expose a live-shaped schema.
+        entries[WEB_SEARCH_PROCEDURE_ID] = _web_search_catalog_entry_live_fallback()
+    return _catalog_from_entries(entries)
 
 
 def _web_search_catalog_entry_from_provider(provider: Any) -> Any | None:
@@ -372,29 +383,62 @@ def _web_search_catalog_entry_from_provider(provider: Any) -> Any | None:
     return None
 
 
+def _web_search_catalog_entry_live_fallback() -> Any:
+    """Live-shaped schema when provider.describe() omits web_search (engine required)."""
+
+    definition = SimpleNamespace(
+        procedure_id=WEB_SEARCH_PROCEDURE_ID,
+        display_name="网页搜索",
+        description="按指定引擎执行网页搜索。arguments 必填 engine 与 query。",
+        timeout_seconds=30.0,
+        idempotent=True,
+        arguments_schema={
+            "type": "object",
+            "properties": {
+                "engine": {"type": "string", "enum": ["duckduckgo"]},
+                "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "required": ["engine", "query"],
+            "additionalProperties": False,
+        },
+        enabled=True,
+    )
+    return SimpleNamespace(
+        definition=definition,
+        provider_plugin_id="builtin",
+        api_name=_STUB_INVOKE_API,
+        api_version="1",
+        fingerprint=f"live:{WEB_SEARCH_PROCEDURE_ID}",
+    )
+
+
 def _install_web_search_catalog(harness: Any) -> None:
     _install_procedure_catalog(harness, _build_drain_procedure_catalog(include_web_search=True))
 
 
-def _install_procedure_catalog(harness: Any, catalog: Any) -> None:
-    snapshot = getattr(harness, "_shared_snapshot", None)
-    if snapshot is None:
-        return
-    snapshot.procedure_catalog = catalog
-    agent_catalog = getattr(snapshot, "agent_catalog", None)
-    if agent_catalog is None:
-        return
-
+def _patch_resolve_allowed_procedures(agent_catalog: Any, *, include_web_search: bool) -> None:
     def resolve_allowed_procedures(_agent_id: str, procedures: Any) -> tuple[str, ...]:
         ids = list(getattr(procedures, "ids", ()) or ())
         for core_id in _CORE_IDS:
             if core_id not in ids:
                 ids.append(core_id)
-        if WEB_SEARCH_PROCEDURE_ID not in ids:
+        if include_web_search and WEB_SEARCH_PROCEDURE_ID not in ids:
             ids.append(WEB_SEARCH_PROCEDURE_ID)
         return tuple(ids)
 
     agent_catalog.resolve_allowed_procedures = resolve_allowed_procedures  # type: ignore[attr-defined]
+
+
+def _install_procedure_catalog(harness: Any, catalog: Any, *, snapshot: Any | None = None) -> None:
+    snap = snapshot if snapshot is not None else getattr(harness, "_shared_snapshot", None)
+    if snap is None:
+        return
+    snap.procedure_catalog = catalog
+    agent_catalog = getattr(snap, "agent_catalog", None)
+    if agent_catalog is None:
+        return
+    _patch_resolve_allowed_procedures(agent_catalog, include_web_search=True)
 
 
 def _ensure_drain_catalogs(harness: Any) -> None:
@@ -412,30 +456,30 @@ def _ensure_drain_catalogs(harness: Any) -> None:
     if agent_catalog is None:
         raise RuntimeError("round snapshot 缺少 agent_catalog")
 
-    if not callable(getattr(agent_catalog, "resolve_allowed_procedures", None)):
+    live_catalog = getattr(harness, "_live_procedure_catalog", None)
+    if live_catalog is not None:
+        # Live tools: always install persisted live schema (not stub) on the round snapshot.
+        _install_procedure_catalog(harness, live_catalog, snapshot=snapshot)
+    else:
+        if not callable(getattr(agent_catalog, "resolve_allowed_procedures", None)):
+            include_ws = bool(getattr(harness, "_stub_search_fixtures", None)) or bool(
+                getattr(harness, "_effect_local_invokers", None)
+            )
+            _patch_resolve_allowed_procedures(agent_catalog, include_web_search=include_ws)
 
-        def resolve_allowed_procedures(_agent_id: str, procedures: Any) -> tuple[str, ...]:
-            ids = list(getattr(procedures, "ids", ()) or ())
-            for core_id in _CORE_IDS:
-                if core_id not in ids:
-                    ids.append(core_id)
-            return tuple(ids)
-
-        agent_catalog.resolve_allowed_procedures = resolve_allowed_procedures  # type: ignore[attr-defined]
-
-    procedure_catalog = getattr(snapshot, "procedure_catalog", None)
-    include_web_search = bool(getattr(harness, "_stub_search_fixtures", None)) or bool(
-        getattr(harness, "_effect_local_invokers", None)
-    )
-    existing_ids = set(getattr(procedure_catalog, "ids", ()) or ()) if procedure_catalog is not None else set()
-    needs_catalog = (
-        procedure_catalog is None
-        or not callable(getattr(procedure_catalog, "get", None))
-        or CORE_TERMINATE_ID not in existing_ids
-        or (include_web_search and WEB_SEARCH_PROCEDURE_ID not in existing_ids)
-    )
-    if needs_catalog:
-        snapshot.procedure_catalog = _build_drain_procedure_catalog(include_web_search=include_web_search)
+        procedure_catalog = getattr(snapshot, "procedure_catalog", None)
+        include_web_search = bool(getattr(harness, "_stub_search_fixtures", None)) or bool(
+            getattr(harness, "_effect_local_invokers", None)
+        )
+        existing_ids = set(getattr(procedure_catalog, "ids", ()) or ()) if procedure_catalog is not None else set()
+        needs_catalog = (
+            procedure_catalog is None
+            or not callable(getattr(procedure_catalog, "get", None))
+            or CORE_TERMINATE_ID not in existing_ids
+            or (include_web_search and WEB_SEARCH_PROCEDURE_ID not in existing_ids)
+        )
+        if needs_catalog:
+            snapshot.procedure_catalog = _build_drain_procedure_catalog(include_web_search=include_web_search)
 
     # Integration harness price catalog lacks estimate_model_for_selector; free estimate.
     price_catalog = getattr(snapshot, "price_catalog", None)

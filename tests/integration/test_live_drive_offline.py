@@ -4,8 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fakes import FakeLLMResponse
-from live_harness import drive_until_terminal
+from fakes import FakeLLMResponse, RuntimeHarness
+from live_harness import (
+    WEB_SEARCH_PROCEDURE_ID,
+    attach_effect_runner,
+    drive_until_terminal,
+)
 
 from lunagentic_research_swarm.models import TaskStatus
 from lunagentic_research_swarm.procedures.core import CORE_TERMINATE_ID
@@ -62,3 +66,46 @@ async def test_drive_until_terminal_timeout_dumps_artifacts(runtime_harness, tmp
     assert (artifact_dir / "final_status.json").is_file()
     assert (artifact_dir / "scheduler_pending.txt").is_file()
     harness.llm.release()
+
+
+def _assert_live_web_search_schema(harness) -> None:
+    snapshot = harness.manager._round_snapshots.get(harness.task_id)
+    assert snapshot is not None
+    catalog = snapshot.procedure_catalog
+    entry = catalog.get(WEB_SEARCH_PROCEDURE_ID)
+    assert entry is not None, "drain catalog must include builtin.web_search"
+    schema = dict(getattr(entry.definition, "arguments_schema", {}) or {})
+    required = list(schema.get("required") or [])
+    assert "engine" in required, f"live schema must require engine, got required={required!r}"
+    assert "query" in required, f"live schema must require query, got required={required!r}"
+    assert str(getattr(entry, "fingerprint", "")).startswith("live:"), entry.fingerprint
+
+
+@pytest.mark.asyncio
+async def test_use_live_procedures_catalog_reaches_drain_after_start(runtime_harness) -> None:
+    """Live web_search schema (engine required) must survive open→use_live→start→attach."""
+
+    harness = runtime_harness
+    harness.use_live_procedures({})  # WebSearchSection defaults; no network / web_search_enabled
+    await harness.start("离线 live catalog 自测", credits=20.0, time_budget=60)
+    await harness.formalize("正式任务：校验 live procedure catalog 已安装。")
+    attach_effect_runner(harness)
+    _assert_live_web_search_schema(harness)
+
+
+@pytest.mark.asyncio
+async def test_use_live_procedures_before_open_reaches_drain(tmp_path: Path) -> None:
+    """use_live_procedures before open must not lose live catalog to stub on drain."""
+
+    harness = RuntimeHarness(tmp_path / "before-open")
+    assert harness._shared_snapshot is None
+    harness.use_live_procedures({"enabled_engines": ["duckduckgo"]})
+    assert getattr(harness, "_live_procedure_catalog", None) is not None
+    await harness.open()
+    try:
+        await harness.start("离线 live catalog before-open", credits=20.0, time_budget=60)
+        await harness.formalize("正式任务：before-open live catalog。")
+        attach_effect_runner(harness)
+        _assert_live_web_search_schema(harness)
+    finally:
+        await harness.close()

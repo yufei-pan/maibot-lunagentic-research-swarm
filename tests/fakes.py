@@ -391,6 +391,7 @@ class RuntimeHarness:
         self._started = False
         self.stub_search_invokes = 0
         self.live_search_invokes = 0
+        self._live_procedure_catalog: Any | None = None
         # Mirrored into ResearchManager; deliver_* must be set before formalize
         # (ReportCoordinator reads them at registration).
         self._runtime_limits: dict[str, Any] = dict(runtime_limits or {})
