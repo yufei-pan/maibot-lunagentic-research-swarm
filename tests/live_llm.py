@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import time
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from lunagentic_research_swarm.llm.gateway import GenerationRequest, GenerationResult
+from lunagentic_research_swarm.llm.pricing import TokenUsage
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CREDENTIALS_PATH = REPO_ROOT / ".debug_api_call_credentials"
@@ -104,9 +109,109 @@ async def chat_completion(
     }
 
 
+def _messages_for_chat(messages: Any) -> list[dict[str, Any]]:
+    if isinstance(messages, str):
+        text = messages.strip()
+        return [{"role": "user", "content": text}] if text else []
+    if messages is None:
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in messages:
+        if isinstance(item, Mapping):
+            normalized.append(dict(item))
+        else:
+            normalized.append({"role": "user", "content": str(item)})
+    return normalized
+
+
+class LiveLLMGateway:
+    """OpenAI-compatible chat completions → ``GenerationResult`` for TurnWorker live drives."""
+
+    def __init__(self, credentials: LiveLLMCredentials) -> None:
+        self._credentials = credentials
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate(
+        self,
+        request: GenerationRequest | None = None,
+        *,
+        selector: str | None = None,
+        messages: Any = None,
+        **kwargs: Any,
+    ) -> GenerationResult:
+        if request is not None:
+            selector = request.selector.raw
+            messages = request.messages
+            kwargs = {
+                "tools": request.tools,
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens,
+            }
+        call = {"selector": selector or "", "messages": messages, **kwargs}
+        self.calls.append(call)
+
+        credentials = self._credentials
+        chat_messages = _messages_for_chat(messages)
+        payload: dict[str, Any] = {
+            "model": credentials.model,
+            "messages": chat_messages,
+            "temperature": credentials.temperature,
+        }
+        max_tokens = credentials.max_tokens
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        tools = kwargs.get("tools")
+        if tools is not None:
+            payload["tools"] = tools
+
+        headers = {
+            "Authorization": f"Bearer {credentials.api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{credentials.base_url}/chat/completions"
+        started = time.perf_counter()
+        async with httpx.AsyncClient(timeout=credentials.timeout_seconds) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            body = response.json()
+        duration = time.perf_counter() - started
+
+        choice = (body.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        raw_tool_calls = message.get("tool_calls")
+        tool_calls: list[dict[str, Any]] | None = None
+        if isinstance(raw_tool_calls, list) and raw_tool_calls:
+            tool_calls = [dict(item) for item in raw_tool_calls if isinstance(item, dict)]
+            if not tool_calls:
+                tool_calls = None
+
+        usage = body.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        cache_hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+        cache_miss = int(usage.get("prompt_cache_miss_tokens") or usage.get("prompt_tokens") or 0)
+        return GenerationResult(
+            response=str(content),
+            tool_calls=tool_calls,
+            model_name=str(body.get("model") or credentials.model),
+            usage=TokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cache_hit_tokens=cache_hit,
+                cache_miss_tokens=cache_miss,
+                source="actual",
+            ),
+            success=True,
+            error=None,
+            duration=duration,
+        )
+
+
 __all__ = [
     "CREDENTIALS_PATH",
     "LiveLLMCredentials",
+    "LiveLLMGateway",
     "chat_completion",
     "credentials_available",
     "live_tools_available",
