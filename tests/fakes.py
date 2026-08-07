@@ -728,6 +728,29 @@ class RuntimeHarness:
     def resources_closed(self) -> bool:
         return self.store._connection is None and self.store._executor is None
 
+    def use_live_llm(self, creds: Any) -> None:
+        """Swap FakeLLMGateway for LiveLLMGateway (Task 5+ live tiers)."""
+
+        from live_llm import LiveLLMGateway
+
+        self.llm = LiveLLMGateway(creds)
+
+    async def drive_live_until_terminal(
+        self,
+        *,
+        timeout_seconds: float,
+        artifact_dir: Any = None,
+    ) -> dict[str, Any]:
+        """Delegate to ``live_harness.drive_until_terminal``."""
+
+        from live_harness import drive_until_terminal
+
+        return await drive_until_terminal(
+            self,
+            timeout_seconds=timeout_seconds,
+            artifact_dir=artifact_dir,
+        )
+
 
 __all__ = [
     "FakeClock",
