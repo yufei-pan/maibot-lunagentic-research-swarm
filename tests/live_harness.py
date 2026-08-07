@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,10 +15,10 @@ from lunagentic_research_swarm.procedures.core import (
     CORE_CHECKPOINT_ID,
     CORE_COMPACT_ID,
     CORE_TERMINATE_ID,
-    execute_core_procedure,
 )
 from lunagentic_research_swarm.procedures.executor import ProcedureExecutor
 from lunagentic_research_swarm.runtime.effect_runner import RuntimeEffectRunner
+from lunagentic_research_swarm.runtime.reducer import PerformBranchSummary
 from lunagentic_research_swarm.runtime.turns import TurnWorker
 
 _CORE_IDS = (CORE_TERMINATE_ID, CORE_COMPACT_ID, CORE_CHECKPOINT_ID)
@@ -28,31 +29,6 @@ class _ZeroPricing:
 
     def charge_actual(self, **_kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(credits=0.0)
-
-
-async def _core_terminate_invoker(
-    *,
-    version: str = "1",
-    procedure_id: str = CORE_TERMINATE_ID,
-    request_id: str = "",
-    arguments: dict[str, Any] | None = None,
-    scoped_metadata: dict[str, Any] | None = None,
-    **_kwargs: Any,
-) -> dict[str, Any]:
-    """Local invoker for ``core.terminate`` (control path usually skips API; kept for wiring)."""
-
-    _ = version, scoped_metadata
-    result = await execute_core_procedure(str(procedure_id or CORE_TERMINATE_ID), dict(arguments or {}))
-    payload = result.model_dump(mode="python")
-    metadata = dict(payload.get("metadata") or {})
-    if request_id:
-        metadata["request_id"] = request_id
-    payload["metadata"] = metadata
-    return payload
-
-
-def _core_local_invokers() -> dict[str, Any]:
-    return {CORE_TERMINATE_ID: _core_terminate_invoker}
 
 
 def _ensure_drain_catalogs(harness: Any) -> None:
@@ -128,9 +104,12 @@ def attach_effect_runner(harness: Any, *, pricing: Any | None = None) -> Runtime
         raise RuntimeError("attach_effect_runner 需要已 open/start 的 RuntimeHarness")
     _ensure_drain_catalogs(harness)
 
-    local_invokers = _core_local_invokers()
-    if CORE_TERMINATE_ID not in local_invokers:
-        raise RuntimeError("local_invokers 必须包含 core.terminate")
+    # Production-aligned: core.terminate / compact / checkpoint are control flags from
+    # ``split_procedure_requests`` inside ProcedureExecutor.invoke_many — they never call
+    # ``local_invokers``. Only ordinary (non-core) procedures use local_invokers / host API
+    # (see services._procedure_local_invokers → builtin.invoke_procedure). Offline drain
+    # therefore passes an empty map; catalog allowlisting of core.* is still required above.
+    local_invokers: dict[str, Any] = {}
 
     def procedure_factory(catalog: Any) -> ProcedureExecutor:
         return ProcedureExecutor(
@@ -184,6 +163,24 @@ async def _dump_timeout_artifacts(harness: Any, artifact_dir: Path) -> None:
         (artifact_dir / "last_report.txt").write_text(report_text, encoding="utf-8")
 
 
+def _record_branch_summary_reason(harness: Any, effect: Any) -> None:
+    """Accumulate PerformBranchSummary.payload['reason'] for terminate-oracle tests."""
+
+    if not isinstance(effect, PerformBranchSummary):
+        return
+    payload = getattr(effect, "payload", None)
+    if not isinstance(payload, Mapping):
+        return
+    reason = payload.get("reason")
+    if reason is None:
+        return
+    reasons = getattr(harness, "live_drain_branch_summary_reasons", None)
+    if not isinstance(reasons, list):
+        reasons = []
+        harness.live_drain_branch_summary_reasons = reasons
+    reasons.append(str(reason))
+
+
 async def drive_until_terminal(
     harness: Any,
     *,
@@ -194,6 +191,7 @@ async def drive_until_terminal(
 
     runner = attach_effect_runner(harness)
     deadline = time.monotonic() + float(timeout_seconds)
+    harness.live_drain_branch_summary_reasons = []
     terminal = {
         TaskStatus.COMPLETED.value,
         TaskStatus.COMPLETED_WITH_ERRORS.value,
@@ -208,7 +206,19 @@ async def drive_until_terminal(
             return status
         if harness.scheduler.enqueued:
             effect = harness.scheduler.enqueued.pop(0)
-            await runner.run(effect)
+            _record_branch_summary_reason(harness, effect)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(runner.run(effect), timeout=remaining)
+            except TimeoutError:
+                if artifact_dir is not None:
+                    await _dump_timeout_artifacts(harness, Path(artifact_dir))
+                raise TimeoutError(
+                    f"drive_until_terminal 超时（{timeout_seconds}s）：task_id={harness.task_id!s} "
+                    f"pending={len(harness.scheduler.enqueued)}（runner.run 未在剩余时间内完成）"
+                ) from None
             continue
         await asyncio.sleep(0.05)
     if artifact_dir is not None:
