@@ -373,12 +373,11 @@ async def deep_judge(
             "scores": {key: 0 for key in _DEEP_SCORE_KEYS},
         }
     scores = _normalize_deep_scores(payload.get("scores"))
-    model_pass = _coerce_bool(payload.get("pass"))
-    score_pass = all(scores[key] >= _DEEP_SCORE_MIN for key in _DEEP_SCORE_KEYS)
-    # 即便模型声称 pass，也以分数门槛为准，禁止静默放行。
-    passed = bool(model_pass and score_pass)
+    # 深度 pass 仅由分数门槛决定，无视模型自报的 pass（禁止静默放行）。
+    passed = all(scores[key] >= _DEEP_SCORE_MIN for key in _DEEP_SCORE_KEYS)
     reason = str(payload.get("reason") or "").strip() or "no reason"
-    if model_pass and not score_pass:
+    model_pass = _coerce_bool(payload.get("pass"))
+    if model_pass != passed:
         reason = f"{reason} (scores gate: require all >= {_DEEP_SCORE_MIN}, got {scores})"
     return {"pass": passed, "reason": reason, "scores": scores}
 
