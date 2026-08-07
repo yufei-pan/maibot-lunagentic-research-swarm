@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import tomllib
 from collections.abc import Mapping
@@ -16,6 +17,9 @@ from lunagentic_research_swarm.llm.pricing import TokenUsage
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CREDENTIALS_PATH = REPO_ROOT / ".debug_api_call_credentials"
+
+_DEEP_SCORE_KEYS = ("relevance", "completeness", "groundedness")
+_DEEP_SCORE_MIN = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,12 +212,185 @@ class LiveLLMGateway:
         )
 
 
+def _extract_first_json_object(text: str) -> str | None:
+    """从回复中提取第一个括号平衡的 ``{...}`` 对象（允许前后有包装文字）。"""
+
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            continue
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _parse_judge_payload(raw: str) -> dict[str, Any] | None:
+    candidate = _extract_first_json_object(raw) or raw.strip()
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def _judge_once(
+    credentials: LiveLLMCredentials,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    result = await chat_completion(credentials, messages)
+    response = str((result or {}).get("response") or "")
+    return _parse_judge_payload(response)
+
+
+async def _judge_with_one_parse_retry(
+    credentials: LiveLLMCredentials,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    payload = await _judge_once(credentials, messages)
+    if payload is not None:
+        return payload
+    return await _judge_once(credentials, messages)
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1", "pass"}:
+            return True
+        if lowered in {"false", "no", "0", "fail"}:
+            return False
+    return False
+
+
+async def light_judge(
+    credentials: LiveLLMCredentials,
+    *,
+    objective: str,
+    report: str,
+) -> dict[str, Any]:
+    """轻量判定：FINAL 是否回应形式化目标。仅返回 ``pass`` / ``reason``。"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是严格的研究报告评审。只输出一个 JSON 对象，不要 Markdown、不要代码围栏、不要其它文字。"
+                '键必须且仅有：{"pass": bool, "reason": string}。'
+                "pass=true 仅当报告实质回应了 objective；否则 pass=false。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"objective:\n{objective}\n\n"
+                f"report:\n{report}\n\n"
+                '请判定报告是否回应目标，并只输出 JSON：{"pass": bool, "reason": string}'
+            ),
+        },
+    ]
+    payload = await _judge_with_one_parse_retry(credentials, messages)
+    if payload is None:
+        return {"pass": False, "reason": "judge JSON parse failed after one retry"}
+    return {
+        "pass": _coerce_bool(payload.get("pass")),
+        "reason": str(payload.get("reason") or "").strip() or "no reason",
+    }
+
+
+def _normalize_deep_scores(raw_scores: Any) -> dict[str, int]:
+    source = raw_scores if isinstance(raw_scores, Mapping) else {}
+    scores: dict[str, int] = {}
+    for key in _DEEP_SCORE_KEYS:
+        value = source.get(key, 0)
+        try:
+            scores[key] = int(value)
+        except (TypeError, ValueError):
+            scores[key] = 0
+    return scores
+
+
+async def deep_judge(
+    credentials: LiveLLMCredentials,
+    *,
+    objective: str,
+    report: str,
+    evidence: str = "",
+) -> dict[str, Any]:
+    """深度量规：relevance / completeness / groundedness（1–5），Python 强制三项均 ≥ 3 才 pass。"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是严格的研究报告评审。只输出一个 JSON 对象，不要 Markdown、不要代码围栏、不要其它文字。"
+                "键必须包含：pass (bool)、reason (string)、"
+                'scores 对象 {"relevance": int, "completeness": int, "groundedness": int}，'
+                "三项分数均为 1–5 整数。"
+                "relevance：是否切题；completeness：是否覆盖目标；groundedness：是否可被 evidence/事实支撑。"
+                "仅当三项均 ≥ 3 时才可设 pass=true；否则 pass=false。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"objective:\n{objective}\n\n"
+                f"report:\n{report}\n\n"
+                f"evidence:\n{evidence}\n\n"
+                "请按量规打分并只输出 JSON："
+                '{"pass": bool, "reason": string, '
+                '"scores": {"relevance": int, "completeness": int, "groundedness": int}}'
+            ),
+        },
+    ]
+    payload = await _judge_with_one_parse_retry(credentials, messages)
+    if payload is None:
+        return {
+            "pass": False,
+            "reason": "judge JSON parse failed after one retry",
+            "scores": {key: 0 for key in _DEEP_SCORE_KEYS},
+        }
+    scores = _normalize_deep_scores(payload.get("scores"))
+    model_pass = _coerce_bool(payload.get("pass"))
+    score_pass = all(scores[key] >= _DEEP_SCORE_MIN for key in _DEEP_SCORE_KEYS)
+    # 即便模型声称 pass，也以分数门槛为准，禁止静默放行。
+    passed = bool(model_pass and score_pass)
+    reason = str(payload.get("reason") or "").strip() or "no reason"
+    if model_pass and not score_pass:
+        reason = f"{reason} (scores gate: require all >= {_DEEP_SCORE_MIN}, got {scores})"
+    return {"pass": passed, "reason": reason, "scores": scores}
+
+
 __all__ = [
     "CREDENTIALS_PATH",
     "LiveLLMCredentials",
     "LiveLLMGateway",
     "chat_completion",
     "credentials_available",
+    "deep_judge",
+    "light_judge",
     "live_tools_available",
     "load_live_llm_credentials",
 ]
