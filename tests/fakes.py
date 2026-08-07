@@ -272,7 +272,11 @@ class FakeSummarizer:
         await self.task_gate.wait()
         if self.task_failure is not None:
             return SummaryResult(False, "", "gpt-5.6-luna-max", None, self.task_failure)
-        return SummaryResult(True, "task-summary", "gpt-5.6-luna-max", None, None)
+        # Multi-branch FINAL (live E2E B): join coverage so light_judge sees agent reports.
+        coverage = getattr(request, "coverage_summaries", ()) or ()
+        parts = [str(item).strip() for item in coverage if str(item).strip()]
+        text = "\n".join(parts) if parts else "task-summary"
+        return SummaryResult(True, text, "gpt-5.6-luna-max", None, None)
 
 
 class FakeScheduler:
@@ -750,6 +754,33 @@ class RuntimeHarness:
             timeout_seconds=timeout_seconds,
             artifact_dir=artifact_dir,
         )
+
+    async def store_count_child_branches(self) -> int:
+        """Count durable branches with a non-null parent (survives coordinator prune)."""
+
+        round_id = str(self.round_id or "")
+
+        def _query(connection: Any) -> int:
+            if round_id:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM branches "
+                    "WHERE parent_branch_id IS NOT NULL AND parent_branch_id != '' "
+                    "AND round_id = ?",
+                    (round_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM branches "
+                    "WHERE parent_branch_id IS NOT NULL AND parent_branch_id != ''"
+                ).fetchone()
+            if row is None:
+                return 0
+            try:
+                return int(row["n"])
+            except (KeyError, IndexError, TypeError):
+                return int(row[0])
+
+        return int(await self.store.run_locked(_query))
 
 
 __all__ = [
