@@ -30,6 +30,8 @@ include = ["lunagentic_research_swarm*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Design Goal 6: default pytest stays offline; live tiers are opt-in via -m live_llm…
+addopts = "-m 'not live_llm and not live_llm_e2e and not live_llm_thorough and not live_llm_live_tools'"
 markers = [
     "live_llm: 需要仓库根 .debug_api_call_credentials 的真实 LLM 调用",
     "live_llm_e2e: A/B 端到端（seed formalize + light judge）",

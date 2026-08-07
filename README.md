@@ -108,11 +108,11 @@ PYTHONPATH=.:../maibot-plugin-sdk pytest -q
 python -m ruff check plugin.py lunagentic_research_swarm tests
 ```
 
-仅在明确平台条件（例如缺少 Lance wheel）时允许 pytest marker skip，并应在此 README 说明。当前 Linux x86_64 / aarch64 常规环境期望 **0 skipped**。
+仅在明确平台条件（例如缺少 Lance wheel）时允许 pytest marker skip，并应在此 README 说明。默认离线套件（不含 live markers）在 Linux x86_64 / aarch64 常规环境期望 **0 skipped**。
 
 ### Live LLM tests
 
-可选真实 LLM / 工具层，按 marker 分档；无可用凭证时 **skip**（不算失败）。模板见仓库根 `.debug_api_call_credentials.example`（复制为 gitignored 的 `.debug_api_call_credentials`）。**不要**提交真实 endpoint / API key。
+可选真实 LLM / 工具层，按 marker 分档。默认 `pytest` 通过 `addopts` **排除**全部 `live_llm*` markers（即使存在可用凭证也不会跑慢速 live 测试）。显式 `-m live_llm…` 覆盖默认过滤以 opt-in；无可用凭证时 **skip**（不算失败）。模板见仓库根 `.debug_api_call_credentials.example`（复制为 gitignored 的 `.debug_api_call_credentials`）。**不要**提交真实 endpoint / API key。
 
 | Marker | 内容 |
 |---|---|
@@ -122,6 +122,11 @@ python -m ruff check plugin.py lunagentic_research_swarm tests
 | `live_llm_live_tools` | 真实 `web_search`（需 `web_search_enabled = true`）+ deep judge |
 
 ```bash
+# 默认：仅离线（live markers 被 deselect）
+pytest -q
+
+# opt-in 各档（-m 覆盖 pyproject addopts）
+pytest -m live_llm -v
 pytest -m live_llm_e2e -v
 pytest -m live_llm_thorough -v
 pytest -m live_llm_live_tools -v
