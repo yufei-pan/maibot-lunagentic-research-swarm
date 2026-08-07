@@ -77,32 +77,27 @@ async def test_live_e2e_b_root_delegates_child_then_finishes(tmp_path) -> None:
         "（例如出现「子分支工作完成」或等价陈述）。"
     )
     timeout = max(float(creds.e2e_timeout_seconds), 300.0)
-    # One extra attempt for local-model flake where root terminates without delegating.
-    last_detail = ""
-    for attempt in range(2):
-        harness = RuntimeHarness(tmp_path / f"b-{attempt}")
-        await harness.open()
-        try:
-            await harness.start("多分支自测", credits=80.0, time_budget=180)
-            await harness.formalize(formalized)
-            harness.use_live_llm(creds)
-            status = await harness.drive_live_until_terminal(
-                timeout_seconds=timeout,
-                artifact_dir=tmp_path / f"b-{attempt}-artifacts",
-            )
-            assert _status_value(status) in {
-                TaskStatus.COMPLETED.value,
-                TaskStatus.COMPLETED_WITH_ERRORS.value,
-            }
-            child_rows = await harness.store_count_child_branches()
-            if child_rows < 1:
-                last_detail = f"attempt={attempt} children=0 calls={len(harness.llm.calls)}"
-                continue
-            final_text = _final_report_text(harness)
-            assert harness.llm.calls, "expected at least one live LLM call"
-            verdict = await light_judge(creds, objective=judge_objective, report=final_text)
-            assert verdict["pass"] is True, verdict
-            return
-        finally:
-            await harness.close()
-    pytest.fail(f"B 未物化子分支（local model flake）：{last_detail}")
+    harness = RuntimeHarness(tmp_path / "b")
+    await harness.open()
+    try:
+        await harness.start("多分支自测", credits=80.0, time_budget=180)
+        await harness.formalize(formalized)
+        harness.use_live_llm(creds)
+        status = await harness.drive_live_until_terminal(
+            timeout_seconds=timeout,
+            artifact_dir=tmp_path / "b-artifacts",
+        )
+        assert _status_value(status) in {
+            TaskStatus.COMPLETED.value,
+            TaskStatus.COMPLETED_WITH_ERRORS.value,
+        }
+        child_rows = await harness.store_count_child_branches()
+        assert child_rows >= 1, (
+            f"B 未物化子分支：children={child_rows} calls={len(harness.llm.calls)}"
+        )
+        final_text = _final_report_text(harness)
+        assert harness.llm.calls, "expected at least one live LLM call"
+        verdict = await light_judge(creds, objective=judge_objective, report=final_text)
+        assert verdict["pass"] is True, verdict
+    finally:
+        await harness.close()
