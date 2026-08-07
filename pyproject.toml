@@ -30,6 +30,12 @@ include = ["lunagentic_research_swarm*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "live_llm: 需要仓库根 .debug_api_call_credentials 的真实 LLM 调用",
+    "live_llm_e2e: A/B 端到端（seed formalize + light judge）",
+    "live_llm_thorough: stub tools 深度调研 + deep judge",
+    "live_llm_live_tools: 真实 web_search + live LLM + deep judge",
+]
 
 [tool.ruff]
 target-version = "py310"
