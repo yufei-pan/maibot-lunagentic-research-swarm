@@ -64,8 +64,7 @@ class LiveSummarizer:
                     "role": "system",
                     "content": (
                         "你是任务形式化助手。把用户目标改写成简短正式任务（Markdown）。"
-                        "若目标要求检索/查证，必须写明：先调用 builtin.web_search（arguments.query 含 california 或 California），"
-                        "再下结论；最终报告必须原样引用检索 snippet 中的关键事实标记（如 LRS_STUB_FACT_*）。"
+                        "保留目标中的硬性步骤与引用要求；若目标要求检索，写明须先检索再下结论。"
                         "只输出正式任务正文，不要解释。"
                     ),
                 },
@@ -91,7 +90,7 @@ class LiveSummarizer:
                     "role": "system",
                     "content": (
                         "你是分支总结器。根据分支历史写一段简洁中文摘要。"
-                        "必须原样保留检索结果中的关键事实、数字、以及形如 LRS_STUB_FACT_* 的标记字符串；禁止改写或省略这些标记。"
+                        "必须原样保留工具结果中的关键事实、数字与事实标记字符串；禁止改写或省略这些标记。"
                         "只输出摘要。"
                     ),
                 },
@@ -115,8 +114,8 @@ class LiveSummarizer:
                     "role": "system",
                     "content": (
                         "你是任务最终报告撰写者。综合覆盖摘要写出简短最终报告（中文）。"
-                        "报告必须包含检索到的关键事实，并原样粘贴任何 LRS_STUB_FACT_* 标记；"
-                        "不要只写「已搜索/stub」而不贴出标记本身。只输出报告正文。"
+                        "报告必须包含检索到的关键事实，并原样粘贴工具结果中的事实标记字符串；"
+                        "不要只写「已搜索」而不贴出标记本身。只输出报告正文。"
                     ),
                 },
                 {
@@ -235,9 +234,7 @@ def _match_stub_fixture(fixtures: Mapping[str, Any], query: str) -> Any:
     for key, payload in fixtures.items():
         if str(key).casefold() in lowered:
             return payload
-    # Fallback: first fixture so a near-miss query still returns the distinctive token.
-    if fixtures:
-        return next(iter(fixtures.values()))
+    # Query substring miss: empty results (do not leak the first fixture).
     return {"results": []}
 
 

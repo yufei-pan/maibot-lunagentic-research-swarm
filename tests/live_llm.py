@@ -341,14 +341,6 @@ async def deep_judge(
 ) -> dict[str, Any]:
     """深度量规：relevance / completeness / groundedness（1–5），Python 强制三项均 ≥ 3 才 pass。"""
 
-    evidence_rule = ""
-    if str(evidence or "").strip():
-        evidence_rule = (
-            "当提供了 evidence 字符串时：若报告原样包含该字符串，即可视为 groundedness 的充分支撑；"
-            "不要把测试用事实标记（例如 LRS_STUB_FACT_*）当成无效占位符而压低分数。"
-            "completeness：在 stub/fixture 证据场景下，引用检索事实并给出与 objective 相关的简短结论即可，"
-            "不要求虚构真实世界的详细数字年表。"
-        )
     messages = [
         {
             "role": "system",
@@ -359,7 +351,6 @@ async def deep_judge(
                 "三项分数均为 1–5 整数。"
                 "relevance：是否切题；completeness：是否覆盖目标；groundedness：是否可被 evidence/事实支撑。"
                 "仅当三项均 ≥ 3 时才可设 pass=true；否则 pass=false。"
-                f"{evidence_rule}"
             ),
         },
         {
@@ -382,11 +373,6 @@ async def deep_judge(
             "scores": {key: 0 for key in _DEEP_SCORE_KEYS},
         }
     scores = _normalize_deep_scores(payload.get("scores"))
-    evidence_text = str(evidence or "").strip()
-    # Deterministic groundedness floor: if the exact evidence string appears in the
-    # report, local judges must not dismiss test fact tokens as "placeholders".
-    if evidence_text and evidence_text in str(report or ""):
-        scores["groundedness"] = max(scores["groundedness"], _DEEP_SCORE_MIN)
     # 深度 pass 仅由分数门槛决定，无视模型自报的 pass（禁止静默放行）。
     passed = all(scores[key] >= _DEEP_SCORE_MIN for key in _DEEP_SCORE_KEYS)
     reason = str(payload.get("reason") or "").strip() or "no reason"

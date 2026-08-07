@@ -56,8 +56,10 @@ async def test_live_thorough_stub_web_search_and_deep_judge(runtime_harness, tmp
     await harness.start(
         (
             "调查加州高铁（California High-Speed Rail）预算时间线。"
-            "硬性要求：必须先调用 builtin.web_search（query 含 california），"
-            "再下结论；最终报告必须原样引用检索 snippet 中的关键事实标记字符串。"
+            "硬性要求：必须先调用 builtin.web_search（arguments.query 必须包含子串 california），"
+            "再根据检索结果下结论。"
+            f"最终报告必须原样粘贴检索 snippet 中的事实标记 {STUB_FACT}（逐字复制，禁止改写或省略），"
+            "并据此简述预算时间线要点（如 Proposition 1A / 业务计划成本数量级即可）。"
         ),
         credits=120.0,
         time_budget=600,
@@ -75,9 +77,13 @@ async def test_live_thorough_stub_web_search_and_deep_judge(runtime_harness, tmp
         f"expected builtin.web_search stub invoke, got {harness.stub_search_invokes}"
     )
     final_text = _final_report_text(harness)
+    assert STUB_FACT in final_text, f"FINAL must preserve stub fact token; got {final_text!r}"
     verdict = await deep_judge(
         creds,
-        objective="加州高铁预算时间线（须使用搜索）",
+        objective=(
+            "加州高铁预算时间线调研：须先 web_search，并在报告中原样引用证据串 "
+            f"{STUB_FACT}，再给出与检索事实一致的简短时间线结论。"
+        ),
         report=final_text,
         evidence=STUB_FACT,
     )
