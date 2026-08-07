@@ -10,7 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from lunagentic_research_swarm.models import TaskStatus
+from lunagentic_research_swarm.llm.summarizer import SummaryResult
+from lunagentic_research_swarm.models import FormalizedTask, TaskStatus
 from lunagentic_research_swarm.procedures.core import (
     CORE_CHECKPOINT_ID,
     CORE_COMPACT_ID,
@@ -22,6 +23,8 @@ from lunagentic_research_swarm.runtime.reducer import PerformBranchSummary
 from lunagentic_research_swarm.runtime.turns import TurnWorker
 
 _CORE_IDS = (CORE_TERMINATE_ID, CORE_COMPACT_ID, CORE_CHECKPOINT_ID)
+WEB_SEARCH_PROCEDURE_ID = "builtin.web_search"
+_STUB_INVOKE_API = "builtin.invoke_procedure"
 
 
 class _ZeroPricing:
@@ -29,6 +32,284 @@ class _ZeroPricing:
 
     def charge_actual(self, **_kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(credits=0.0)
+
+
+class LiveSummarizer:
+    """Minimal live formalize / finalize for thorough tiers (no Host prompt files)."""
+
+    def __init__(self, credentials: Any) -> None:
+        self._credentials = credentials
+        self.branch_requests: list[Any] = []
+        self.task_requests: list[Any] = []
+
+    async def _chat(self, messages: list[dict[str, Any]]) -> SummaryResult:
+        from live_llm import chat_completion
+
+        result = await chat_completion(self._credentials, messages)
+        text = str((result or {}).get("response") or "").strip()
+        model = str((result or {}).get("model_name") or (result or {}).get("model") or self._credentials.model)
+        if not text:
+            from lunagentic_research_swarm.llm.gateway import GenerationError
+
+            return SummaryResult(False, "", model, None, GenerationError("summary_empty", "live summarizer 返回空文本"))
+        return SummaryResult(True, text, model, None, None)
+
+    async def formalize_task(self, request: Any) -> SummaryResult:
+        raw = str(getattr(request, "raw_context", "") or "")
+        chat = getattr(request, "chat_messages", ()) or ()
+        chat_blob = chat if isinstance(chat, str) else json.dumps(chat, ensure_ascii=False, default=str)
+        result = await self._chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是任务形式化助手。把用户目标改写成简短正式任务（Markdown）。"
+                        "若目标要求检索/查证，必须写明：先调用 builtin.web_search（arguments.query 含 california 或 California），"
+                        "再下结论；最终报告必须原样引用检索 snippet 中的关键事实标记（如 LRS_STUB_FACT_*）。"
+                        "只输出正式任务正文，不要解释。"
+                    ),
+                },
+                {"role": "user", "content": f"raw_context:\n{raw}\n\nchat:\n{chat_blob}"},
+            ]
+        )
+        if result.success:
+            try:
+                FormalizedTask.create(result.text)
+            except ValueError as exc:
+                from lunagentic_research_swarm.llm.gateway import GenerationError
+
+                return SummaryResult(False, "", result.model_name, None, GenerationError("summary_empty", str(exc)))
+        return result
+
+    async def finalize_branch(self, request: Any) -> SummaryResult:
+        self.branch_requests.append(request)
+        history = list(getattr(request, "branch_history", ()) or ())
+        formalized = getattr(getattr(request, "formalized_task", None), "text", "") or ""
+        return await self._chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是分支总结器。根据分支历史写一段简洁中文摘要。"
+                        "必须原样保留检索结果中的关键事实、数字、以及形如 LRS_STUB_FACT_* 的标记字符串；禁止改写或省略这些标记。"
+                        "只输出摘要。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"formalized_task:\n{formalized}\n\n"
+                        f"branch_history:\n{json.dumps(history, ensure_ascii=False, default=str)}"
+                    ),
+                },
+            ]
+        )
+
+    async def finalize_task(self, request: Any) -> SummaryResult:
+        self.task_requests.append(request)
+        coverage = list(getattr(request, "coverage_summaries", ()) or ())
+        formalized = getattr(getattr(request, "formalized_task", None), "text", "") or ""
+        return await self._chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是任务最终报告撰写者。综合覆盖摘要写出简短最终报告（中文）。"
+                        "报告必须包含检索到的关键事实，并原样粘贴任何 LRS_STUB_FACT_* 标记；"
+                        "不要只写「已搜索/stub」而不贴出标记本身。只输出报告正文。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"formalized_task:\n{formalized}\n\n"
+                        f"coverage_summaries:\n{json.dumps(coverage, ensure_ascii=False, default=str)}"
+                    ),
+                },
+            ]
+        )
+
+    async def compact_branch(self, request: Any) -> SummaryResult:
+        history = list(getattr(request, "branch_history", ()) or ())
+        formalized = getattr(getattr(request, "formalized_task", None), "text", "") or ""
+        return await self._chat(
+            [
+                {
+                    "role": "system",
+                    "content": "你是上下文压缩器。把分支历史压成短摘要，保留关键事实。只输出摘要。",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"formalized_task:\n{formalized}\n\n"
+                        f"branch_history:\n{json.dumps(history, ensure_ascii=False, default=str)}"
+                    ),
+                },
+            ]
+        )
+
+
+def _web_search_catalog_entry() -> Any:
+    definition = SimpleNamespace(
+        procedure_id=WEB_SEARCH_PROCEDURE_ID,
+        display_name="网页搜索",
+        description=(
+            "按 query 检索网页并返回 title/url/snippet。"
+            "arguments: query (string, 必填)；engine / max_results 可选。"
+            "调研类任务应优先调用本 Procedure 获取证据。"
+        ),
+        timeout_seconds=30.0,
+        idempotent=True,
+        arguments_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "engine": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "required": ["query"],
+            "additionalProperties": True,
+        },
+        enabled=True,
+    )
+    return SimpleNamespace(
+        definition=definition,
+        provider_plugin_id="builtin",
+        api_name=_STUB_INVOKE_API,
+        api_version="1",
+        fingerprint=f"stub:{WEB_SEARCH_PROCEDURE_ID}",
+    )
+
+
+def _core_catalog_entry(procedure_id: str) -> Any:
+    return SimpleNamespace(
+        definition=SimpleNamespace(
+            procedure_id=procedure_id,
+            display_name=procedure_id,
+            description=procedure_id,
+            timeout_seconds=30.0,
+            idempotent=True,
+        ),
+        provider_plugin_id="lrs.core",
+        api_name=procedure_id,
+        api_version="1",
+        fingerprint=f"core:{procedure_id}",
+    )
+
+
+def _build_drain_procedure_catalog(*, include_web_search: bool) -> Any:
+    entries: dict[str, Any] = {procedure_id: _core_catalog_entry(procedure_id) for procedure_id in _CORE_IDS}
+    if include_web_search:
+        entries[WEB_SEARCH_PROCEDURE_ID] = _web_search_catalog_entry()
+    catalog_ids = tuple(entries)
+
+    def _prompt_entry(entry: Any) -> dict[str, Any]:
+        definition = getattr(entry, "definition", entry)
+        payload: dict[str, Any] = {
+            "procedure_id": str(getattr(definition, "procedure_id", "")),
+            "display_name": str(getattr(definition, "display_name", "")),
+            "description": str(getattr(definition, "description", "")),
+        }
+        schema = getattr(definition, "arguments_schema", None)
+        if isinstance(schema, Mapping):
+            payload["arguments_schema"] = dict(schema)
+        return payload
+
+    class _DrainProcedureCatalog:
+        fingerprint = "live-drain-procedures"
+        ids = catalog_ids
+
+        @property
+        def entries(self) -> tuple[Any, ...]:
+            # Dicts serialize cleanly into StablePromptBuilder frozen catalog JSON.
+            return tuple(_prompt_entry(item) for item in entries.values())
+
+        def get(self, procedure_id: str) -> Any | None:
+            return entries.get(str(procedure_id))
+
+    return _DrainProcedureCatalog()
+
+
+def _match_stub_fixture(fixtures: Mapping[str, Any], query: str) -> Any:
+    lowered = query.casefold()
+    for key, payload in fixtures.items():
+        if str(key).casefold() in lowered:
+            return payload
+    # Fallback: first fixture so a near-miss query still returns the distinctive token.
+    if fixtures:
+        return next(iter(fixtures.values()))
+    return {"results": []}
+
+
+def use_stub_procedures(harness: Any, fixtures: Mapping[str, Any]) -> None:
+    """Install canned ``builtin.web_search`` + catalog entries before ``start``/formalize."""
+
+    fixture_map = {str(key): value for key, value in dict(fixtures or {}).items()}
+    harness._stub_search_fixtures = fixture_map
+    harness.stub_search_invokes = 0
+
+    async def _stub_invoke(
+        *,
+        version: str = "1",
+        procedure_id: str,
+        request_id: str = "",
+        arguments: Mapping[str, Any] | None = None,
+        scoped_metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        del version, scoped_metadata, _kwargs
+        pid = str(procedure_id or "")
+        if pid != WEB_SEARCH_PROCEDURE_ID:
+            return {
+                "success": False,
+                "data": None,
+                "error": {"code": "procedure_unavailable", "message": f"stub 未实现 {pid}"},
+                "metadata": {"request_id": request_id, "procedure_id": pid},
+            }
+        harness.stub_search_invokes = int(getattr(harness, "stub_search_invokes", 0) or 0) + 1
+        args = dict(arguments or {})
+        query = str(args.get("query") or "")
+        payload = _match_stub_fixture(fixture_map, query)
+        if isinstance(payload, Mapping) and "results" in payload:
+            data = {
+                "engine": str(args.get("engine") or "stub"),
+                "query": query,
+                "results": list(payload.get("results") or []),
+            }
+        elif isinstance(payload, Mapping):
+            data = {
+                "engine": str(args.get("engine") or "stub"),
+                "query": query,
+                "results": [dict(payload)],
+            }
+        else:
+            data = {"engine": "stub", "query": query, "results": []}
+        return {
+            "success": True,
+            "data": data,
+            "error": None,
+            "metadata": {"request_id": request_id, "procedure_id": pid, "stub": True},
+        }
+
+    harness._effect_local_invokers = {_STUB_INVOKE_API: _stub_invoke}
+
+    catalog = _build_drain_procedure_catalog(include_web_search=True)
+    snapshot = getattr(harness, "_shared_snapshot", None)
+    if snapshot is not None:
+        snapshot.procedure_catalog = catalog
+        agent_catalog = getattr(snapshot, "agent_catalog", None)
+        if agent_catalog is not None:
+
+            def resolve_allowed_procedures(_agent_id: str, procedures: Any) -> tuple[str, ...]:
+                ids = list(getattr(procedures, "ids", ()) or ())
+                for core_id in _CORE_IDS:
+                    if core_id not in ids:
+                        ids.append(core_id)
+                if WEB_SEARCH_PROCEDURE_ID not in ids:
+                    ids.append(WEB_SEARCH_PROCEDURE_ID)
+                return tuple(ids)
+
+            agent_catalog.resolve_allowed_procedures = resolve_allowed_procedures  # type: ignore[attr-defined]
 
 
 def _ensure_drain_catalogs(harness: Any) -> None:
@@ -58,38 +339,18 @@ def _ensure_drain_catalogs(harness: Any) -> None:
         agent_catalog.resolve_allowed_procedures = resolve_allowed_procedures  # type: ignore[attr-defined]
 
     procedure_catalog = getattr(snapshot, "procedure_catalog", None)
-    needs_core_catalog = (
+    include_web_search = bool(getattr(harness, "_stub_search_fixtures", None)) or bool(
+        getattr(harness, "_effect_local_invokers", None)
+    )
+    existing_ids = set(getattr(procedure_catalog, "ids", ()) or ()) if procedure_catalog is not None else set()
+    needs_catalog = (
         procedure_catalog is None
         or not callable(getattr(procedure_catalog, "get", None))
-        or CORE_TERMINATE_ID not in set(getattr(procedure_catalog, "ids", ()) or ())
+        or CORE_TERMINATE_ID not in existing_ids
+        or (include_web_search and WEB_SEARCH_PROCEDURE_ID not in existing_ids)
     )
-    if needs_core_catalog:
-        core_entries = {
-            procedure_id: SimpleNamespace(
-                definition=SimpleNamespace(
-                    procedure_id=procedure_id,
-                    display_name=procedure_id,
-                    description=procedure_id,
-                    timeout_seconds=30.0,
-                    idempotent=True,
-                ),
-                provider_plugin_id="lrs.core",
-                api_name=procedure_id,
-                api_version="1",
-                fingerprint=f"core:{procedure_id}",
-            )
-            for procedure_id in _CORE_IDS
-        }
-
-        class _CoreProcedureCatalog:
-            fingerprint = "live-drain-core-procedures"
-            ids = _CORE_IDS
-            entries = tuple(core_entries.values())
-
-            def get(self, procedure_id: str) -> Any | None:
-                return core_entries.get(str(procedure_id))
-
-        snapshot.procedure_catalog = _CoreProcedureCatalog()
+    if needs_catalog:
+        snapshot.procedure_catalog = _build_drain_procedure_catalog(include_web_search=include_web_search)
 
     # Integration harness price catalog lacks estimate_model_for_selector; free estimate.
     price_catalog = getattr(snapshot, "price_catalog", None)
@@ -108,8 +369,8 @@ def attach_effect_runner(harness: Any, *, pricing: Any | None = None) -> Runtime
     # ``split_procedure_requests`` inside ProcedureExecutor.invoke_many — they never call
     # ``local_invokers``. Only ordinary (non-core) procedures use local_invokers / host API
     # (see services._procedure_local_invokers → builtin.invoke_procedure). Offline drain
-    # therefore passes an empty map; catalog allowlisting of core.* is still required above.
-    local_invokers: dict[str, Any] = {}
+    # defaults to empty; stub/live thorough tiers attach via ``use_stub_procedures``.
+    local_invokers: dict[str, Any] = dict(getattr(harness, "_effect_local_invokers", None) or {})
 
     def procedure_factory(catalog: Any) -> ProcedureExecutor:
         return ProcedureExecutor(
@@ -161,6 +422,9 @@ async def _dump_timeout_artifacts(harness: Any, artifact_dir: Path) -> None:
         report_text = str(getattr(last, "text", "") or getattr(last, "body", "") or last)
     if report_text:
         (artifact_dir / "last_report.txt").write_text(report_text, encoding="utf-8")
+    invokes = getattr(harness, "stub_search_invokes", None)
+    if invokes is not None:
+        (artifact_dir / "stub_search_invokes.txt").write_text(f"{invokes}\n", encoding="utf-8")
 
 
 def _record_branch_summary_reason(harness: Any, effect: Any) -> None:
@@ -230,6 +494,9 @@ async def drive_until_terminal(
 
 
 __all__ = [
+    "LiveSummarizer",
+    "WEB_SEARCH_PROCEDURE_ID",
     "attach_effect_runner",
     "drive_until_terminal",
+    "use_stub_procedures",
 ]

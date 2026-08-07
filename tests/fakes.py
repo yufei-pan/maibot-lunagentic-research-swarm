@@ -385,9 +385,11 @@ class RuntimeHarness:
         self.stream_id = "integration-stream"
         self.formalized_task: FormalizedTask | None = None
         self.coordinator: ReportCoordinator | None = None
+        self._shared_snapshot: Any | None = None
         self._root_branch_id = ""
         self._status = TaskStatus.FORMALIZING
         self._started = False
+        self.stub_search_invokes = 0
         # Mirrored into ResearchManager; deliver_* must be set before formalize
         # (ReportCoordinator reads them at registration).
         self._runtime_limits: dict[str, Any] = dict(runtime_limits or {})
@@ -415,6 +417,7 @@ class RuntimeHarness:
             procedure_catalog=SimpleNamespace(fingerprint="integration-procedures"),
             price_catalog=_PriceCatalog(),
         )
+        self._shared_snapshot = snapshot
 
         async def snapshot_provider() -> Any:
             return snapshot
@@ -445,7 +448,10 @@ class RuntimeHarness:
         if not self._started:
             await self.open()
         assert self.manager is not None
-        self.summarizer.formalization_gate.clear()
+        # FakeSummarizer blocks formalize until the gate opens; LiveSummarizer has no gate.
+        gate = getattr(self.summarizer, "formalization_gate", None)
+        if gate is not None:
+            gate.clear()
         result = await self.manager.start(
             objective=objective,
             stream_id=self.stream_id,
@@ -454,6 +460,7 @@ class RuntimeHarness:
         )
         self.task_id = str(result["task_id"])
         self.round_id = str((await self.manager.status(self.task_id))["round_id"])
+        self.coordinator = self.manager.report_coordinators.get(self.task_id)
         return result
 
     async def formalize(self, text: str) -> None:
@@ -700,6 +707,8 @@ class RuntimeHarness:
 
     @property
     def reports(self) -> list[Any]:
+        if self.coordinator is None and self.manager is not None and self.task_id:
+            self.coordinator = self.manager.report_coordinators.get(self.task_id)
         return [] if self.coordinator is None else self.coordinator.reports
 
     @property
@@ -738,6 +747,22 @@ class RuntimeHarness:
         from live_llm import LiveLLMGateway
 
         self.llm = LiveLLMGateway(creds)
+
+    def use_live_summarizer(self, creds: Any) -> None:
+        """Replace FakeSummarizer before ``start`` so formalize/finalize are live."""
+
+        from live_harness import LiveSummarizer
+
+        self.summarizer = LiveSummarizer(creds)
+        if self.manager is not None:
+            self.manager.summarizer = self.summarizer
+
+    def use_stub_procedures(self, fixtures: dict[str, Any]) -> None:
+        """Canned ``builtin.web_search`` fixtures + catalog before ``start``."""
+
+        from live_harness import use_stub_procedures
+
+        use_stub_procedures(self, fixtures)
 
     async def drive_live_until_terminal(
         self,
