@@ -390,6 +390,7 @@ class RuntimeHarness:
         self._status = TaskStatus.FORMALIZING
         self._started = False
         self.stub_search_invokes = 0
+        self.live_search_invokes = 0
         # Mirrored into ResearchManager; deliver_* must be set before formalize
         # (ReportCoordinator reads them at registration).
         self._runtime_limits: dict[str, Any] = dict(runtime_limits or {})
@@ -763,6 +764,13 @@ class RuntimeHarness:
         from live_harness import use_stub_procedures
 
         use_stub_procedures(self, fixtures)
+
+    def use_live_procedures(self, web_search_config: dict[str, Any] | None = None) -> None:
+        """Real ``BundledProcedureProvider`` / ``WebSearchService`` before ``start``."""
+
+        from live_harness import use_live_procedures
+
+        use_live_procedures(self, web_search_config)
 
     async def drive_live_until_terminal(
         self,

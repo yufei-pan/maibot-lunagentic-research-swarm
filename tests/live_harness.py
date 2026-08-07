@@ -200,6 +200,10 @@ def _build_drain_procedure_catalog(*, include_web_search: bool) -> Any:
     entries: dict[str, Any] = {procedure_id: _core_catalog_entry(procedure_id) for procedure_id in _CORE_IDS}
     if include_web_search:
         entries[WEB_SEARCH_PROCEDURE_ID] = _web_search_catalog_entry()
+    return _catalog_from_entries(entries)
+
+
+def _catalog_from_entries(entries: dict[str, Any]) -> Any:
     catalog_ids = tuple(entries)
 
     def _prompt_entry(entry: Any) -> dict[str, Any]:
@@ -220,7 +224,6 @@ def _build_drain_procedure_catalog(*, include_web_search: bool) -> Any:
 
         @property
         def entries(self) -> tuple[Any, ...]:
-            # Dicts serialize cleanly into StablePromptBuilder frozen catalog JSON.
             return tuple(_prompt_entry(item) for item in entries.values())
 
         def get(self, procedure_id: str) -> Any | None:
@@ -289,24 +292,109 @@ def use_stub_procedures(harness: Any, fixtures: Mapping[str, Any]) -> None:
         }
 
     harness._effect_local_invokers = {_STUB_INVOKE_API: _stub_invoke}
+    _install_web_search_catalog(harness)
 
+
+def use_live_procedures(harness: Any, web_search_config: Mapping[str, Any] | None = None) -> None:
+    """Wire real ``BundledProcedureProvider`` / ``WebSearchService`` into drain local invokers."""
+
+    from lunagentic_research_swarm.config import WebSearchSection
+    from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
+    from lunagentic_research_swarm.procedures.executor import bundled_procedure_invoker
+
+    raw = dict(web_search_config or {})
+    if "enabled_engines" not in raw or not raw.get("enabled_engines"):
+        raw["enabled_engines"] = ["duckduckgo"]
+    section = WebSearchSection.model_validate(raw)
+    provider = BundledProcedureProvider(SimpleNamespace(), web_search_config=section)
+    harness._bundled_procedure_provider = provider
+    harness.live_search_invokes = 0
+
+    base_invoke = bundled_procedure_invoker(provider)
+
+    async def _live_invoke(
+        *,
+        version: str = "1",
+        procedure_id: str,
+        request_id: str = "",
+        arguments: Mapping[str, Any] | None = None,
+        scoped_metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        pid = str(procedure_id or "")
+        if pid == WEB_SEARCH_PROCEDURE_ID:
+            harness.live_search_invokes = int(getattr(harness, "live_search_invokes", 0) or 0) + 1
+        return await base_invoke(
+            version=version,
+            procedure_id=procedure_id,
+            request_id=request_id,
+            arguments=arguments,
+            scoped_metadata=scoped_metadata,
+            **_kwargs,
+        )
+
+    harness._effect_local_invokers = {_STUB_INVOKE_API: _live_invoke}
+    # Prefer real web_search schema (engine required + enum) so the live LLM can call correctly.
+    live_entry = _web_search_catalog_entry_from_provider(provider)
     catalog = _build_drain_procedure_catalog(include_web_search=True)
+    if live_entry is not None:
+        entries = {procedure_id: _core_catalog_entry(procedure_id) for procedure_id in _CORE_IDS}
+        entries[WEB_SEARCH_PROCEDURE_ID] = live_entry
+        catalog = _catalog_from_entries(entries)
+    _install_procedure_catalog(harness, catalog)
+
+
+def _web_search_catalog_entry_from_provider(provider: Any) -> Any | None:
+    for payload in list(provider.describe() or []):
+        if not isinstance(payload, Mapping):
+            continue
+        if str(payload.get("procedure_id") or "") != WEB_SEARCH_PROCEDURE_ID:
+            continue
+        definition = SimpleNamespace(
+            procedure_id=WEB_SEARCH_PROCEDURE_ID,
+            display_name=str(payload.get("display_name") or "网页搜索"),
+            description=str(
+                payload.get("description")
+                or "按指定引擎执行网页搜索。arguments 必填 engine 与 query。"
+            ),
+            timeout_seconds=float(payload.get("timeout_seconds") or 30.0),
+            idempotent=bool(payload.get("idempotent", True)),
+            arguments_schema=dict(payload.get("arguments_schema") or {}),
+            enabled=bool(payload.get("enabled", True)),
+        )
+        return SimpleNamespace(
+            definition=definition,
+            provider_plugin_id="builtin",
+            api_name=_STUB_INVOKE_API,
+            api_version="1",
+            fingerprint=f"live:{WEB_SEARCH_PROCEDURE_ID}",
+        )
+    return None
+
+
+def _install_web_search_catalog(harness: Any) -> None:
+    _install_procedure_catalog(harness, _build_drain_procedure_catalog(include_web_search=True))
+
+
+def _install_procedure_catalog(harness: Any, catalog: Any) -> None:
     snapshot = getattr(harness, "_shared_snapshot", None)
-    if snapshot is not None:
-        snapshot.procedure_catalog = catalog
-        agent_catalog = getattr(snapshot, "agent_catalog", None)
-        if agent_catalog is not None:
+    if snapshot is None:
+        return
+    snapshot.procedure_catalog = catalog
+    agent_catalog = getattr(snapshot, "agent_catalog", None)
+    if agent_catalog is None:
+        return
 
-            def resolve_allowed_procedures(_agent_id: str, procedures: Any) -> tuple[str, ...]:
-                ids = list(getattr(procedures, "ids", ()) or ())
-                for core_id in _CORE_IDS:
-                    if core_id not in ids:
-                        ids.append(core_id)
-                if WEB_SEARCH_PROCEDURE_ID not in ids:
-                    ids.append(WEB_SEARCH_PROCEDURE_ID)
-                return tuple(ids)
+    def resolve_allowed_procedures(_agent_id: str, procedures: Any) -> tuple[str, ...]:
+        ids = list(getattr(procedures, "ids", ()) or ())
+        for core_id in _CORE_IDS:
+            if core_id not in ids:
+                ids.append(core_id)
+        if WEB_SEARCH_PROCEDURE_ID not in ids:
+            ids.append(WEB_SEARCH_PROCEDURE_ID)
+        return tuple(ids)
 
-            agent_catalog.resolve_allowed_procedures = resolve_allowed_procedures  # type: ignore[attr-defined]
+    agent_catalog.resolve_allowed_procedures = resolve_allowed_procedures  # type: ignore[attr-defined]
 
 
 def _ensure_drain_catalogs(harness: Any) -> None:
@@ -366,7 +454,7 @@ def attach_effect_runner(harness: Any, *, pricing: Any | None = None) -> Runtime
     # ``split_procedure_requests`` inside ProcedureExecutor.invoke_many — they never call
     # ``local_invokers``. Only ordinary (non-core) procedures use local_invokers / host API
     # (see services._procedure_local_invokers → builtin.invoke_procedure). Offline drain
-    # defaults to empty; stub/live thorough tiers attach via ``use_stub_procedures``.
+    # defaults to empty; stub/live thorough tiers attach via use_stub/use_live_procedures.
     local_invokers: dict[str, Any] = dict(getattr(harness, "_effect_local_invokers", None) or {})
 
     def procedure_factory(catalog: Any) -> ProcedureExecutor:
@@ -419,9 +507,12 @@ async def _dump_timeout_artifacts(harness: Any, artifact_dir: Path) -> None:
         report_text = str(getattr(last, "text", "") or getattr(last, "body", "") or last)
     if report_text:
         (artifact_dir / "last_report.txt").write_text(report_text, encoding="utf-8")
-    invokes = getattr(harness, "stub_search_invokes", None)
-    if invokes is not None:
-        (artifact_dir / "stub_search_invokes.txt").write_text(f"{invokes}\n", encoding="utf-8")
+    stub_invokes = getattr(harness, "stub_search_invokes", None)
+    if stub_invokes is not None:
+        (artifact_dir / "stub_search_invokes.txt").write_text(f"{stub_invokes}\n", encoding="utf-8")
+    live_invokes = getattr(harness, "live_search_invokes", None)
+    if live_invokes is not None:
+        (artifact_dir / "live_search_invokes.txt").write_text(f"{live_invokes}\n", encoding="utf-8")
 
 
 def _record_branch_summary_reason(harness: Any, effect: Any) -> None:
@@ -495,5 +586,6 @@ __all__ = [
     "WEB_SEARCH_PROCEDURE_ID",
     "attach_effect_runner",
     "drive_until_terminal",
+    "use_live_procedures",
     "use_stub_procedures",
 ]

@@ -110,6 +110,23 @@ python -m ruff check plugin.py lunagentic_research_swarm tests
 
 仅在明确平台条件（例如缺少 Lance wheel）时允许 pytest marker skip，并应在此 README 说明。当前 Linux x86_64 / aarch64 常规环境期望 **0 skipped**。
 
+### Live LLM tests
+
+可选真实 LLM / 工具层，按 marker 分档；无可用凭证时 **skip**（不算失败）。模板见仓库根 `.debug_api_call_credentials.example`（复制为 gitignored 的 `.debug_api_call_credentials`）。**不要**提交真实 endpoint / API key。
+
+| Marker | 内容 |
+|---|---|
+| `live_llm` | 协议 smoke（JSON envelope） |
+| `live_llm_e2e` | 薄垂直切片 A/B + light judge |
+| `live_llm_thorough` | stub `web_search` 深度调研 + deep judge |
+| `live_llm_live_tools` | 真实 `web_search`（需 `web_search_enabled = true`）+ deep judge |
+
+```bash
+pytest -m live_llm_e2e -v
+pytest -m live_llm_thorough -v
+pytest -m live_llm_live_tools -v
+```
+
 ## 许可
 
 MIT — 见 [LICENSE](LICENSE)。
