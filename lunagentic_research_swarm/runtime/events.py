@@ -201,6 +201,8 @@ class ProcedureBatchCompleted(Event):
     credits_after: float = 0.0
     parent_messages: tuple[Mapping[str, Any], ...] = ()
     parent_depth: int = 0
+    # 当前分支 agent；空委派 + 非控制 Procedure 时用于隐式自委派。
+    agent_id: str = ""
     live_agent_ids: tuple[str, ...] | None = None
     max_delegations_per_turn: int = 8
     max_branch_depth: int = 32

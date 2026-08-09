@@ -77,19 +77,41 @@ def _nonnegative_int(value: Any, name: str) -> int:
     return value
 
 
-def rejected_edge_notice(rejected: Sequence[RejectedEdge]) -> dict[str, str]:
-    """把全部被拒绝的委派边汇总成一条可读的 user 消息。"""
+_EDGE_REASON_HINTS = {
+    "agent_unavailable": "该 agent_id 不在本轮可委派目录中（可能拼写错误或已下线）",
+    "delegation_limit_exceeded": "超出本 turn 的委派条数上限",
+    "branch_depth_exceeded": "已达分支深度上限，不能再往下委派",
+    "agent_call_limit_exceeded": "已达本任务的智能体调用次数上限",
+}
+
+
+def rejected_edge_notice(
+    rejected: Sequence[RejectedEdge],
+    *,
+    live_agent_ids: Sequence[str] | frozenset[str] | None = None,
+) -> dict[str, str]:
+    """把全部被拒绝的委派边汇总成一条可读的 user 消息。
+
+    ``live_agent_ids`` 会被渲染成可选清单：这条消息的目的就是让下一 turn 能改对，
+    只说「改用仍然可用的智能体」而不给出名字，模型只能继续猜。
+    """
 
     lines = [
-        f"- agent_id={edge.agent_id}；assignment={edge.assignment[:200]}；原因={edge.reason}"
+        f"- agent_id={edge.agent_id}；assignment={edge.assignment[:200]}；"
+        f"原因={edge.reason}（{_EDGE_REASON_HINTS.get(edge.reason, '结构限制')}）"
         for edge in rejected
     ]
+    available = ""
+    if live_agent_ids:
+        names = "、".join(f"`{item}`" for item in sorted(str(item) for item in live_agent_ids))
+        available = f"\n当前仍可委派的 agent_id：{names}。"
     return {
         "role": "user",
         "content": (
             "本 turn 请求的全部委派都无法启动，没有任何子分支被创建。"
             "分配给这些委派的 credits 已全额退回本分支。\n"
             + "\n".join(lines)
+            + available
             + "\n请据此改用仍然可用的智能体、改为自行调用 Procedure，或结束本分支。"
         ),
     }

@@ -73,7 +73,14 @@ class RuntimeEffectRunner:
         manager = self._require_manager()
         if isinstance(effect, PerformAgentCall):
             try:
-                prepared = await manager.prepare_agent_effect(effect)
+                payload = dict(getattr(effect, "payload", None) or {})
+                # Reducer-built protocol corrections already reserved credits and
+                # attached the correction user message + model: pin. Re-running
+                # prepare_agent_effect would wipe those and double-reserve.
+                if int(payload.get("correction_count") or 0) >= 1 and payload.get("messages") is not None:
+                    prepared = effect
+                else:
+                    prepared = await manager.prepare_agent_effect(effect)
                 completed = await self._turn_worker.perform_agent_call(prepared)
             except Exception as exc:
                 await self._fail_branch(manager, effect, exc, "agent_effect_failed")

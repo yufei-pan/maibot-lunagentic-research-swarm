@@ -97,6 +97,7 @@ def past_cases_procedure_definitions() -> list[ProcedureDefinition]:
         "idempotent": True,
         "timeout_seconds": 60.0,
         "external_cost_kind": "none",
+        "allowed_agents": ["builtin.past_case_researcher"],
     }
     return [ProcedureDefinition.model_validate(payload)]
 

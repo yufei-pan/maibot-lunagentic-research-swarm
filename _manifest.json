@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "com.0-hz.lunagentic-research-swarm",
   "version": "0.1.0",
-  "name": "麦麦深度调查组",
+  "name": "麦麦深度调查组 (Lunagentic Research Swarm)",
   "description": "以 agentic research swarm 架构进行持续、多智能体深度调查；结合价格有竞争力的快速模型与大型知识模型，通过多代专职 agent、动态 credits、模型路由和上下文优化，提供近似可预测的时间与成本特征。",
   "author": {
     "name": "kes",

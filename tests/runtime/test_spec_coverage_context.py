@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from lunagentic_research_swarm.models import FormalizedTask
 from lunagentic_research_swarm.runtime.context import (
+    BranchContext,
     RuntimeHeader,
     StablePromptBuilder,
+    render_assignment_section,
+    root_assignment_section,
     should_auto_compact,
 )
 
@@ -25,22 +28,28 @@ def _builder(formalized: FormalizedTask) -> StablePromptBuilder:
 
 
 def test_spec_8_2_message_order_and_secrets_stripped_from_system() -> None:
+    """system → 正式任务 → …… → `[LRS runtime]`（含根任务分配）。
+
+    根任务分配仍然是一条 user 消息、仍然不进 system（spec §8.2 的实质要求），
+    只是与同一 turn 的 runtime 状态合并成了同一个块。
+    """
+
     formalized = FormalizedTask.create("正式任务 α")
     builder = _builder(formalized)
     root = builder.root_context(coordinator="agent.root")
     messages = builder.messages_for_call(
         root,
-        RuntimeHeader("root", 1, "调查", 90, 8.0, 1, 0),
+        RuntimeHeader("root", 1, "调查", 90, 8.0, 1, 0, assignment=root_assignment_section()),
     )
     assert messages[0]["role"] == "system"
     assert "SECRET" not in messages[0]["content"]
     assert "also-secret" not in messages[0]["content"]
+    assert "起始协调者" not in messages[0]["content"]
     assert messages[1]["role"] == "user"
     assert messages[1]["content"] == formalized.text
-    assert messages[2]["role"] == "user"
-    assert "起始协调者" in messages[2]["content"]
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"].startswith("[LRS runtime]")
+    assert "起始协调者" in messages[-1]["content"]
 
 
 def test_spec_8_2_runtime_header_distinguishes_zero_and_negative_balances() -> None:
@@ -55,13 +64,29 @@ def test_spec_8_2_runtime_header_distinguishes_zero_and_negative_balances() -> N
 
 
 def test_spec_8_2_child_assignment_appended_without_rewriting_formalized_user1() -> None:
+    """子任务分配随尾部 runtime 块下发；User 1 的正式任务描述原样不动。"""
+
     formalized = FormalizedTask.create("正式任务")
     builder = _builder(formalized)
-    root = builder.root_context(coordinator="agent.root")
-    root_messages = builder.messages_for_call(root, RuntimeHeader("root", 1, "调查", 90, 8.0, 1, 0))
-    child_messages = [*root_messages[:-1], {"role": "user", "content": "assignment: 核查来源"}, root_messages[-1]]
+    inherited = builder.initial_messages(builder.root_context(coordinator="agent.root"))
+    child_messages = builder.messages_for_call(
+        BranchContext([*inherited[2:], {"role": "assistant", "content": "父分支 report"}]),
+        RuntimeHeader(
+            "child",
+            1,
+            "调查",
+            90,
+            8.0,
+            1,
+            0,
+            assignment=render_assignment_section(character_prompt="核验角色", assignment="核查来源"),
+        ),
+    )
     assert child_messages[1]["content"] == formalized.text
-    assert any(item.get("content") == "assignment: 核查来源" for item in child_messages)
+    assert child_messages[-1]["content"].startswith("[LRS runtime]")
+    assert "核查来源" in child_messages[-1]["content"]
+    # assignment 不再是一条独立消息
+    assert not any(str(item.get("content", "")).startswith("assignment: ") for item in child_messages)
 
 
 def test_spec_12_2_model_window_beats_high_global_threshold() -> None:

@@ -2,17 +2,26 @@
 # 复制为 config.toml 后按需修改。不要把含密钥的 live config 提交到版本库。
 
 [plugin]
-config_version = "1.0.0"
+config_version = "1.2.0"
 enabled = true
 root_agent = "builtin.quick_thinker"
 
 [llm]
-force_selector = ""
+default_selector = ""
 
 [summarizer]
-selector = "task:mid_memory"
+selector = ""
 temperature = 0.2
 max_tokens = 0
+
+# 各总结角色的输出下限（字符）。只有下限、没有上限：给出长度区间会让模型去凑区间，
+# 而不是照材料本身该写多少写多少。过长由上面的 max_tokens 截断——异常冗长本身
+# 就是需要排查的信号。设为 0 表示提示词里完全不提长度。
+[summarizer.min_output_chars]
+formalize_task = 80
+finalize_branch = 80
+finalize_task = 120
+compact_branch = 80
 
 [embedding]
 selector = "task:embedding"
@@ -131,7 +140,7 @@ you_api_key = ""
 #
 # [agents."builtin.memory_researcher"]
 # enabled = true
-# selector = "task:utils"
+# selector = "task:mid_memory"
 #
 # [agents."builtin.knowledge_reporter"]
 # enabled = true

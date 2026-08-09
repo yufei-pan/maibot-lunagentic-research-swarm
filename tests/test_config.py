@@ -9,7 +9,8 @@ from lunagentic_research_swarm.config import CURRENT_CONFIG_VERSION, LRSConfig, 
 def test_config_defaults_match_approved_spec() -> None:
     config = LRSConfig()
     assert config.plugin.root_agent == "builtin.quick_thinker"
-    assert config.summarizer.selector == "task:mid_memory"
+    assert config.llm.default_selector == ""
+    assert config.summarizer.selector == ""
     assert config.summarizer.temperature == 0.2
     assert config.summarizer.max_tokens == 0
     assert config.timing.default_time_budget_seconds == 120
@@ -26,6 +27,41 @@ def test_config_defaults_match_approved_spec() -> None:
     assert config.commands.allow_vector_rebuild is False
     assert config.commands.maintenance_allowed_user_ids == []
     assert "reasoning" not in LRSConfig.model_json_schema()["properties"]
+
+
+def test_normalize_migrates_force_selector_to_default_selector() -> None:
+    defaults = LRSConfig().model_dump(mode="python", exclude_none=True)
+    raw = {
+        "plugin": {"config_version": "1.0.0"},
+        "llm": {"force_selector": "model:pinned"},
+    }
+    normalized, changed, notes = normalize_config(raw, defaults)
+    assert normalized["llm"]["default_selector"] == "model:pinned"
+    assert "force_selector" not in normalized["llm"]
+    assert changed is True
+    assert any(CURRENT_CONFIG_VERSION in note for note in notes)
+
+
+def test_normalize_omits_none_values_for_toml_roundtrip() -> None:
+    """Host 用 tomlkit 写回 config.toml；None 会导致整文件写失败并清空配置。"""
+
+    defaults = LRSConfig().model_dump(mode="python", exclude_none=True)
+    normalized, _changed, _notes = normalize_config(
+        {"plugin": {"config_version": "1.0.0"}, "llm": {"force_selector": ""}},
+        defaults,
+    )
+
+    def _assert_no_none(value: object, path: str = "") -> None:
+        assert value is not None, path
+        if isinstance(value, dict):
+            for key, child in value.items():
+                _assert_no_none(child, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                _assert_no_none(child, f"{path}[{index}]")
+
+    _assert_no_none(normalized)
+    assert "model_context_window" not in normalized.get("context", {})
 
 
 def test_normalize_migrates_legacy_maintenance_person_ids() -> None:

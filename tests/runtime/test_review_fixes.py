@@ -79,11 +79,17 @@ async def test_supplied_context_is_injected_into_the_next_agent_call(harness) ->
     assert manager._branches[task_id][branch_id]["pending_context"] == []
 
 
-# --- spec §8.2：每次普通智能体调用前都追加一份新的 runtime header -------------
+# --- spec §8.2：每次调用追加一个新的 runtime 块，历史只追加不改写 -------------
 
 
 @pytest.mark.asyncio
-async def test_runtime_header_is_rebuilt_per_call_and_never_accumulates(harness) -> None:  # noqa: F811
+async def test_runtime_block_is_appended_per_call_and_history_stays_append_only(harness) -> None:  # noqa: F811
+    """每次调用在末尾追加一个新块；已发送的消息一个都不动。
+
+    上一次请求必须是这一次请求的逐字节前缀，provider 的前缀缓存才能覆盖整条链；
+    块内自带「只有最后一个有效」的说明，历史里的旧块因此不会误导模型。
+    """
+
     manager, _store, _summarizer, scheduler, *_ = harness
     result = await manager.start(objective="调查", stream_id="s", time_budget_seconds=120)
     task_id = result["task_id"]
@@ -91,21 +97,33 @@ async def test_runtime_header_is_rebuilt_per_call_and_never_accumulates(harness)
     agent_effect = next(
         effect for effect in reversed(scheduler.enqueued) if isinstance(effect, PerformAgentCall)
     )
+    branch_id = str(agent_effect.payload.get("branch_id") or "")
 
     first = await manager.prepare_agent_effect(agent_effect)
+    # 让上一 turn 的输出落进分支历史，模拟真实的 turn 结算。
+    manager._branches[task_id][branch_id]["messages"] = [
+        *first.payload["messages"],
+        {"role": "assistant", "content": "上一 turn 的 report"},
+    ]
     second = await manager.prepare_agent_effect(agent_effect)
 
-    def headers(payload):
+    def blocks(payload):
         return [
             str(item["content"])
             for item in payload["messages"]
             if str(item.get("content", "")).startswith("[LRS runtime]")
         ]
 
-    assert len(headers(first.payload)) == 1
-    assert len(headers(second.payload)) == 1
-    assert "turn=1" in headers(first.payload)[0]
-    assert "turn=2" in headers(second.payload)[0]
+    assert len(blocks(first.payload)) == 1
+    assert "turn=1" in blocks(first.payload)[0]
+    # 第二次调用保留了第一次的块，并在末尾追加了新的一个。
+    assert len(blocks(second.payload)) == 2
+    assert "turn=2" in blocks(second.payload)[-1]
+    assert str(second.payload["messages"][-1]["content"]).startswith("[LRS runtime]")
+    assert "只有最后一个" in blocks(second.payload)[-1]
+    previous = [dict(item) for item in first.payload["messages"]]
+    current = [dict(item) for item in second.payload["messages"]]
+    assert current[: len(previous)] == previous, "上一次请求必须是这一次请求的逐字节前缀"
 
 
 # --- spec §14.3 + §11.7：全部委派被拒时不悬空、不销毁 credits ----------------
@@ -272,7 +290,14 @@ def test_branch_does_not_receive_its_own_summary_broadcast() -> None:
     messages = ReportCoordinator.pending_summary_messages(coordinator, "br_self")
 
     contents = [item["content"] for item in messages]
-    assert contents == ["兄弟的摘要"]
+    assert len(contents) == 1
+    assert "兄弟的摘要" in contents[0]
+    assert "自己的摘要" not in contents[0]
+    # 广播必须自带出处，否则接收方会把兄弟分支的结论当成自己做过的工作。
+    assert "br_other" in contents[0]
+    assert "其它分支" in contents[0]
+    # OpenAI 兼容服务端对 `name` 有 ^[a-zA-Z0-9_-]+$ 限制；带冒号的名字会被 400 拒绝。
+    assert all("name" not in item for item in messages)
 
 
 # --- spec §9.2：纠正 turn 使用同一协议 --------------------------------------

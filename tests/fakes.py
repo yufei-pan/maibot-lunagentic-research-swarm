@@ -321,6 +321,28 @@ class _ConfigAPI:
         }[key]
 
 
+class _FakeLogger:
+    """Records every level so error paths under test behave like production."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str]] = []
+
+    def _log(self, level: str):
+        def _emit(message: Any = "", *args: Any, **_kwargs: Any) -> None:
+            try:
+                rendered = str(message) % args if args else str(message)
+            except (TypeError, ValueError):
+                rendered = f"{message} {args}"
+            self.records.append((level, rendered))
+
+        return _emit
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self._log(name)
+
+
 class _AgentCatalog:
     """Integration catalog; ``entries`` feeds held-release ``plan_delegations`` live_ids."""
 
@@ -330,15 +352,31 @@ class _AgentCatalog:
     def __init__(self) -> None:
         self._extra_agents: dict[str, Any] = {}
 
-    def register_agent(self, agent_id: str, *, can_be_root: bool = False) -> None:
-        """Make ``agent_id`` visible to catalog.get / entries (held-release credit path)."""
+    def register_agent(
+        self,
+        agent_id: str,
+        *,
+        can_be_root: bool = False,
+        display_name: str = "",
+        description: str = "",
+        character_prompt: str = "",
+    ) -> None:
+        """Make ``agent_id`` visible to catalog.get / entries (held-release credit path).
 
-        self._extra_agents[str(agent_id)] = SimpleNamespace(
+        ``display_name`` / ``character_prompt`` default to a recognizable per-agent
+        value so the assignment role card (design §8.2) is exercised end to end.
+        """
+
+        name = str(agent_id)
+        self._extra_agents[name] = SimpleNamespace(
             definition=SimpleNamespace(
-                agent_id=str(agent_id),
+                agent_id=name,
                 model_selector="model:gpt-5.6-luna-max",
                 enabled=True,
                 can_be_root=can_be_root,
+                display_name=display_name or f"测试智能体 {name}",
+                description=description or f"{name} 的能力简述",
+                character_prompt=character_prompt or f"{name} 的角色与工作偏好",
             )
         )
 
@@ -365,6 +403,29 @@ class _PriceCatalog:
 
     def low_budget_warning(self, _selector: str, _credits: float, **_kwargs: object) -> None:
         return None
+
+    def charge_actual(self, **kwargs: object) -> SimpleNamespace:
+        """Summarizer metering path; free charge keeps ledgers valid.
+
+        ``reconcile_usage`` reads ``charged.price.source``, so a bare
+        ``SimpleNamespace(credits=…)`` makes every metering call raise and flood
+        live-run output with tracebacks that bury the real failure.
+        """
+
+        return SimpleNamespace(
+            credits=0.0,
+            price=self.resolve_model(str(kwargs.get("actual_model_name") or ""), actual=True),
+        )
+
+    def resolve_model(self, model_name: str, *, actual: bool = False) -> SimpleNamespace:
+        """Reconciliation path; free profile so no ledger entry is invented."""
+
+        del actual
+        return SimpleNamespace(
+            model_name=str(model_name),
+            profile=SimpleNamespace(price_in=0.0, cache=False, cache_price_in=0.0, price_out=0.0),
+            source="host_unavailable_free",
+        )
 
 
 class RuntimeHarness:
@@ -408,7 +469,12 @@ class RuntimeHarness:
         ctx = SimpleNamespace(
             message=_MessageAPI(),
             config=_ConfigAPI(),
-            logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+            # A Host ctx.logger has every level.  A fake carrying only `warning`
+            # turns any error-path log into AttributeError, which is exactly where
+            # the runtime is trying to *recover* from a failure (see
+            # ResearchManager.fail_agent_effect): a transient upstream timeout then
+            # kills the whole drain instead of just that branch.
+            logger=_FakeLogger(),
         )
         snapshot = SimpleNamespace(
             root_agent="builtin.quick_thinker",
@@ -420,6 +486,12 @@ class RuntimeHarness:
             price_catalog=_PriceCatalog(),
         )
         self._shared_snapshot = snapshot
+
+        live_catalog = getattr(self, "_live_procedure_catalog", None)
+        if live_catalog is not None:
+            from live_harness import _install_procedure_catalog
+
+            _install_procedure_catalog(self, live_catalog)
 
         async def snapshot_provider() -> Any:
             return snapshot
@@ -758,6 +830,43 @@ class RuntimeHarness:
         self.summarizer = LiveSummarizer(creds)
         if self.manager is not None:
             self.manager.summarizer = self.summarizer
+
+    def use_real_summarizer(self, creds: Any) -> None:
+        """Install the shipped ``SummarizerService`` (real ``prompts/zh-CN/*.txt``).
+
+        ``use_live_summarizer`` swaps in test-local prompts, so it cannot tell us
+        anything about the prompt files we actually ship.  This one drives the real
+        four roles through the live gateway.
+        """
+
+        from live_llm import LiveLLMGateway
+
+        from lunagentic_research_swarm.llm.summarizer import SummarizerService
+
+        self.summarizer = SummarizerService(LiveLLMGateway(creds), selector="task:mid_memory", temperature=0.2)
+        if self.manager is not None:
+            self.manager.summarizer = self.summarizer
+
+    def use_bundled_agents(self, root_agent: str = "builtin.quick_thinker") -> None:
+        """Freeze the real nine-agent catalog into the shared round snapshot.
+
+        The default ``_AgentCatalog`` only knows the root, so delegation to the
+        specialized bundled roles — and therefore the assignment role cards and the
+        per-agent procedure allowlists — is unreachable without this.
+        """
+
+        from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
+        from lunagentic_research_swarm.agents.registry import AgentRegistry
+
+        registry = AgentRegistry(root_agent=root_agent)
+        registry.replace_provider(
+            "builtin", [item.model_dump(mode="json") for item in bundled_agent_definitions()]
+        )
+        snapshot = self._shared_snapshot
+        if snapshot is None:
+            raise RuntimeError("use_bundled_agents requires an opened harness")
+        snapshot.agent_catalog = registry.snapshot({})
+        snapshot.root_agent = root_agent
 
     def use_stub_procedures(self, fixtures: dict[str, Any]) -> None:
         """Canned ``builtin.web_search`` fixtures + catalog before ``start``."""

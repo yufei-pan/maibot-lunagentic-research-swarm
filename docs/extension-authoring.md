@@ -46,7 +46,7 @@ async def describe_agents(self) -> list[dict]:
             "character_prompt": "角色偏好……",
             "model_selector": "task:utils",  # 必须 task: 或 model:
             "protocol": "json_envelope",     # 或 native_tools
-            "allowed_procedures": ["*"],
+            "allowed_procedures": ["*"],     # 兼容保留；执行裁决看 Procedure.allowed_agents
             "can_be_root": False,
             "auto_compact_tokens": None,
             "enabled": True,
@@ -55,6 +55,8 @@ async def describe_agents(self) -> list[dict]:
 ```
 
 **校验要点：** ID 命名空间、selector 格式、protocol 枚举、禁止冒充 `core` / summarizer；整批失败时 provider 在 health 中为 `invalid`，不会静默兜底。
+
+`allowed_procedures` 不再决定谁能调用哪些工具。若要限制某 Procedure，在 `describe_procedures` 里设置 `allowed_agents`（见下）。
 
 ## `describe_procedures@1` / `invoke_procedure@1`
 
@@ -82,6 +84,7 @@ async def describe_procedures(self) -> list[dict]:
             # timeout_seconds=0 表示禁用执行器硬超时；>0 为硬上限秒数
             "timeout_seconds": 30,
             "external_cost_kind": "none",
+            "allowed_agents": ["*"],  # 默认全体；或显式 agent_id 列表（不可与 * 混用）
             "enabled": True,
         }
     ]

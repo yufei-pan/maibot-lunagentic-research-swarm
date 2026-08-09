@@ -342,3 +342,6 @@ def test_correction_message_escapes_and_bounds_model_controlled_schema_errors() 
     assert "\\n" in content
     assert content.count('"pointer"') <= 4
     assert '{"report":"","procedures":[],"delegations":[]}' in content
+    # 注入防护靠的是转义换行，不是 ensure_ascii：中文错误说明必须可读地送达模型，
+    # 否则纠正 turn 只能看到一串 \uXXXX。
+    assert "\\u" not in content

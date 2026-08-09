@@ -167,9 +167,13 @@ def sanitize_host_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
 
     tasks: dict[str, dict[str, list[str]]] = {}
     for task_name, raw_task in tasks_raw.items():
-        if not isinstance(task_name, str) or not isinstance(raw_task, Mapping):
+        if not isinstance(task_name, str) or not task_name.strip():
             raise ValueError("Host 模型快照包含无效 task 条目")
-        model_list = raw_task.get("model_list", [])
+        # Host model_dump 会把 PluginConfigBase 元数据（field_docs / suppress_any_warning）
+        # 混进 model_task_config；这些不是 task 条目，直接跳过。
+        if not isinstance(raw_task, Mapping) or "model_list" not in raw_task:
+            continue
+        model_list = raw_task.get("model_list")
         if not isinstance(model_list, list) or not all(isinstance(name, str) for name in model_list):
             raise ValueError("Host task model_list 必须为字符串列表")
         tasks[task_name] = {"model_list": [name for name in model_list if name.strip()]}

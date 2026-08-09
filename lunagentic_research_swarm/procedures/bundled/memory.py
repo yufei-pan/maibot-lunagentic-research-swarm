@@ -11,6 +11,8 @@ Handler = Callable[[Any, Mapping[str, Any]], Awaitable[ProcedureResult]]
 
 _OBJECT_SCHEMA: dict[str, Any] = {"type": "object"}
 
+_MEMORY_AGENT = "builtin.memory_researcher"
+
 _MEMORY_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "procedure_id": "builtin.chat_streams",
@@ -166,6 +168,7 @@ def memory_procedure_definitions() -> list[ProcedureDefinition]:
             "timeout_seconds": 30.0,
             "external_cost_kind": "none",
             "enabled": True,
+            "allowed_agents": [_MEMORY_AGENT],
             "result_schema": item.get("result_schema") or _OBJECT_SCHEMA,
         }
         definitions.append(ProcedureDefinition.model_validate(payload))

@@ -275,6 +275,136 @@ def test_spec_9_1_self_delegation_materializes_child_under_limits() -> None:
     assert not _edge_summaries(transition.effects)
 
 
+def test_spec_9_1_empty_delegations_with_non_control_procedure_auto_self_delegates() -> None:
+    """§9.1 — empty delegations + ordinary procedure → implicit self-continue delegation."""
+
+    parent_agent = "builtin.quick_thinker"
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.RUNNING,
+        generation=0,
+        active_round_id="round-1",
+        active_leaves={"parent": 8.0},
+        agent_calls_started=1,
+    )
+    transition = reduce_event(
+        state,
+        ProcedureBatchCompleted(
+            "evt-auto-self",
+            "task-1",
+            "round-1",
+            0,
+            occurred_at=NOW,
+            branch_id="parent",
+            call_id="call-1",
+            result_id="result-1",
+            credits_after=7.5,
+            results=(SimpleNamespace(procedure_id="builtin.web_search"),),
+            delegations=(),
+            agent_id=parent_agent,
+            parent_messages=({"role": "user", "content": "formalized"},),
+            parent_depth=0,
+            live_agent_ids=(parent_agent,),
+            max_delegations_per_turn=8,
+            max_branch_depth=32,
+            max_agent_calls_per_task=256,
+            agent_calls_started=1,
+        ),
+    )
+
+    children = _materialize_children(transition.effects)
+    assert len(children) == 1
+    assert children[0].payload["agent_id"] == parent_agent
+    assert children[0].payload["credits"] == pytest.approx(7.5)
+    assignment = str(children[0].payload.get("assignment", ""))
+    assert "上一 turn 的 Procedure 结果" in assignment
+    # 兜底自委派也要说明下一步能做什么，否则这一 turn 只会原地复述。
+    assert "core.terminate" in assignment
+    assert not any(
+        isinstance(item, PerformBranchSummary) and item.payload.get("reason") == "no_further_work"
+        for item in transition.effects
+    )
+
+
+def test_spec_9_1_empty_delegations_without_ordinary_procedure_is_natural_end() -> None:
+    """§9.1 — empty delegations and no ordinary procedure → no_further_work."""
+
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.RUNNING,
+        generation=0,
+        active_round_id="round-1",
+        active_leaves={"parent": 8.0},
+        agent_calls_started=1,
+    )
+    transition = reduce_event(
+        state,
+        ProcedureBatchCompleted(
+            "evt-natural",
+            "task-1",
+            "round-1",
+            0,
+            occurred_at=NOW,
+            branch_id="parent",
+            call_id="call-1",
+            result_id="result-1",
+            credits_after=8.0,
+            results=(),
+            delegations=(),
+            agent_id="builtin.quick_thinker",
+            parent_depth=0,
+            live_agent_ids=("builtin.quick_thinker",),
+            agent_calls_started=1,
+        ),
+    )
+    assert _materialize_children(transition.effects) == []
+    summaries = [
+        item
+        for item in transition.effects
+        if isinstance(item, PerformBranchSummary) and item.payload.get("reason") == "no_further_work"
+    ]
+    assert len(summaries) == 1
+
+
+def test_spec_9_1_terminate_wins_over_auto_self_delegation() -> None:
+    """§9.1 — terminate ignores empty-delegation auto self-continue."""
+
+    state = RuntimeState(
+        "task-1",
+        TaskStatus.RUNNING,
+        generation=0,
+        active_round_id="round-1",
+        active_leaves={"parent": 8.0},
+        agent_calls_started=1,
+    )
+    transition = reduce_event(
+        state,
+        ProcedureBatchCompleted(
+            "evt-term",
+            "task-1",
+            "round-1",
+            0,
+            occurred_at=NOW,
+            branch_id="parent",
+            call_id="call-1",
+            result_id="result-1",
+            credits_after=8.0,
+            results=(SimpleNamespace(procedure_id="builtin.web_search"),),
+            controls=CoreProcedureDecision(terminate=True),
+            delegations=(),
+            agent_id="builtin.quick_thinker",
+            parent_depth=0,
+            live_agent_ids=("builtin.quick_thinker",),
+            agent_calls_started=1,
+        ),
+    )
+    assert _materialize_children(transition.effects) == []
+    assert any(
+        isinstance(item, PerformBranchSummary) and item.payload.get("reason") == "terminate"
+        for item in transition.effects
+    )
+
+
 # ---------------------------------------------------------------------------
 # §10 — mixed rejected edges / credits conserved
 # ---------------------------------------------------------------------------

@@ -86,14 +86,33 @@ def freeze_report_kind(*, active_branch_count: int, coverage_has_checkpoint: boo
     return ReportKind.FINAL
 
 
+_COVERAGE_KIND_LABELS = {
+    SummaryKind.CHECKPOINT: "阶段性检查点摘要",
+    SummaryKind.BRANCH_FINAL: "已结束分支的最终摘要",
+}
+
+
 def coverage_messages(coverage: CoverageSet) -> tuple[dict[str, str], ...]:
-    """Encode each coverage item as a separate assistant message."""
+    """Encode each coverage item as a separate, explicitly attributed message.
+
+    The text belongs to a *different* branch.  Sending it as a bare assistant turn
+    made the receiving model read a sibling's findings as its own prior output —
+    the attribution lived in an OpenAI ``name`` field, which most providers drop.
+    Worse, that name (``branch:<id>:CHECKPOINT:epoch:1``) contains colons, which
+    strict OpenAI-compatible servers reject outright with a 400.  The provenance is
+    therefore stated inside the content, and no ``name`` is sent at all.
+    """
 
     return tuple(
         {
-            "role": "assistant",
-            "content": item.text or "",
-            "name": f"branch:{item.branch_id or 'task'}:{item.kind.value}:epoch:{item.epoch}",
+            "role": "user",
+            "content": (
+                f"【其它分支的共享摘要 · {_COVERAGE_KIND_LABELS.get(item.kind, item.kind.value)}"
+                f" · branch={item.branch_id or 'task'} · epoch={item.epoch}】\n"
+                "以下内容来自本次调查的另一个分支，不是你自己做过的工作。"
+                "可以直接引用其结论以避免重复劳动，但不要把它当成你已验证过的证据。\n"
+                f"{item.text or ''}"
+            ),
         }
         for item in coverage.items
     )

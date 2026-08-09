@@ -23,9 +23,11 @@ from lunagentic_research_swarm.extensions.contracts import ExtensionRefreshDelta
 from lunagentic_research_swarm.extensions.discovery import ExtensionDiscovery
 from lunagentic_research_swarm.feedback import FeedbackService
 from lunagentic_research_swarm.llm.gateway import (
+    SUMMARIZER_BUILTIN_SELECTOR,
     HostModelSnapshotReader,
     LLMGateway,
     ModelSelector,
+    agent_override_selector,
     resolve_generation_selector,
 )
 from lunagentic_research_swarm.llm.physical_pinning import PhysicalPinningAdapter, PhysicalPinningStatus
@@ -57,18 +59,19 @@ class NextRoundSnapshot:
     """启动一个 round 时一次性冻结的配置与目录边界。"""
 
     root_agent: str
-    root_force_selector: str
+    root_default_selector: str
     summarizer_selector: str
     default_effort_credits: float
     agent_catalog: AgentCatalogSnapshot
     procedure_catalog: ProcedureCatalogSnapshot
     price_catalog: PriceCatalog
+    agent_overrides: Mapping[str, AgentOverride]
 
 
 @dataclass(frozen=True, slots=True)
 class _NextRoundState:
     root_agent: str
-    root_force_selector: str
+    root_default_selector: str
     summarizer_selector: str
     default_effort_credits: float
     agent_overrides: tuple[tuple[str, AgentOverride], ...]
@@ -78,10 +81,17 @@ class _NextRoundState:
 
     @classmethod
     def from_config(cls, config: LRSConfig, *, price_catalog: PriceCatalog | None) -> _NextRoundState:
+        default_selector = str(config.llm.default_selector)
+        summarizer_user = str(config.summarizer.selector).strip() or None
+        summarizer_selector = resolve_generation_selector(
+            SUMMARIZER_BUILTIN_SELECTOR,
+            default_selector=default_selector,
+            user_override=summarizer_user,
+        ).raw
         return cls(
             root_agent=str(config.plugin.root_agent),
-            root_force_selector=str(config.llm.force_selector),
-            summarizer_selector=str(config.summarizer.selector),
+            root_default_selector=default_selector,
+            summarizer_selector=summarizer_selector,
             default_effort_credits=float(config.budget.default_effort_credits),
             agent_overrides=tuple(
                 sorted((name, value.model_copy(deep=True)) for name, value in config.agents.items())
@@ -569,15 +579,13 @@ class LRSServiceContainer:
         assert self.price_catalog is not None
         config = self._config
         gateway = LLMGateway(self._ctx, physical_pinning=self._physical_pinning)
-        summarizer_selector = resolve_generation_selector(
-            config.summarizer.selector,
-            config.llm.force_selector,
-        ).raw
+        summarizer_selector = self._next_round_state.summarizer_selector
         summarizer = SummarizerService(
             gateway,
             selector=summarizer_selector,
             temperature=float(config.summarizer.temperature),
             max_tokens=int(config.summarizer.max_tokens),
+            min_output_chars=config.summarizer.min_output_chars,
         )
         procedure_catalog = self.procedure_registry.snapshot(
             self._next_round_state.detached_procedure_overrides()
@@ -763,7 +771,11 @@ class LRSServiceContainer:
         if entry is None:
             return None
         try:
-            return resolve_generation_selector(entry.definition.model_selector, state.root_force_selector).raw
+            return resolve_generation_selector(
+                entry.definition.model_selector,
+                default_selector=state.root_default_selector,
+                user_override=agent_override_selector(state.detached_agent_overrides(), state.root_agent),
+            ).raw
         except Exception:
             return None
 
@@ -840,7 +852,7 @@ class LRSServiceContainer:
             assert state.price_catalog is not None
             return NextRoundSnapshot(
                 root_agent=state.root_agent,
-                root_force_selector=state.root_force_selector,
+                root_default_selector=state.root_default_selector,
                 summarizer_selector=state.summarizer_selector,
                 default_effort_credits=state.default_effort_credits,
                 agent_catalog=self.agent_registry.snapshot(
@@ -850,6 +862,7 @@ class LRSServiceContainer:
                     state.detached_procedure_overrides()
                 ),
                 price_catalog=state.price_catalog,
+                agent_overrides=MappingProxyType(state.detached_agent_overrides()),
             )
 
     async def update_self_config(self, config: LRSConfig, *, version: str) -> None:
@@ -934,18 +947,9 @@ class LRSServiceContainer:
 
     def _summarizer_health(self) -> dict[str, Any]:
         state = self._next_round_state
-        try:
-            selector = resolve_generation_selector(
-                state.summarizer_selector,
-                state.root_force_selector,
-            ).raw
-        except Exception:
-            return {
-                "status": "degraded",
-                "code": "summarizer_selector_invalid",
-                "selector": state.summarizer_selector,
-            }
-        result = self._selector_health(selector)
+        result = self._selector_health(state.summarizer_selector)
+        if result.get("code") == "selector_invalid":
+            result["code"] = "summarizer_selector_invalid"
         if result.get("code") == "selector_unavailable":
             result["code"] = "summarizer_selector_unavailable"
         return result

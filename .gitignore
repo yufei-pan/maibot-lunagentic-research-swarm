@@ -7,3 +7,4 @@ config.toml
 config.local.toml
 data/
 .superpowers/
+.debug_api_call_credentials

@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
+from lunagentic_research_swarm.agents.bundled.prompts import BUNDLED_CHARACTER_PROMPTS
 from lunagentic_research_swarm.config import ProcedureOverride
 from lunagentic_research_swarm.extensions.contracts import ProcedureResult
 from lunagentic_research_swarm.procedures.bundled.contractor import (
@@ -157,6 +158,23 @@ def test_config_default_toml_lists_all_bundled_procedure_toggles() -> None:
     assert "timeout_seconds = 0" in contractor_block.split("[", 1)[0]
 
 
+async def _always_ok_nested(
+    procedure_id: str,
+    arguments: Any = None,
+    **_kwargs: Any,
+) -> ProcedureResult:
+    """嵌套调用永远成功且不扣费；用于驱动承包商跑满轮数上限。"""
+
+    del arguments
+    return ProcedureResult(
+        success=True,
+        data={"procedure_id": str(procedure_id), "results": []},
+        error=None,
+        metadata={"research_credits_charged": 0.0},
+        research_credits_charged=0.0,
+    )
+
+
 @dataclass
 class _FakePrices:
     """Deterministic charge_actual for contractor metering tests."""
@@ -263,6 +281,69 @@ async def test_contractor_fresh_context_excludes_parent_task(contractor_harness:
     assert "旁路问题" in blob
     assert "FORMALIZED_TASK_MARKER" not in blob
     assert "parent transcript marker" not in blob
+
+
+@pytest.mark.asyncio
+async def test_contractor_system_prompt_states_identity_budget_and_schemas(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """承包商必须知道：谁在问、还剩多少预算、每个 Procedure 的参数长什么样。"""
+
+    contractor_harness.deps.resolve_procedure_catalog = lambda _agent_id: [
+        {
+            "procedure_id": "builtin.web_search",
+            "description": "按指定引擎执行网页搜索。",
+            "arguments_schema": {
+                "type": "object",
+                "properties": {"engine": {"type": "string", "enum": ["duckduckgo"]}, "query": {"type": "string"}},
+                "required": ["engine", "query"],
+            },
+        }
+    ]
+    contractor_harness.llm.queue_json({"return": "ok"})
+    await contractor_harness.invoke(
+        agent_id="builtin.researcher",
+        question="旁路问题",
+        caller_protocol="json_envelope",
+        credit_budget=7.0,
+        time_budget_seconds=30,
+    )
+
+    system = str(contractor_harness.llm.calls[0]["messages"][0]["content"])
+    # 人设仍来自被选中的智能体
+    assert BUNDLED_CHARACTER_PROMPTS["builtin.researcher"] in system
+    # 提问方 + 预算：没有这些，承包商无法自我调度，只能被强制截断
+    assert "`builtin.quick_thinker`" in system
+    assert "最多 16 轮" in system
+    assert "7 credits" in system
+    assert "30 秒" in system
+    # arguments schema：只给 id + 描述时，required/enum 的 Procedure 必然被猜错
+    assert '"required"' in system and "engine" in system
+    assert "duckduckgo" in system
+
+
+@pytest.mark.asyncio
+async def test_contractor_max_turns_is_not_reported_as_a_normal_return(
+    contractor_harness: ContractorHarness,
+) -> None:
+    """轮数耗尽必须可与「答完了」区分，否则调用方会把截断结果当完整答案。"""
+
+    contractor_harness.deps.invoke_nested_procedure = _always_ok_nested
+    for _ in range(20):
+        contractor_harness.llm.queue_json(
+            {"report": "继续查", "procedures": [{"procedure_id": "builtin.web_search", "arguments": {}}]}
+        )
+    result = await contractor_harness.invoke(
+        agent_id="builtin.researcher",
+        question="永远查不完的问题",
+        caller_protocol="json_envelope",
+        credit_budget=10_000.0,
+    )
+
+    assert result.success is True
+    assert result.metadata["termination_reason"] == "max_turns"
+    assert result.metadata["turn_count"] == 16
+    assert "max_turns" in str(result.data["result"])
 
 
 @pytest.mark.asyncio
@@ -870,6 +951,68 @@ async def test_contractor_llm_failure_is_not_returned_success(contractor_harness
     assert result.error["code"] in {"llm_generation_failed", "upstream_timeout"}
     assert result.metadata.get("termination_reason") != "returned"
     assert float(result.research_credits_charged) == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_contractor_gets_argument_schemas_from_the_frozen_round_snapshot() -> None:
+    """生产路径（有 round snapshot）也必须把 arguments schema 交给承包商。"""
+
+    from lunagentic_research_swarm.procedures.registry import ProcedureRegistry
+
+    agent = bundled_agent_definitions()[0]
+    procedures = ProcedureRegistry()
+    procedures.replace_provider(
+        "builtin",
+        [
+            {
+                "procedure_id": "builtin.web_search",
+                "version": "1",
+                "display_name": "网页搜索",
+                "description": "按指定引擎执行网页搜索。",
+                "arguments_schema": {
+                    "type": "object",
+                    "properties": {
+                        "engine": {"type": "string", "enum": ["duckduckgo"]},
+                        "query": {"type": "string"},
+                    },
+                    "required": ["engine", "query"],
+                },
+                "result_schema": {"type": "object"},
+                "enabled": True,
+            }
+        ],
+    )
+
+    class _Entry:
+        definition = agent
+
+    class _AgentCatalog:
+        def get(self, agent_id: str) -> Any:
+            return _Entry() if agent_id == agent.agent_id else None
+
+        def resolve_allowed_procedures(self, agent_id: str, _procedures: Any) -> tuple[str, ...]:
+            del agent_id
+            return ("builtin.web_search",)
+
+    snapshot = SimpleNamespace(
+        agent_catalog=_AgentCatalog(),
+        procedure_catalog=procedures.snapshot({}),
+        price_catalog=_FakePrices(),
+    )
+    llm = FakeLLMGateway()
+    llm.queue_json({"return": "ok"})
+    deps = ContractorDeps(llm=llm, round_snapshot_for_task=lambda _task_id: snapshot)
+
+    await run_contractor(
+        arguments={"agent_id": agent.agent_id, "question": "旁路问题"},
+        scoped_metadata={"task_id": "task-1", "caller_protocol": "json_envelope"},
+        deps=deps,
+    )
+
+    system = str(llm.calls[0]["messages"][0]["content"])
+    assert "builtin.web_search" in system
+    assert '"required"' in system
+    assert "duckduckgo" in system
 
 
 @pytest.mark.asyncio

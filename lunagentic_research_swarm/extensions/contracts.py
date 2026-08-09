@@ -105,6 +105,7 @@ class ProcedureDefinition(_StrictContract):
     idempotent: StrictBool = False
     timeout_seconds: float = Field(default=30.0, ge=0.0, le=600.0)
     external_cost_kind: Literal["none", "provider_metered"] = "none"
+    allowed_agents: list[str] = Field(default_factory=lambda: ["*"], min_length=1)
     enabled: StrictBool = True
 
     @field_validator("procedure_id")
@@ -114,6 +115,21 @@ class ProcedureDefinition(_StrictContract):
         if value.startswith("core."):
             raise ValueError("procedure_id 不得使用保留的 core 命名空间")
         return value
+
+    @field_validator("allowed_agents")
+    @classmethod
+    def _validate_allowed_agents(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values):
+            raise ValueError("allowed_agents 不得重复")
+        if "*" in values:
+            if values != ["*"]:
+                raise ValueError("通配符 * 不能与具体 agent_id 混用")
+            return freeze_json(values)
+        for value in values:
+            agent_id = validate_extension_id(value, field_name="agent_id")
+            if agent_id == "summarizer" or agent_id.startswith("core.") or agent_id.endswith(".summarizer"):
+                raise ValueError("allowed_agents 不得包含 core 或 summarizer")
+        return freeze_json(values)
 
     @field_validator("arguments_schema", "result_schema", mode="before")
     @classmethod

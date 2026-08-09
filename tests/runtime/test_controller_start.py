@@ -126,7 +126,8 @@ class FakeMessageAPI:
 
     async def build_readable(self, messages):
         self.calls.append(("build_readable", tuple(item["message_id"] for item in messages)))
-        return [{"role": "user", "content": messages[0]["content"]}]
+        # 与 Host SDK 一致：返回可读字符串，而非 message dict 列表。
+        return str(messages[0]["content"]) if messages else ""
 
 
 class FakeConfigAPI:
@@ -231,12 +232,13 @@ def harness():
     )
     snapshot = SimpleNamespace(
         root_agent="root",
-        root_force_selector="",
+        root_default_selector="",
         summarizer_selector="model:summarizer",
         default_effort_credits=100.0,
         agent_catalog=FakeCatalog(),
         procedure_catalog=SimpleNamespace(fingerprint="procedures-fingerprint"),
         price_catalog=FakePriceCatalog(),
+        agent_overrides={},
     )
 
     async def snapshot_provider():

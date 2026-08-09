@@ -98,7 +98,7 @@ async def test_spec_21_1_next_round_snapshot_keeps_inflight_formalized_byte_iden
     snapshot.price_catalog = FakePriceCatalog()
     snapshot.price_catalog.fingerprint = "price-reloaded"  # type: ignore[misc]
     snapshot.default_effort_credits = 999.0
-    snapshot.root_force_selector = "model:reloaded"
+    snapshot.root_default_selector = "model:reloaded"
 
     pricing_after = {"agent.root": {"fingerprint": "price-2", "price_in": 9.0, "price_out": 9.0}}
     user1_after = _prompt_user1_bytes(formalized, pricing=pricing_after)

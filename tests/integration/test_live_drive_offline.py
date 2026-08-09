@@ -78,7 +78,44 @@ def _assert_live_web_search_schema(harness) -> None:
     required = list(schema.get("required") or [])
     assert "engine" in required, f"live schema must require engine, got required={required!r}"
     assert "query" in required, f"live schema must require query, got required={required!r}"
-    assert str(getattr(entry, "fingerprint", "")).startswith("live:"), entry.fingerprint
+
+
+def _assert_full_bundled_procedure_catalog(harness) -> None:
+    """Live drain must freeze the real bundled research catalog (not web_search-only)."""
+
+    snapshot = harness.manager._round_snapshots.get(harness.task_id)
+    assert snapshot is not None
+    catalog = snapshot.procedure_catalog
+    ids = set(getattr(catalog, "ids", ()) or ())
+    expected = {
+        "builtin.web_search",
+        "builtin.chat_streams",
+        "builtin.message_recent",
+        "builtin.message_by_id",
+        "builtin.message_time_range",
+        "builtin.person_lookup",
+        "builtin.knowledge_search",
+        "builtin.past_cases",
+        "builtin.calculate",
+        "builtin.statistics",
+        "builtin.convert_units",
+        "builtin.normalize_urls",
+        "builtin.organize_provenance",
+        "builtin.contractor",
+    }
+    missing = expected - ids
+    assert not missing, f"live catalog missing bundled procedures: {sorted(missing)}"
+    # core.* stay outside the research registry (system control section / runtime header).
+    assert not any(str(pid).startswith("core.") for pid in ids)
+    resolve = getattr(catalog, "resolve_callable_procedures", None)
+    assert callable(resolve), "catalog must expose resolve_callable_procedures"
+    memory_only = set(resolve("builtin.memory_researcher"))
+    generalist = set(resolve("builtin.quick_thinker"))
+    assert "builtin.knowledge_search" in memory_only
+    assert "builtin.knowledge_search" not in generalist
+    assert "builtin.web_search" in generalist
+    assert "builtin.past_cases" not in generalist
+    assert "builtin.past_cases" in set(resolve("builtin.past_case_researcher"))
 
 
 @pytest.mark.asyncio
@@ -91,6 +128,14 @@ async def test_use_live_procedures_catalog_reaches_drain_after_start(runtime_har
     await harness.formalize("正式任务：校验 live procedure catalog 已安装。")
     attach_effect_runner(harness)
     _assert_live_web_search_schema(harness)
+    _assert_full_bundled_procedure_catalog(harness)
+    # Formalize freezes StablePromptBuilder from snapshot.entries — must already be full.
+    builder = harness.manager._prompt_builders.get(harness.task_id)
+    assert builder is not None
+    system = builder.system_message
+    assert "builtin.knowledge_search" in system
+    assert "调用限制：仅 `builtin.memory_researcher` 可调用" in system
+    assert "builtin.contractor" in system
 
 
 @pytest.mark.asyncio
@@ -107,5 +152,6 @@ async def test_use_live_procedures_before_open_reaches_drain(tmp_path: Path) -> 
         await harness.formalize("正式任务：before-open live catalog。")
         attach_effect_runner(harness)
         _assert_live_web_search_schema(harness)
+        _assert_full_bundled_procedure_catalog(harness)
     finally:
         await harness.close()

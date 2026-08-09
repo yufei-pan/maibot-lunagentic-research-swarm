@@ -35,10 +35,57 @@ class ModelSelector:
         return self.name
 
 
-def resolve_generation_selector(configured_selector: str, force_selector: str = "") -> ModelSelector:
-    """非空 force selector 统一覆盖生成式 LLM；embedding 调用方不使用本函数。"""
+def resolve_generation_selector(
+    builtin_selector: str,
+    default_selector: str = "",
+    *,
+    user_override: str | None = None,
+) -> ModelSelector:
+    """生成式 LLM selector 优先级：用户覆盖 > 全局默认 > 内置。
 
-    return ModelSelector.parse(force_selector if force_selector else configured_selector)
+    ``user_override`` 为 agent / summarizer 上用户显式配置的非空 selector。
+    ``default_selector`` 来自 ``llm.default_selector``（非空时覆盖内置默认）。
+    embedding 调用方不得使用本函数。
+    """
+
+    if isinstance(user_override, str) and user_override.strip():
+        return ModelSelector.parse(user_override.strip())
+    if isinstance(default_selector, str) and default_selector.strip():
+        return ModelSelector.parse(default_selector.strip())
+    return ModelSelector.parse(builtin_selector)
+
+
+SUMMARIZER_BUILTIN_SELECTOR = "task:mid_memory"
+
+# Host runner 对 cap.call 的默认 RPC 超时是 30s；形式化/分支总结/agent 轮次经常超过。
+# 通过 kwargs 传入 rpc_timeout_ms，由 runner 弹出并用作本次 RPC 超时（不进入 Host LLM 参数）。
+DEFAULT_LLM_RPC_TIMEOUT_MS = 600_000
+
+
+def _prompt_for_host(messages: str | Sequence[Mapping[str, Any]]) -> str | list[Any]:
+    """Host ``_normalize_prompt_arg`` 只接受 ``str`` 或 ``list``，拒绝 tuple。"""
+
+    if isinstance(messages, str):
+        return messages
+    return [dict(item) if isinstance(item, Mapping) else item for item in messages]
+
+
+def agent_override_selector(overrides: Mapping[str, Any], agent_id: str) -> str | None:
+    """从 ``[agents.<id>]`` 覆盖中取出用户显式 selector；未设置则返回 None。"""
+
+    override = overrides.get(agent_id)
+    if override is None:
+        return None
+    if hasattr(override, "model_dump"):
+        data = override.model_dump(mode="python", exclude_unset=True)
+    elif isinstance(override, Mapping):
+        data = dict(override)
+    else:
+        return None
+    selector = data.get("selector")
+    if isinstance(selector, str) and selector.strip():
+        return selector.strip()
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,13 +164,15 @@ class LLMGateway:
         started = time.perf_counter()
         selector = request.selector
         assert isinstance(selector, ModelSelector)
+        prompt = _prompt_for_host(request.messages)
         try:
             if selector.scheme == "task":
                 kwargs = {
-                    "prompt": request.messages,
+                    "prompt": prompt,
                     "model": selector.name,
                     "temperature": request.temperature,
                     "max_tokens": request.max_tokens,
+                    "rpc_timeout_ms": DEFAULT_LLM_RPC_TIMEOUT_MS,
                 }
                 if request.tools is None:
                     raw = await self._ctx.llm.generate(**kwargs)
@@ -132,7 +181,7 @@ class LLMGateway:
             else:
                 raw = await self._physical_pinning.generate(
                     physical_name=selector.name,
-                    prompt=request.messages,
+                    prompt=prompt,
                     tools=request.tools,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,

@@ -31,11 +31,19 @@ def test_selector_requires_explicit_supported_scheme_and_nonempty_name() -> None
         assert caught.value.message == f"无效模型 selector：{invalid}"
 
 
-def test_force_selector_only_overrides_generation_selector() -> None:
+def test_default_selector_priority_over_builtin() -> None:
     from lunagentic_research_swarm.llm.gateway import resolve_generation_selector
 
     assert resolve_generation_selector("task:utils", "model:pinned").raw == "model:pinned"
     assert resolve_generation_selector("task:utils", "").raw == "task:utils"
+    assert (
+        resolve_generation_selector("task:utils", "model:default", user_override="model:agent").raw
+        == "model:agent"
+    )
+    assert (
+        resolve_generation_selector("task:utils", "model:default", user_override="").raw == "model:default"
+    )
+    assert resolve_generation_selector("task:utils", "model:default", user_override=None).raw == "model:default"
     with pytest.raises(LRSError, match="无效模型 selector"):
         resolve_generation_selector("task:utils", "bare-name")
 
@@ -69,6 +77,38 @@ def test_host_unavailable_unpriced_and_actual_unknown_have_distinct_free_sources
     )
     assert actual.price.source == "actual_model_unknown_free"
     assert actual.credits == 0.0
+
+
+def test_sanitize_skips_host_model_task_config_metadata() -> None:
+    """MaiBot PluginConfigBase model_dump 会把 field_docs / suppress_any_warning 混进 task map。
+
+    回归：若再次整包拒绝此类快照，swarm health 会出现
+    initial_price_snapshot=host_model_snapshot_invalid，并级联
+    root_selector_unavailable / summarizer_selector_unavailable。
+    """
+
+    from lunagentic_research_swarm.llm.pricing import sanitize_host_snapshot
+
+    host_like = {
+        "models": [{"name": "m", "price_in": 1.0}],
+        "model_task_config": {
+            "field_docs": {"utils": "组件模型", "mid_memory": "摘要"},
+            "suppress_any_warning": False,
+            "utils": {
+                "field_docs": {"model_list": "使用的模型列表"},
+                "suppress_any_warning": True,
+                "model_list": ["m"],
+                "temperature": 0.7,
+            },
+            "mid_memory": {"model_list": ["m"]},
+        },
+    }
+    safe = sanitize_host_snapshot(host_like)
+    assert set(safe["model_task_config"]) == {"utils", "mid_memory"}
+    catalog = PriceCatalog.from_host_snapshot(host_like, {})
+    assert catalog.debug_snapshot()["tasks"] == {"utils": ["m"], "mid_memory": ["m"]}
+    assert catalog.debug_snapshot()["tasks"].get("field_docs") is None
+    assert "suppress_any_warning" not in catalog.debug_snapshot()["tasks"]
 
 
 def test_partial_host_price_keeps_present_fields_and_defaults_missing_fields() -> None:

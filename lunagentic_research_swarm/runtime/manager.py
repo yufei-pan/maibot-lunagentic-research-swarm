@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from lunagentic_research_swarm.llm.gateway import resolve_generation_selector
+from lunagentic_research_swarm.llm.gateway import agent_override_selector, resolve_generation_selector
 from lunagentic_research_swarm.llm.pricing import TokenUsage, charge
 from lunagentic_research_swarm.llm.summarizer import FormalizationRequest
 from lunagentic_research_swarm.llm.tokens import estimate_child_tokens, estimate_prompt_tokens
@@ -35,6 +35,9 @@ from lunagentic_research_swarm.models import (
 from lunagentic_research_swarm.runtime.context import (
     RuntimeHeader,
     StablePromptBuilder,
+    render_assignment_section,
+    root_assignment_section,
+    replace_leading_system_message,
     release_raw_context,
     should_auto_compact,
 )
@@ -73,7 +76,12 @@ from lunagentic_research_swarm.runtime.reducer import (
     ReleaseRawContext,
     RuntimeState,
 )
-from lunagentic_research_swarm.procedures.core import CORE_COMPACT_ID, CoreProcedureContext, execute_core_procedure
+from lunagentic_research_swarm.procedures.core import (
+    CORE_COMPACT_ID,
+    CORE_PROCEDURE_IDS,
+    CoreProcedureContext,
+    execute_core_procedure,
+)
 from lunagentic_research_swarm.storage.sqlite import StoreCommand
 
 _LOG = logging.getLogger(__name__)
@@ -95,7 +103,12 @@ _RUNTIME_HEADER_MARKER = "[LRS runtime]"
 
 
 def _is_runtime_header(message: Mapping[str, Any] | Any) -> bool:
-    """Per-call runtime headers are ephemeral and never part of inherited history."""
+    """Identify a ``[LRS runtime]`` block.
+
+    Blocks are appended once per call and then left in place — history is
+    append-only so each request stays a prefix of the next.  This predicate is for
+    inspection (tests, compaction bookkeeping), not for removing them.
+    """
 
     if not isinstance(message, Mapping):
         return False
@@ -180,7 +193,11 @@ class ResearchManager:
             raise ValueError("root agent 不可用")
         if not str(snapshot.summarizer_selector).strip():
             raise ValueError("summarizer selector 不能为空")
-        selector = str(snapshot.root_force_selector or root.definition.model_selector)
+        selector = resolve_generation_selector(
+            root.definition.model_selector,
+            default_selector=str(getattr(snapshot, "root_default_selector", "") or ""),
+            user_override=agent_override_selector(getattr(snapshot, "agent_overrides", {}) or {}, snapshot.root_agent),
+        ).raw
         credits = float(snapshot.default_effort_credits) * float(effort_level)
         miss_tokens = int(self._runtime_limits.get("warning_miss_input_tokens", 500_000))
         output_tokens = int(self._runtime_limits.get("warning_output_tokens", 50_000))
@@ -331,18 +348,11 @@ class ResearchManager:
                 pricing=pricing_context,
             )
             root_context = builder.root_context(coordinator=snapshot.root_agent)
-            root_messages = builder.messages_for_call(
-                root_context,
-                RuntimeHeader(
-                    branch_id,
-                    1,
-                    str(getattr(root_entry.definition, "description", snapshot.root_agent)),
-                    time_budget_seconds,
-                    credits,
-                    1,
-                    0,
-                ),
-            )
+            root_protocol = str(getattr(root_entry.definition, "protocol", "json_envelope") or "json_envelope")
+            root_assignment = root_assignment_section()
+            # Stored history stops before the runtime block; prepare_agent_effect
+            # appends this branch's block on every call (history is append-only).
+            root_messages = builder.initial_messages(root_context, protocol=root_protocol)
             self._prompt_builders[task_id] = builder
             prepared_branch_id = branch_id
             self._branches[task_id][branch_id] = {
@@ -351,6 +361,7 @@ class ResearchManager:
                 "agent_id": snapshot.root_agent,
                 "messages": root_messages,
                 "depth": 0,
+                "assignment": root_assignment,
             }
             self._register_report_coordinator(
                 task_id=task_id,
@@ -638,18 +649,8 @@ class ResearchManager:
             for item in summary_context.get(key, ())
         ]
         root_context = builder.restart_context(summary_layers=summary_layers, coordinator=snapshot.root_agent)
-        root_messages = builder.messages_for_call(
-            root_context,
-            RuntimeHeader(
-                branch_id,
-                1,
-                str(getattr(root_entry.definition, "description", snapshot.root_agent)),
-                time_budget_seconds,
-                credits,
-                1,
-                0,
-            ),
-        )
+        root_protocol = str(getattr(root_entry.definition, "protocol", "json_envelope") or "json_envelope")
+        root_messages = builder.initial_messages(root_context, protocol=root_protocol)
         previous_branches = self._branches.get(task_id, {})
         previous_snapshot = self._round_snapshots.get(task_id)
         previous_builder = self._prompt_builders.get(task_id)
@@ -663,6 +664,7 @@ class ResearchManager:
                 "agent_id": snapshot.root_agent,
                 "messages": root_messages,
                 "depth": 0,
+                "assignment": root_assignment_section(),
             }
         }
         self._register_report_coordinator(
@@ -772,7 +774,12 @@ class ResearchManager:
         )
 
     def _sync_branch_model_from_event(self, event: Any) -> None:
-        """Remember the physical model a branch actually used, for cache lineage."""
+        """Remember the physical model a branch actually used, for cache lineage.
+
+        The reconciled charge is kept alongside it so the next runtime header can
+        tell the agent what a turn on this branch actually costs — the frozen price
+        catalog cannot, since agent cards deliberately omit ``model_selector``.
+        """
 
         model_name = str(getattr(event, "actual_model_name", "") or "")
         branch_id = getattr(event, "branch_id", None)
@@ -782,6 +789,9 @@ class ResearchManager:
         branch = self._branches.get(task_id, {}).get(branch_id)
         if branch is not None:
             branch["last_actual_model_name"] = model_name
+            actual_charge = getattr(event, "actual_charge", None)
+            if actual_charge is not None:
+                branch["last_actual_charge"] = float(actual_charge)
 
     def _sync_branch_messages_from_event(self, event: Any) -> None:
         """Apply compacted/rewritten parent messages and procedure summaries after batch complete."""
@@ -829,7 +839,11 @@ class ResearchManager:
         if entry is None:
             raise LookupError(f"agent {agent_id} 不存在")
         definition = entry.definition
-        selector = resolve_generation_selector(definition.model_selector, snapshot.root_force_selector).raw
+        selector = resolve_generation_selector(
+            definition.model_selector,
+            default_selector=str(getattr(snapshot, "root_default_selector", "") or ""),
+            user_override=agent_override_selector(getattr(snapshot, "agent_overrides", {}) or {}, agent_id),
+        ).raw
         live_ids = tuple(
             sorted(
                 item.definition.agent_id
@@ -838,17 +852,21 @@ class ResearchManager:
             )
         )
         messages = tuple(dict(item) for item in branch.get("messages", ()))
-        protocol = str(getattr(definition, "protocol", "json_envelope"))
+        protocol = str(effect.payload.get("protocol") or getattr(definition, "protocol", "json_envelope") or "json_envelope")
         call_id = str(effect.payload.get("call_id") or new_call_id())
         # Authoritative balance lives on active_leaves; branch cache is status-only.
         if branch_id in controller.state.active_leaves:
             balance_before = float(controller.state.active_leaves[branch_id])
         else:
             balance_before = float(branch.get("credits", 0.0))
-        # Runtime headers are per-call and must never accumulate in inherited
-        # history (design §8.2); drop any carried over from a parent or a
-        # previous turn before appending this call's fresh header below.
-        messages = tuple(item for item in messages if not _is_runtime_header(item))
+        # History is append-only: earlier `[LRS runtime]` blocks stay exactly where
+        # they were sent, so every previous request is a byte-identical prefix of
+        # this one and provider prefix caches keep the whole chain.  Stripping them
+        # would also delete the branch's task assignment, which now travels inside
+        # the same block; the block itself tells the agent only the last one counts.
+        builder = self._prompt_builders.get(effect.task_id)
+        if builder is not None:
+            messages = replace_leading_system_message(messages, builder.system_message_for_protocol(protocol))
         appended = tuple(
             dict(item) for item in effect.payload.get("appended_messages", ()) if isinstance(item, Mapping)
         )
@@ -928,6 +946,13 @@ class ResearchManager:
                 turn_number=turn_number,
                 definition=definition,
                 credits_after_reservation=balance_before - estimated_charge,
+                protocol=protocol,
+                agent_id=agent_id,
+                allowed_procedures=self._allowed_procedures_for(snapshot, agent_id),
+                last_turn_credits=branch.get("last_actual_charge"),
+                # Repeated every turn so the last block is self-sufficient: the
+                # agent never has to scan back through history for its own task.
+                assignment=str(branch.get("assignment", "") or ""),
             ),
         )
         estimated_charge, prompt_tokens, cache_hit, cache_miss, resolved = self._estimate_agent_reservation(
@@ -1001,6 +1026,38 @@ class ResearchManager:
         )
         return replace(effect, payload=payload)
 
+    @staticmethod
+    def _allowed_procedures_for(snapshot: Any, agent_id: str) -> tuple[str, ...] | None:
+        """Resolve this agent's callable procedure ids for the runtime header.
+
+        The frozen system catalog is byte-identical for every agent in the round
+        (design §8.2), so the per-call header lists only IDs this agent may invoke
+        (research procedures via ``allowed_agents``, plus always-on ``core.*``).
+        Returning ``None`` means "unknown" and the header stays silent rather than
+        claiming a wrong restriction.
+        """
+
+        catalog = getattr(snapshot, "agent_catalog", None)
+        resolve = getattr(catalog, "resolve_allowed_procedures", None)
+        if not callable(resolve):
+            return None
+        try:
+            resolved = resolve(agent_id, getattr(snapshot, "procedure_catalog", None))
+        except Exception:  # a telemetry-only line must never break a research call
+            return None
+        if resolved is None:
+            return None
+        research = tuple(str(item) for item in resolved)
+        core = tuple(sorted(CORE_PROCEDURE_IDS))
+        # Core first (stable order), then research ids already catalog-ordered.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in (*core, *research):
+            if item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        return tuple(ordered)
+
     def _runtime_header(
         self,
         *,
@@ -1009,6 +1066,11 @@ class ResearchManager:
         turn_number: int,
         definition: Any,
         credits_after_reservation: float,
+        protocol: str = "json_envelope",
+        agent_id: str = "",
+        allowed_procedures: tuple[str, ...] | None = None,
+        last_turn_credits: float | None = None,
+        assignment: str = "",
     ) -> dict[str, Any]:
         """Build this call's runtime header from live scheduler/report state."""
 
@@ -1029,6 +1091,7 @@ class ResearchManager:
                 queued_count = int(task_stats.get("queued", 0))
             except Exception:  # telemetry must never block a research call
                 active_count = queued_count = 0
+        resolved_agent_id = str(agent_id or getattr(definition, "agent_id", "") or "")
         return RuntimeHeader(
             branch_id,
             turn_number,
@@ -1037,6 +1100,12 @@ class ResearchManager:
             credits_after_reservation,
             active_count,
             queued_count,
+            protocol=str(protocol or "json_envelope"),
+            agent_id=resolved_agent_id,
+            agent_display_name=str(getattr(definition, "display_name", "") or ""),
+            allowed_procedures=allowed_procedures,
+            last_turn_credits=last_turn_credits,
+            assignment=assignment,
         ).message()
 
     def _estimate_agent_reservation(
@@ -1285,6 +1354,38 @@ class ResearchManager:
             return bool(self._agent_live_provider(agent_id))
         return snapshot.agent_catalog.get(agent_id) is not None
 
+    def _split_role_assignment(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        snapshot: Any,
+        agent_id: str,
+        assignment: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Lift the planner's bare ``assignment:`` line out of history into a card.
+
+        ``plan_delegations`` is pure and has no catalog access, so it can only emit
+        the raw assignment text as a message.  design §8.2 requires role/personality
+        to travel with the sub-task (never in the cached system prefix), and the card
+        now rides inside the child's ``[LRS runtime]`` block instead of occupying its
+        own message — which keeps the inherited history a byte-identical prefix of
+        what the parent already sent.  Returns (inherited_messages, assignment_card).
+        """
+
+        if not messages or not assignment:
+            return messages, ""
+        last = messages[-1]
+        if str(last.get("role", "")) != "user" or str(last.get("content", "")) != f"assignment: {assignment}":
+            # Not the planner-rendered assignment (custom/held payload): leave as is.
+            return messages, ""
+        entry = snapshot.agent_catalog.get(agent_id) if snapshot is not None else None
+        definition = getattr(entry, "definition", entry)
+        card = render_assignment_section(
+            character_prompt=str(getattr(definition, "character_prompt", "") or ""),
+            assignment=assignment,
+        )
+        return messages[:-1], card
+
     async def materialize_child_effect(self, effect: NotifyToolWaiter) -> None:
         """Commit one child branch before making its first agent call runnable."""
 
@@ -1318,15 +1419,22 @@ class ResearchManager:
             ),
         )
         self._sync_branch_credits(effect.task_id, controller)
-        messages = [dict(item) for item in payload.get("messages", ())]
+        messages, assignment_card = self._split_role_assignment(
+            [dict(item) for item in payload.get("messages", ())],
+            snapshot=snapshot,
+            agent_id=agent_id,
+            assignment=str(payload.get("assignment", "") or ""),
+        )
         parent_branch = self._branches[effect.task_id].get(parent_id) or {}
         self._branches[effect.task_id][branch_id] = {
             "credits": credits, "pending_context": [], "agent_id": agent_id,
             "messages": messages, "depth": depth,
+            "assignment": assignment_card,
             # Cache lineage for the child's first input estimate (design §11.2):
-            # everything before the appended assignment is byte-identical to what
-            # the parent already sent to its own physical model.
-            "inherited_messages": tuple(dict(item) for item in messages[:-1]),
+            # the inherited history is byte-identical to what the parent already
+            # sent to its own physical model — the assignment rides in the trailing
+            # runtime block, which is appended per call and never inherited as-is.
+            "inherited_messages": tuple(dict(item) for item in messages),
             "inherited_model_name": str(parent_branch.get("last_actual_model_name", "") or ""),
             "turn": 0,
         }
@@ -2047,7 +2155,7 @@ class ResearchManager:
                 )
             )
         if plan.all_rejected:
-            notice = rejected_edge_notice(plan.rejected)
+            notice = rejected_edge_notice(plan.rejected, live_agent_ids=live_ids)
             if plan.blocking_reason is not None:
                 await self._finalize_held_parent(
                     task_id, parent_branch_id, reason=plan.blocking_reason, appended=(notice,)

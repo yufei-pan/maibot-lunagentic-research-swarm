@@ -6,9 +6,11 @@ from typing import Any
 import pytest
 
 from lunagentic_research_swarm.llm.gateway import (
+    DEFAULT_LLM_RPC_TIMEOUT_MS,
     GenerationRequest,
     HostModelSnapshotReader,
     LLMGateway,
+    _prompt_for_host,
 )
 from lunagentic_research_swarm.llm.pricing import PriceCatalog, PriceProfile
 from lunagentic_research_swarm.llm.tokens import (
@@ -82,16 +84,52 @@ async def test_task_selector_routes_plain_and_native_tool_calls_through_public_c
     )
 
     assert [name for name, _ in public.calls] == ["generate", "generate_with_tools"]
-    assert public.calls[0][1] == {"prompt": "hello", "model": "utils", "temperature": 0.4, "max_tokens": None}
+    assert public.calls[0][1] == {
+        "prompt": "hello",
+        "model": "utils",
+        "temperature": 0.4,
+        "max_tokens": None,
+        "rpc_timeout_ms": DEFAULT_LLM_RPC_TIMEOUT_MS,
+    }
     assert public.calls[1][1] == {
         "prompt": [{"role": "user", "content": "go"}],
         "tools": tools,
         "model": "planner",
         "temperature": None,
         "max_tokens": None,
+        "rpc_timeout_ms": DEFAULT_LLM_RPC_TIMEOUT_MS,
     }
     assert not pinned.calls
     assert plain.success and native.success
+
+
+def test_prompt_for_host_coerces_tuple_messages_to_list() -> None:
+    """Host 只接受 list；agent 路径常把 messages 存成 tuple。"""
+
+    messages = ({"role": "user", "content": "hi"},)
+    prompt = _prompt_for_host(messages)
+    assert isinstance(prompt, list)
+    assert prompt == [{"role": "user", "content": "hi"}]
+    assert _prompt_for_host("plain") == "plain"
+
+
+@pytest.mark.asyncio
+async def test_task_generate_coerces_tuple_prompt_and_sets_rpc_timeout() -> None:
+    public = FakeLLM()
+    gateway = LLMGateway(FakeContext(public), physical_pinning=FakePinning())
+    result = await gateway.generate(
+        GenerationRequest(
+            selector="task:mid_memory",
+            messages=({"role": "system", "content": "s"}, {"role": "user", "content": "u"}),
+        )
+    )
+    assert result.success
+    assert public.calls[0][0] == "generate"
+    kwargs = public.calls[0][1]
+    assert isinstance(kwargs["prompt"], list)
+    assert kwargs["prompt"] == [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    assert kwargs["rpc_timeout_ms"] == DEFAULT_LLM_RPC_TIMEOUT_MS
+    assert kwargs["rpc_timeout_ms"] > 30_000
 
 
 @pytest.mark.asyncio

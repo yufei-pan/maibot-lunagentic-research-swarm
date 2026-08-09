@@ -218,6 +218,7 @@ class TurnWorker:
             credits_after=prior - charged,
             parent_messages=parent_messages,
             parent_depth=int(payload.get("branch_depth", 0)),
+            agent_id=str(payload.get("agent_id", "") or ""),
             live_agent_ids=payload.get("live_agent_ids"),
             max_delegations_per_turn=int(payload.get("max_delegations_per_turn", 8)),
             max_branch_depth=int(payload.get("max_branch_depth", 32)),

@@ -92,7 +92,14 @@ async def chat_completion(
     url = f"{credentials.base_url}/chat/completions"
     async with httpx.AsyncClient(timeout=credentials.timeout_seconds) as client:
         response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # raise_for_status() drops the body, which is where an OpenAI-compatible
+            # server explains itself ("context length exceeded", bad param, ...).
+            raise httpx.HTTPStatusError(
+                f"{response.status_code} from {url}: {response.text[:800]}",
+                request=response.request,
+                response=response,
+            )
         body = response.json()
     choice = (body.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -134,6 +141,39 @@ class LiveLLMGateway:
     def __init__(self, credentials: LiveLLMCredentials) -> None:
         self._credentials = credentials
         self.calls: list[dict[str, Any]] = []
+        # Request/response pairs, so a live test can assert on what the agents
+        # were actually told and what they actually answered.
+        self.exchanges: list[dict[str, Any]] = []
+
+    def _failure(
+        self,
+        code: str,
+        message: str,
+        started: float,
+        chat_messages: list[dict[str, Any]],
+        tools: Any,
+    ) -> GenerationResult:
+        from lunagentic_research_swarm.llm.gateway import GenerationError
+
+        self.exchanges.append(
+            {
+                "messages": chat_messages,
+                "tools": tools,
+                "response": "",
+                "tool_calls": None,
+                "error": {"code": code, "message": message},
+                "duration": time.perf_counter() - started,
+            }
+        )
+        return GenerationResult(
+            response="",
+            tool_calls=None,
+            model_name=self._credentials.model,
+            usage=None,
+            success=False,
+            error=GenerationError(code, message),
+            duration=time.perf_counter() - started,
+        )
 
     async def generate(
         self,
@@ -174,10 +214,25 @@ class LiveLLMGateway:
         }
         url = f"{credentials.base_url}/chat/completions"
         started = time.perf_counter()
-        async with httpx.AsyncClient(timeout=credentials.timeout_seconds) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            body = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=credentials.timeout_seconds) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                if response.status_code >= 400:
+                    return self._failure(
+                        f"http_{response.status_code}",
+                        response.text[:800],
+                        started,
+                        chat_messages,
+                        tools,
+                    )
+                body = response.json()
+        except httpx.HTTPError as exc:
+            # A Host LLM capability reports transport failures as a failed result;
+            # raising here would abort the whole drain instead of just this branch,
+            # which is not how production degrades.
+            return self._failure(
+                type(exc).__name__, str(exc)[:800], started, chat_messages, tools
+            )
         duration = time.perf_counter() - started
 
         choice = (body.get("choices") or [{}])[0]
@@ -195,6 +250,17 @@ class LiveLLMGateway:
         completion_tokens = int(usage.get("completion_tokens") or 0)
         cache_hit = int(usage.get("prompt_cache_hit_tokens") or 0)
         cache_miss = int(usage.get("prompt_cache_miss_tokens") or usage.get("prompt_tokens") or 0)
+        self.exchanges.append(
+            {
+                "messages": chat_messages,
+                "tools": tools,
+                "response": str(content),
+                "tool_calls": tool_calls,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "duration": duration,
+            }
+        )
         return GenerationResult(
             response=str(content),
             tool_calls=tool_calls,

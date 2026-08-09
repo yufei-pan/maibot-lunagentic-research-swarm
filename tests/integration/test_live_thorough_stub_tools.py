@@ -35,7 +35,8 @@ def _final_report_text(harness) -> str:
 async def test_live_thorough_stub_web_search_and_deep_judge(runtime_harness, tmp_path) -> None:
     creds = load_live_llm_credentials()
     harness = runtime_harness
-    harness.use_live_summarizer(creds)
+    harness.use_bundled_agents()
+    harness.use_real_summarizer(creds)
     harness.use_live_llm(creds)
     harness.use_stub_procedures(
         {

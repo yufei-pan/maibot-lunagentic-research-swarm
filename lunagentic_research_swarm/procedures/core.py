@@ -26,6 +26,28 @@ CORE_CHECKPOINT_ID = "core.checkpoint"
 CORE_TERMINATE_ID = "core.terminate"
 CORE_PROCEDURE_IDS = frozenset({CORE_COMPACT_ID, CORE_CHECKPOINT_ID, CORE_TERMINATE_ID})
 
+# Agent-facing 控制 Procedure 说明（不进 ProcedureRegistry；写入冻结 system 契约）。
+CORE_PROCEDURE_PROMPTS: tuple[dict[str, str], ...] = (
+    {
+        "procedure_id": CORE_COMPACT_ID,
+        "display_name": "压缩上下文",
+        "description": "压缩本分支可变历史以节省 token；arguments 用 `{}`。",
+        "arguments_note": "通常 `{}`。",
+    },
+    {
+        "procedure_id": CORE_CHECKPOINT_ID,
+        "display_name": "检查点汇总",
+        "description": "生成本分支检查点摘要；可与委派同 turn；arguments 用 `{}`。",
+        "arguments_note": "通常 `{}`。",
+    },
+    {
+        "procedure_id": CORE_TERMINATE_ID,
+        "display_name": "终结本分支",
+        "description": "明确结束本分支，不再启动后代；arguments 用 `{}`。",
+        "arguments_note": "通常 `{}`。",
+    },
+)
+
 
 def is_core_procedure(procedure_id: str) -> bool:
     """返回 ID 是否属于固定的本地控制 Procedure。"""
@@ -422,6 +444,7 @@ __all__ = [
     "CORE_CHECKPOINT_ID",
     "CORE_COMPACT_ID",
     "CORE_PROCEDURE_IDS",
+    "CORE_PROCEDURE_PROMPTS",
     "CORE_TERMINATE_ID",
     "CoreProcedureContext",
     "CoreProcedureDecision",

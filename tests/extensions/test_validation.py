@@ -98,6 +98,20 @@ def test_agent_allowlist_rejects_empty_invalid_mixed_or_duplicate_values(allowed
         AgentDefinition.model_validate(agent_payload(allowed_procedures=allowed))
 
 
+@pytest.mark.parametrize("allowed", [["missing.optional"], ["*"], ["example.reader", "missing.optional"]])
+def test_procedure_allowed_agents_checks_syntax(allowed: list[str]) -> None:
+    assert ProcedureDefinition.model_validate(procedure_payload(allowed_agents=allowed)).allowed_agents == allowed
+
+
+@pytest.mark.parametrize(
+    "allowed",
+    [[], ["bad id"], ["*", "example.reader"], ["example.reader", "example.reader"], ["core.terminate"], ["summarizer"]],
+)
+def test_procedure_allowed_agents_rejects_invalid_values(allowed: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        ProcedureDefinition.model_validate(procedure_payload(allowed_agents=allowed))
+
+
 @pytest.mark.parametrize("field", ["arguments_schema", "result_schema"])
 @pytest.mark.parametrize("schema", [{}, {"type": "array"}, [], "object"])
 def test_procedure_schemas_must_be_object_schemas(field: str, schema: object) -> None:
@@ -129,11 +143,13 @@ def test_procedure_defaults_and_public_fields_are_exact() -> None:
         "idempotent",
         "timeout_seconds",
         "external_cost_kind",
+        "allowed_agents",
         "enabled",
     }
     assert definition.idempotent is False
     assert definition.timeout_seconds == 30.0
     assert definition.external_cost_kind == "none"
+    assert definition.allowed_agents == ["*"]
     assert definition.enabled is True
 
 

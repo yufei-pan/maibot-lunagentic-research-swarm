@@ -106,8 +106,13 @@ async def test_bc1_procedure_results_fold_into_parent_and_child_messages() -> No
         _effect([ProcedureRequest(procedure_id="builtin.web_search", arguments={"engine": "duckduckgo", "query": "q"})])
     )
 
-    assert any("procedure_result:" in str(item.get("content", "")) for item in completed.parent_messages)
+    assert any(
+        "【Procedure 结果 · builtin.web_search】" in str(item.get("content", ""))
+        for item in completed.parent_messages
+    )
     assert any("lunar research" in str(item.get("content", "")) for item in completed.parent_messages)
+    # 纯审计字段不进入被后代继承的消息（只留在事件/存储里）。
+    assert "provider_plugin_id" not in repr(completed.parent_messages)
     assert "raw_payload" not in repr(completed.parent_messages)
 
     transition = reduce_event(
@@ -133,7 +138,7 @@ async def test_bc1_procedure_results_fold_into_parent_and_child_messages() -> No
     assert len(children) == 1
     child_blob = repr(children[0].payload["messages"])
     assert "lunar research" in child_blob
-    assert "procedure_result:" in child_blob
+    assert "Procedure 结果" in child_blob
 
 
 @pytest.mark.asyncio

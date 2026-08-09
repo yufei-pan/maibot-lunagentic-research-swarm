@@ -8,6 +8,12 @@ from typing import Any
 import pytest
 
 from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
+from lunagentic_research_swarm.procedures.bundled.memory import memory_procedure_definitions
+
+
+def test_memory_procedures_are_restricted_to_memory_researcher() -> None:
+    for item in memory_procedure_definitions():
+        assert item.allowed_agents == ["builtin.memory_researcher"]
 
 
 @dataclass

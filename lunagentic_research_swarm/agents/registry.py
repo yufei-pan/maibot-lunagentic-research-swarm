@@ -62,16 +62,23 @@ class AgentCatalogSnapshot:
         return self._by_id.get(agent_id)
 
     def resolve_allowed_procedures(self, agent_id: str, procedures: Any) -> tuple[str, ...]:
-        """在冻结 round 时才把语法有效的 allowlist 与 Procedure snapshot 求交。"""
+        """解析本智能体可调用的研究 Procedure（由 Procedure.allowed_agents 决定）。
 
-        entry = self.get(agent_id)
-        if entry is None:
+        Agent 侧 ``allowed_procedures`` 不再参与裁决；保留本方法名以兼容旧调用方。
+        ``core.*`` 由执行器控制路径单独处理，不出现在本返回值中——runtime header
+        会另行并入 core ID。
+        """
+
+        if self.get(agent_id) is None:
             return ()
-        available = set(procedures.ids)
-        allowlist = entry.definition.allowed_procedures
-        if allowlist == ["*"]:
-            return tuple(sorted(available))
-        return tuple(procedure_id for procedure_id in allowlist if procedure_id in available)
+        resolve = getattr(procedures, "resolve_callable_procedures", None)
+        if callable(resolve):
+            return tuple(str(item) for item in resolve(agent_id))
+        # 兼容仅有 ids 的假目录：视为全部开放。
+        ids = getattr(procedures, "ids", ())
+        if isinstance(ids, Sequence) and not isinstance(ids, (str, bytes, bytearray)):
+            return tuple(str(item) for item in ids)
+        return ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +202,31 @@ class AgentRegistry:
             return False
         batch = self._providers[provider_id]
         return any(item.agent_id == agent_id and item.enabled for item in batch.definitions)
+
+    def root_capable_agent_ids(
+        self,
+        overrides: Mapping[str, AgentOverride] | None = None,
+        *,
+        default_protocol: str | None = None,
+    ) -> tuple[str, ...]:
+        """返回启用且 ``can_be_root`` 的智能体 ID（不校验当前配置 root 是否可用）。"""
+
+        overrides = overrides or {}
+        chosen: list[str] = []
+        for provider_id, batch in self._providers.items():
+            del provider_id
+            for original in batch.definitions:
+                fallback = (
+                    default_protocol
+                    if default_protocol and original.agent_id not in self._explicit_protocol
+                    else None
+                )
+                definition = self._apply_override(
+                    original, overrides.get(original.agent_id), default_protocol=fallback
+                )
+                if definition.enabled and definition.can_be_root:
+                    chosen.append(definition.agent_id)
+        return tuple(sorted(set(chosen)))
 
     def snapshot(
         self,

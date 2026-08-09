@@ -12,17 +12,11 @@ from typing import Any
 
 from lunagentic_research_swarm.llm.summarizer import SummaryResult
 from lunagentic_research_swarm.models import FormalizedTask, TaskStatus
-from lunagentic_research_swarm.procedures.core import (
-    CORE_CHECKPOINT_ID,
-    CORE_COMPACT_ID,
-    CORE_TERMINATE_ID,
-)
 from lunagentic_research_swarm.procedures.executor import ProcedureExecutor
 from lunagentic_research_swarm.runtime.effect_runner import RuntimeEffectRunner
 from lunagentic_research_swarm.runtime.reducer import PerformBranchSummary
 from lunagentic_research_swarm.runtime.turns import TurnWorker
 
-_CORE_IDS = (CORE_TERMINATE_ID, CORE_COMPACT_ID, CORE_CHECKPOINT_ID)
 WEB_SEARCH_PROCEDURE_ID = "builtin.web_search"
 _STUB_INVOKE_API = "builtin.invoke_procedure"
 
@@ -148,90 +142,6 @@ class LiveSummarizer:
         )
 
 
-def _web_search_catalog_entry() -> Any:
-    definition = SimpleNamespace(
-        procedure_id=WEB_SEARCH_PROCEDURE_ID,
-        display_name="网页搜索",
-        description=(
-            "按 query 检索网页并返回 title/url/snippet。"
-            "arguments: query (string, 必填)；engine / max_results 可选。"
-            "调研类任务应优先调用本 Procedure 获取证据。"
-        ),
-        timeout_seconds=30.0,
-        idempotent=True,
-        arguments_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "minLength": 1, "maxLength": 2000},
-                "engine": {"type": "string"},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
-            },
-            "required": ["query"],
-            "additionalProperties": True,
-        },
-        enabled=True,
-    )
-    return SimpleNamespace(
-        definition=definition,
-        provider_plugin_id="builtin",
-        api_name=_STUB_INVOKE_API,
-        api_version="1",
-        fingerprint=f"stub:{WEB_SEARCH_PROCEDURE_ID}",
-    )
-
-
-def _core_catalog_entry(procedure_id: str) -> Any:
-    return SimpleNamespace(
-        definition=SimpleNamespace(
-            procedure_id=procedure_id,
-            display_name=procedure_id,
-            description=procedure_id,
-            timeout_seconds=30.0,
-            idempotent=True,
-        ),
-        provider_plugin_id="lrs.core",
-        api_name=procedure_id,
-        api_version="1",
-        fingerprint=f"core:{procedure_id}",
-    )
-
-
-def _build_drain_procedure_catalog(*, include_web_search: bool) -> Any:
-    entries: dict[str, Any] = {procedure_id: _core_catalog_entry(procedure_id) for procedure_id in _CORE_IDS}
-    if include_web_search:
-        entries[WEB_SEARCH_PROCEDURE_ID] = _web_search_catalog_entry()
-    return _catalog_from_entries(entries)
-
-
-def _catalog_from_entries(entries: dict[str, Any]) -> Any:
-    catalog_ids = tuple(entries)
-
-    def _prompt_entry(entry: Any) -> dict[str, Any]:
-        definition = getattr(entry, "definition", entry)
-        payload: dict[str, Any] = {
-            "procedure_id": str(getattr(definition, "procedure_id", "")),
-            "display_name": str(getattr(definition, "display_name", "")),
-            "description": str(getattr(definition, "description", "")),
-        }
-        schema = getattr(definition, "arguments_schema", None)
-        if isinstance(schema, Mapping):
-            payload["arguments_schema"] = dict(schema)
-        return payload
-
-    class _DrainProcedureCatalog:
-        fingerprint = "live-drain-procedures"
-        ids = catalog_ids
-
-        @property
-        def entries(self) -> tuple[Any, ...]:
-            return tuple(_prompt_entry(item) for item in entries.values())
-
-        def get(self, procedure_id: str) -> Any | None:
-            return entries.get(str(procedure_id))
-
-    return _DrainProcedureCatalog()
-
-
 def _match_stub_fixture(fixtures: Mapping[str, Any], query: str) -> Any:
     lowered = query.casefold()
     for key, payload in fixtures.items():
@@ -242,12 +152,24 @@ def _match_stub_fixture(fixtures: Mapping[str, Any], query: str) -> Any:
 
 
 def use_stub_procedures(harness: Any, fixtures: Mapping[str, Any]) -> None:
-    """Install canned ``builtin.web_search`` + catalog entries before ``start``/formalize."""
+    """Install canned ``builtin.web_search`` plus the real bundled research catalog."""
+
+    from lunagentic_research_swarm.config import WebSearchSection
+    from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
+    from lunagentic_research_swarm.procedures.executor import bundled_procedure_invoker
 
     fixture_map = {str(key): value for key, value in dict(fixtures or {}).items()}
     harness._stub_search_fixtures = fixture_map
     harness.stub_search_invokes = 0
-    harness._live_procedure_catalog = None
+
+    ctx = _harness_procedure_ctx(harness)
+    provider = BundledProcedureProvider(
+        ctx,
+        web_search_config=WebSearchSection(enabled_engines=["duckduckgo"]),
+        store=getattr(harness, "store", None),
+    )
+    harness._bundled_procedure_provider = provider
+    base_invoke = bundled_procedure_invoker(provider)
 
     async def _stub_invoke(
         *,
@@ -257,16 +179,17 @@ def use_stub_procedures(harness: Any, fixtures: Mapping[str, Any]) -> None:
         arguments: Mapping[str, Any] | None = None,
         scoped_metadata: Mapping[str, Any] | None = None,
         **_kwargs: Any,
-    ) -> dict[str, Any]:
-        del version, scoped_metadata, _kwargs
+    ) -> Any:
         pid = str(procedure_id or "")
         if pid != WEB_SEARCH_PROCEDURE_ID:
-            return {
-                "success": False,
-                "data": None,
-                "error": {"code": "procedure_unavailable", "message": f"stub 未实现 {pid}"},
-                "metadata": {"request_id": request_id, "procedure_id": pid},
-            }
+            return await base_invoke(
+                version=version,
+                procedure_id=procedure_id,
+                request_id=request_id,
+                arguments=arguments,
+                scoped_metadata=scoped_metadata,
+                **_kwargs,
+            )
         harness.stub_search_invokes = int(getattr(harness, "stub_search_invokes", 0) or 0) + 1
         args = dict(arguments or {})
         query = str(args.get("query") or "")
@@ -293,11 +216,13 @@ def use_stub_procedures(harness: Any, fixtures: Mapping[str, Any]) -> None:
         }
 
     harness._effect_local_invokers = {_STUB_INVOKE_API: _stub_invoke}
-    _install_web_search_catalog(harness)
+    catalog = _build_bundled_procedure_catalog(provider)
+    harness._live_procedure_catalog = catalog
+    _install_procedure_catalog(harness, catalog)
 
 
 def use_live_procedures(harness: Any, web_search_config: Mapping[str, Any] | None = None) -> None:
-    """Wire real ``BundledProcedureProvider`` / ``WebSearchService`` into drain local invokers."""
+    """Wire real ``BundledProcedureProvider`` and freeze its full research catalog."""
 
     from lunagentic_research_swarm.config import WebSearchSection
     from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
@@ -307,9 +232,15 @@ def use_live_procedures(harness: Any, web_search_config: Mapping[str, Any] | Non
     if "enabled_engines" not in raw or not raw.get("enabled_engines"):
         raw["enabled_engines"] = ["duckduckgo"]
     section = WebSearchSection.model_validate(raw)
-    provider = BundledProcedureProvider(SimpleNamespace(), web_search_config=section)
+    ctx = _harness_procedure_ctx(harness)
+    provider = BundledProcedureProvider(
+        ctx,
+        web_search_config=section,
+        store=getattr(harness, "store", None),
+    )
     harness._bundled_procedure_provider = provider
     harness.live_search_invokes = 0
+    harness._stub_search_fixtures = None
 
     base_invoke = bundled_procedure_invoker(provider)
 
@@ -335,97 +266,97 @@ def use_live_procedures(harness: Any, web_search_config: Mapping[str, Any] | Non
         )
 
     harness._effect_local_invokers = {_STUB_INVOKE_API: _live_invoke}
-    # Persist intended live catalog: use_live_procedures often runs before start, when
-    # _shared_snapshot may be missing; _ensure_drain_catalogs installs it post-start.
-    catalog = _build_live_procedure_catalog(provider)
+    catalog = _build_bundled_procedure_catalog(provider)
     harness._live_procedure_catalog = catalog
     _install_procedure_catalog(harness, catalog)
 
 
-def _build_live_procedure_catalog(provider: Any) -> Any:
-    """Drain catalog with real ``builtin.web_search`` schema (required engine+query)."""
-
-    entries: dict[str, Any] = {procedure_id: _core_catalog_entry(procedure_id) for procedure_id in _CORE_IDS}
-    live_entry = _web_search_catalog_entry_from_provider(provider)
-    if live_entry is not None:
-        entries[WEB_SEARCH_PROCEDURE_ID] = live_entry
-    else:
-        # Provider omitted web_search (no engines); still expose a live-shaped schema.
-        entries[WEB_SEARCH_PROCEDURE_ID] = _web_search_catalog_entry_live_fallback()
-    return _catalog_from_entries(entries)
+def _harness_procedure_ctx(harness: Any) -> Any:
+    manager = getattr(harness, "manager", None)
+    ctx = getattr(manager, "ctx", None) if manager is not None else None
+    return ctx if ctx is not None else SimpleNamespace()
 
 
-def _web_search_catalog_entry_from_provider(provider: Any) -> Any | None:
-    for payload in list(provider.describe() or []):
-        if not isinstance(payload, Mapping):
-            continue
-        if str(payload.get("procedure_id") or "") != WEB_SEARCH_PROCEDURE_ID:
-            continue
-        definition = SimpleNamespace(
-            procedure_id=WEB_SEARCH_PROCEDURE_ID,
-            display_name=str(payload.get("display_name") or "网页搜索"),
-            description=str(
-                payload.get("description")
-                or "按指定引擎执行网页搜索。arguments 必填 engine 与 query。"
-            ),
-            timeout_seconds=float(payload.get("timeout_seconds") or 30.0),
-            idempotent=bool(payload.get("idempotent", True)),
-            arguments_schema=dict(payload.get("arguments_schema") or {}),
-            enabled=bool(payload.get("enabled", True)),
-        )
-        return SimpleNamespace(
-            definition=definition,
-            provider_plugin_id="builtin",
-            api_name=_STUB_INVOKE_API,
-            api_version="1",
-            fingerprint=f"live:{WEB_SEARCH_PROCEDURE_ID}",
-        )
-    return None
+def _build_bundled_procedure_catalog(provider: Any) -> Any:
+    """Freeze the real bundled research catalog (``allowed_agents`` included).
+
+    ``core.*`` stay outside this registry — system control section + runtime header.
+    """
+
+    from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition
+    from lunagentic_research_swarm.procedures.registry import ProcedureRegistry
+
+    payloads = [dict(item) for item in list(provider.describe() or []) if isinstance(item, Mapping)]
+    by_id = {str(item.get("procedure_id") or ""): item for item in payloads}
+    if WEB_SEARCH_PROCEDURE_ID not in by_id:
+        fallback = _web_search_fallback_definition()
+        payloads.append(fallback.model_dump(mode="json"))
+    registry = ProcedureRegistry()
+    registry.replace_provider("builtin", payloads)
+    return registry.snapshot({})
 
 
-def _web_search_catalog_entry_live_fallback() -> Any:
-    """Live-shaped schema when provider.describe() omits web_search (engine required)."""
+def _web_search_fallback_definition() -> Any:
+    from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition
 
-    definition = SimpleNamespace(
-        procedure_id=WEB_SEARCH_PROCEDURE_ID,
-        display_name="网页搜索",
-        description="按指定引擎执行网页搜索。arguments 必填 engine 与 query。",
-        timeout_seconds=30.0,
-        idempotent=True,
-        arguments_schema={
-            "type": "object",
-            "properties": {
-                "engine": {"type": "string", "enum": ["duckduckgo"]},
-                "query": {"type": "string", "minLength": 1, "maxLength": 2000},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+    return ProcedureDefinition.model_validate(
+        {
+            "procedure_id": WEB_SEARCH_PROCEDURE_ID,
+            "version": "1",
+            "display_name": "网页搜索",
+            "description": "按指定引擎执行网页搜索。arguments 必填 engine 与 query。",
+            "arguments_schema": {
+                "type": "object",
+                "properties": {
+                    "engine": {"type": "string", "enum": ["duckduckgo"]},
+                    "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "required": ["engine", "query"],
+                "additionalProperties": False,
             },
-            "required": ["engine", "query"],
-            "additionalProperties": False,
-        },
-        enabled=True,
-    )
-    return SimpleNamespace(
-        definition=definition,
-        provider_plugin_id="builtin",
-        api_name=_STUB_INVOKE_API,
-        api_version="1",
-        fingerprint=f"live:{WEB_SEARCH_PROCEDURE_ID}",
+            "result_schema": {"type": "object"},
+            "idempotent": True,
+            "timeout_seconds": 30.0,
+            "external_cost_kind": "provider_metered",
+            "enabled": True,
+            "allowed_agents": ["*"],
+        }
     )
 
 
 def _install_web_search_catalog(harness: Any) -> None:
-    _install_procedure_catalog(harness, _build_drain_procedure_catalog(include_web_search=True))
+    """Install full bundled catalog (name kept for older call sites)."""
+
+    provider = getattr(harness, "_bundled_procedure_provider", None)
+    if provider is None:
+        from lunagentic_research_swarm.config import WebSearchSection
+        from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
+
+        provider = BundledProcedureProvider(
+            _harness_procedure_ctx(harness),
+            web_search_config=WebSearchSection(enabled_engines=["duckduckgo"]),
+            store=getattr(harness, "store", None),
+        )
+        harness._bundled_procedure_provider = provider
+    catalog = _build_bundled_procedure_catalog(provider)
+    harness._live_procedure_catalog = catalog
+    _install_procedure_catalog(harness, catalog)
 
 
 def _patch_resolve_allowed_procedures(agent_catalog: Any, *, include_web_search: bool) -> None:
-    def resolve_allowed_procedures(_agent_id: str, procedures: Any) -> tuple[str, ...]:
+    # Real AgentCatalogSnapshot already resolves via Procedure.allowed_agents (frozen).
+    if callable(getattr(agent_catalog, "resolve_allowed_procedures", None)):
+        return
+
+    def resolve_allowed_procedures(agent_id: str, procedures: Any) -> tuple[str, ...]:
+        resolve = getattr(procedures, "resolve_callable_procedures", None)
+        if callable(resolve):
+            return tuple(str(item) for item in resolve(agent_id))
         ids = list(getattr(procedures, "ids", ()) or ())
-        for core_id in _CORE_IDS:
-            if core_id not in ids:
-                ids.append(core_id)
         if include_web_search and WEB_SEARCH_PROCEDURE_ID not in ids:
             ids.append(WEB_SEARCH_PROCEDURE_ID)
-        return tuple(ids)
+        return tuple(str(item) for item in ids)
 
     agent_catalog.resolve_allowed_procedures = resolve_allowed_procedures  # type: ignore[attr-defined]
 
@@ -456,32 +387,36 @@ def _ensure_drain_catalogs(harness: Any) -> None:
     if agent_catalog is None:
         raise RuntimeError("round snapshot 缺少 agent_catalog")
 
+    provider = getattr(harness, "_bundled_procedure_provider", None)
+    store = getattr(harness, "store", None)
+    if provider is not None and store is not None and hasattr(provider, "bind_case_index"):
+        try:
+            provider.bind_case_index(store=store)
+        except Exception:
+            pass
+
     live_catalog = getattr(harness, "_live_procedure_catalog", None)
     if live_catalog is not None:
-        # Live tools: always install persisted live schema (not stub) on the round snapshot.
         _install_procedure_catalog(harness, live_catalog, snapshot=snapshot)
     else:
-        if not callable(getattr(agent_catalog, "resolve_allowed_procedures", None)):
-            include_ws = bool(getattr(harness, "_stub_search_fixtures", None)) or bool(
-                getattr(harness, "_effect_local_invokers", None)
-            )
-            _patch_resolve_allowed_procedures(agent_catalog, include_web_search=include_ws)
-
-        procedure_catalog = getattr(snapshot, "procedure_catalog", None)
-        include_web_search = bool(getattr(harness, "_stub_search_fixtures", None)) or bool(
+        include_ws = bool(getattr(harness, "_stub_search_fixtures", None)) or bool(
             getattr(harness, "_effect_local_invokers", None)
         )
+        _patch_resolve_allowed_procedures(agent_catalog, include_web_search=include_ws)
+        procedure_catalog = getattr(snapshot, "procedure_catalog", None)
         existing_ids = set(getattr(procedure_catalog, "ids", ()) or ()) if procedure_catalog is not None else set()
         needs_catalog = (
             procedure_catalog is None
             or not callable(getattr(procedure_catalog, "get", None))
-            or CORE_TERMINATE_ID not in existing_ids
-            or (include_web_search and WEB_SEARCH_PROCEDURE_ID not in existing_ids)
+            or (include_ws and WEB_SEARCH_PROCEDURE_ID not in existing_ids)
+            or not callable(getattr(procedure_catalog, "resolve_callable_procedures", None))
         )
-        if needs_catalog:
-            snapshot.procedure_catalog = _build_drain_procedure_catalog(include_web_search=include_web_search)
+        if needs_catalog and include_ws:
+            _install_web_search_catalog(harness)
+            live_catalog = getattr(harness, "_live_procedure_catalog", None)
+            if live_catalog is not None:
+                _install_procedure_catalog(harness, live_catalog, snapshot=snapshot)
 
-    # Integration harness price catalog lacks estimate_model_for_selector; free estimate.
     price_catalog = getattr(snapshot, "price_catalog", None)
     if price_catalog is not None and not callable(getattr(price_catalog, "estimate_model_for_selector", None)):
         snapshot.price_catalog = None

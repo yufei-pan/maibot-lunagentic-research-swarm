@@ -107,7 +107,7 @@ def _fmt_num(value: Any, digits: int = 2) -> str:
 
 def format_plugin_overview(*, root_agent: str, running: Sequence[Mapping[str, Any]], health: Mapping[str, Any]) -> str:
     lines = [
-        "麦麦深度调查组 · 概要",
+        "麦麦深度调查组 (Lunagentic Research Swarm) · 概要",
         f"根智能体：{root_agent or '-'}",
         f"健康：sqlite={_status_of(health.get('sqlite'))} vector={_status_of(health.get('vector_index'))} "
         f"pinning={_status_of(health.get('physical_pinning'))}",

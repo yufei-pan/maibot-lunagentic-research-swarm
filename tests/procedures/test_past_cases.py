@@ -21,10 +21,16 @@ from lunagentic_research_swarm.errors import (
     LRSError,
 )
 from lunagentic_research_swarm.procedures.bundled import past_cases as past_cases_mod
-from lunagentic_research_swarm.procedures.bundled.past_cases import RERANK_FORMULA, _USE_AS
+from lunagentic_research_swarm.procedures.bundled.past_cases import RERANK_FORMULA, _USE_AS, past_cases_procedure_definitions
 from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
 from lunagentic_research_swarm.storage.sqlite import SQLiteStateStore, StoreCommand
 from lunagentic_research_swarm.storage.vectors import VectorOpResult
+
+
+def test_past_cases_procedure_is_restricted_to_past_case_researcher() -> None:
+    defs = past_cases_procedure_definitions()
+    assert len(defs) == 1
+    assert defs[0].allowed_agents == ["builtin.past_case_researcher"]
 
 
 @dataclass

@@ -79,7 +79,7 @@ def test_stable_system_prefix_is_canonical_and_runtime_header_changes_only_suffi
 
 
 def test_architecture_credits_rule_allows_procedure_debit_via_research_credits_charged() -> None:
-    """Agent-facing architecture_rules.credits 须反映 procedure 可扣费（旧「不消耗」已推翻）。"""
+    """Agent-facing credits 文案须允许 Procedure 扣费，且不泄漏实现细节字段名。"""
 
     builder = StablePromptBuilder(
         formalized_task=FormalizedTask.create("任务"),
@@ -89,15 +89,24 @@ def test_architecture_credits_rule_allows_procedure_debit_via_research_credits_c
         procedure_catalog={},
         pricing={},
     )
-    system = builder.system_message
+    system = builder.system_message_for_protocol("json_envelope")
     assert "Procedure 不消耗研究 credits" not in system
     assert "Procedure 不扣研究 credits" not in system
-    assert "research_credits_charged" in system
-    assert "external_cost*" in system
+    assert "external_cost" not in system
+    assert "research_credits_charged" not in system
     assert "零余额仍可零额委派" in system
-    assert "负余额不得启动后代" in system
-    assert "LLM 调用消耗研究 credits" in system
-    assert "可通过 research_credits_charged 扣减" in system
+    assert "自动自委派" not in system
+    assert "自委派" in system
+    assert "负余额" in system
+    assert "LLM" in system and "credits" in system
+    assert "部分 Procedure" in system and "扣" in system
+    assert "## 可用 Procedure" in system
+    assert "## 可委派智能体" in system
+    assert "确定性 Markdown" not in system
+    assert "canonical JSON" not in system
+    assert "quick_thinker_role" not in system
+    assert "第三方目录" not in system
+    assert "### `?`" not in system
 
 
 def test_auto_compact_honors_override_precedence_and_model_window() -> None:

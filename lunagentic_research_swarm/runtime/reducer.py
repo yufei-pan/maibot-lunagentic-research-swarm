@@ -21,6 +21,7 @@ from lunagentic_research_swarm.errors import INVALID_STATE, STORAGE_COMMIT_FAILE
 from lunagentic_research_swarm.models import FormalizedTask, TaskStatus
 from lunagentic_research_swarm.llm.protocol import ProtocolError, build_correction_message
 from lunagentic_research_swarm.procedures.billing import extract_research_credits_charged
+from lunagentic_research_swarm.procedures.core import is_core_procedure
 from lunagentic_research_swarm.runtime.credits import (
     charge_procedure_usage,
     reconcile_usage,
@@ -496,6 +497,40 @@ def _delegation_effects(
     return tuple(effects), plan.calls_after_reservation
 
 
+def _has_non_control_procedure_results(event: ProcedureBatchCompleted) -> bool:
+    """本 turn 是否执行过非 core.* 的普通 Procedure（含失败结果）。"""
+
+    for item in event.results:
+        procedure_id = str(getattr(item, "procedure_id", "") or "")
+        if procedure_id and not is_core_procedure(procedure_id):
+            return True
+    return False
+
+
+def _implicit_self_continue_delegation(
+    event: ProcedureBatchCompleted, credits_after: float
+) -> Mapping[str, Any] | None:
+    """空委派 + 已跑普通 Procedure 时，注入自委派，使 agent 能读到 tool 结果。
+
+    仅在余额非负、未 terminate、且 ``event.agent_id`` 可用时启用。credits 取本 turn
+    结算后的全部剩余余额，走与显式委派相同的 ``plan_delegations`` 规则。
+    """
+
+    agent_id = str(getattr(event, "agent_id", "") or "").strip()
+    if not agent_id or credits_after < 0:
+        return None
+    if not _has_non_control_procedure_results(event):
+        return None
+    return {
+        "agent_id": agent_id,
+        "task": (
+            "继续本分支：上一 turn 的 Procedure 结果已在上文。"
+            "先据此更新结论与证据，再决定继续取证、委派给更合适的智能体，还是 core.terminate。"
+        ),
+        "credits": float(credits_after),
+    }
+
+
 def _all_delegations_rejected(
     event: ProcedureBatchCompleted,
     plan: DelegationPlan,
@@ -508,7 +543,7 @@ def _all_delegations_rejected(
     错误说明重试父节点一次并计入调用次数，确定性原因直接终结分支。
     """
 
-    notice = rejected_edge_notice(plan.rejected)
+    notice = rejected_edge_notice(plan.rejected, live_agent_ids=event.live_agent_ids)
     if plan.blocking_reason is not None:
         return (
             _effect(
@@ -1396,16 +1431,40 @@ def reduce_event(state: Any, event: RuntimeEvent) -> Transition:
             reason = "negative_credit"
         elif checkpoint and held:
             reason = "checkpoint"
-        elif not held:
-            # A checkpoint without delegations adds no pending work, so design §9.1's
-            # natural end applies: finalize now rather than holding the branch for an
-            # epoch boundary that would have nothing to release.  The terminal summary
-            # supersedes the checkpoint it would have produced.
-            reason = "no_further_work"
         else:
+            # 空委派 + 已执行普通 Procedure → 隐式自委派，使 agent 能读到 tool 结果
+            #（现代 LLM 的 tool-call 循环预期）。无普通 Procedure 时仍走自然结束。
+            # checkpoint 且无委派：仍按 §9.1/§10.1 自然结束（无事可释放）。
+            synthetic: Mapping[str, Any] | None = None
+            if not held and not checkpoint:
+                synthetic = _implicit_self_continue_delegation(event, credits_after)
+            if not held and synthetic is None:
+                # A checkpoint without delegations adds no pending work, so design §9.1's
+                # natural end applies: finalize now rather than holding the branch for an
+                # epoch boundary that would have nothing to release.
+                reason = "no_further_work"
+                return Transition(
+                    next_state,
+                    commands=tuple(commands),
+                    effects=(
+                        _effect(
+                            PerformBranchSummary,
+                            event,
+                            priority="barrier",
+                            payload={
+                                "branch_id": event.branch_id,
+                                "reason": reason,
+                                "held_delegations": (),
+                            },
+                        ),
+                    ),
+                )
+            delegation_event = (
+                event if synthetic is None else replace(event, delegations=(dict(synthetic),))
+            )
             try:
                 materialization_effects, calls_after_reservation = _delegation_effects(
-                    event,
+                    delegation_event,
                     credits_after,
                     authoritative_calls_started,
                 )

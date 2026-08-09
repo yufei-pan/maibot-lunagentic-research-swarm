@@ -51,6 +51,19 @@ class ProcedureCatalogSnapshot:
     def get(self, procedure_id: str) -> ProcedureCatalogEntry | None:
         return self._by_id.get(procedure_id)
 
+    def resolve_callable_procedures(self, agent_id: str) -> tuple[str, ...]:
+        """按 Procedure.allowed_agents 解析该智能体可调用的研究 Procedure ID。"""
+
+        agent = str(agent_id or "").strip()
+        if not agent:
+            return ()
+        chosen: list[str] = []
+        for entry in self.entries:
+            allowed = entry.definition.allowed_agents
+            if allowed == ["*"] or agent in allowed:
+                chosen.append(entry.definition.procedure_id)
+        return tuple(chosen)
+
 
 @dataclass(frozen=True, slots=True)
 class _ProviderBatch:

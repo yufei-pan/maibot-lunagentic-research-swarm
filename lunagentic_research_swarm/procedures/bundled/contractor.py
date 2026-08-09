@@ -30,6 +30,7 @@ _NESTED_REJECT_MESSAGE = "嵌套 Procedure 调用被拒绝（当前承包商不�
 _NESTED_RUNTIME_MISSING = "嵌套 Procedure 调用失败：运行时未注入 invoke_nested_procedure（{procedure_id}）"
 _FORCE_RETURN_INSUFFICIENT = "【终止说明】研究额度不足，承包商强制返回（insufficient_funds）。"
 _FORCE_RETURN_TIMEOUT = "【终止说明】软时间预算已耗尽，承包商强制返回（timeout）。"
+_FORCE_RETURN_MAX_TURNS = "【终止说明】已达最大轮数，承包商强制返回（max_turns）；结论可能不完整。"
 _MAX_TURNS = 16
 
 _RESULT_SCHEMA: dict[str, Any] = {
@@ -179,38 +180,66 @@ def _agent_attr(agent: Any, name: str, default: Any = None) -> Any:
     return getattr(agent, name, default)
 
 
+def _catalog_line(item: Mapping[str, Any]) -> str | None:
+    """渲染一条承包商可见的 Procedure 目录项（含 arguments schema）。
+
+    只给 id 与描述时，承包商必须猜参数形状；像 ``builtin.web_search`` 这类带
+    ``required`` + ``enum`` 的 Procedure 几乎必然猜错并浪费整轮预算。
+    """
+
+    pid = str(item.get("procedure_id", "") or "")
+    if not pid or pid == CONTRACTOR_PROCEDURE_ID:
+        return None
+    desc = str(item.get("description", "") or item.get("display_name", "") or "")
+    line = f"- `{pid}`：{desc}" if desc else f"- `{pid}`"
+    schema = item.get("arguments_schema")
+    if isinstance(schema, Mapping) and schema:
+        line += "\n  arguments schema：" + json.dumps(schema, ensure_ascii=False, sort_keys=True, default=str)
+    return line
+
+
 def _build_system_prompt(
     *,
     personality: str,
     procedure_catalog: Sequence[Mapping[str, Any]],
     protocol: str,
+    max_turns: int = _MAX_TURNS,
+    credit_budget: float = 0.0,
+    time_budget_seconds: float = 0.0,
+    caller_agent_id: str = "",
 ) -> str:
-    catalog_lines: list[str] = []
-    for item in procedure_catalog:
-        pid = str(item.get("procedure_id", "") or "")
-        if not pid or pid == CONTRACTOR_PROCEDURE_ID:
-            continue
-        desc = str(item.get("description", "") or item.get("display_name", "") or "")
-        catalog_lines.append(f"- {pid}: {desc}" if desc else f"- {pid}")
-    catalog_block = "\n".join(catalog_lines) if catalog_lines else "- （本智能体暂无额外 Procedure 目录条目）"
+    catalog_lines = [line for line in (_catalog_line(item) for item in procedure_catalog) if line]
+    catalog_block = "\n".join(catalog_lines) if catalog_lines else "- （本次没有可调用的 Procedure）"
     if protocol == "native_tools":
         return_rules = (
-            "协议：native_tools。结束时调用 contractor_return(result=...)。"
-            "需要工具时调用 call_procedure；禁止启动子代理、禁止再调用 builtin.contractor / core.checkpoint / core.terminate。"
+            "协议：native_tools。结束时调用 contractor_return(result=...)，把完整答案放进 result。"
+            "需要工具时调用 call_procedure（arguments 必须满足上面的 schema）；"
+            "禁止启动子代理、禁止再调用 builtin.contractor / core.checkpoint / core.terminate。"
         )
     else:
         return_rules = (
-            "协议：json_envelope。每轮只返回一个 JSON 对象："
+            "协议：json_envelope。每轮只返回一个 JSON 对象（无 Markdown、无代码围栏）："
             '{"report":"...","procedures":[],"return":"可选最终答案"}。'
-            "无 delegations 字段。有明确结论时设置 return；不要启动子代理。"
+            "无 delegations 字段。需要工具时把调用写进 `procedures`，"
+            "结果会在下一轮以 `procedure_results` 交回给你。"
+            "有明确结论时把完整答案写进 `return`；不要启动子代理。"
             "禁止再调用 builtin.contractor / core.checkpoint / core.terminate。"
         )
+    caller = f"提问方是调查 swarm 中的 `{caller_agent_id}`。" if caller_agent_id else ""
+    budget_bits = [f"最多 {max_turns} 轮"]
+    if credit_budget > 0:
+        budget_bits.append(f"研究额度约 {credit_budget:g} credits")
+    if time_budget_seconds > 0:
+        budget_bits.append(f"软时间预算 {time_budget_seconds:g} 秒")
     return (
-        "你是调查 swarm 中的旁路承包商（outsider）。你只有本题的新鲜上下文，"
-        "看不到调用方 transcript、正式任务或其它分支历史。\n"
+        "你是调查 swarm 中的旁路承包商（outsider）。"
+        f"{caller}你只有本题的新鲜上下文，看不到调用方 transcript、正式任务或其它分支历史，"
+        "所以不要反问、不要假设自己知道未给出的背景——就用手上的信息和工具把问题回答完。\n"
         "规则：不得启动子代理；不得递归承包商；只回答当前问题。\n"
+        f"预算：{'；'.join(budget_bits)}。用尽会被强制返回，届时只有已经写出的内容会被交回，"
+        "所以每一轮都要把当前最好的答案写进正文，不要留到最后一轮才写。\n"
         f"人设：\n{personality}\n"
-        f"可用 Procedure 短目录（不含承包商自身）：\n{catalog_block}\n"
+        f"可用 Procedure（不含承包商自身）：\n{catalog_block}\n"
         f"{return_rules}"
     )
 
@@ -474,13 +503,16 @@ def _procedure_catalog_for_agent(
                     items.append({"procedure_id": str(procedure_id), "description": ""})
                     continue
                 definition = getattr(entry, "definition", entry)
-                items.append(
-                    {
-                        "procedure_id": str(procedure_id),
-                        "display_name": str(_agent_attr(definition, "display_name", "") or ""),
-                        "description": str(_agent_attr(definition, "description", "") or ""),
-                    }
-                )
+                item: dict[str, Any] = {
+                    "procedure_id": str(procedure_id),
+                    "display_name": str(_agent_attr(definition, "display_name", "") or ""),
+                    "description": str(_agent_attr(definition, "description", "") or ""),
+                }
+                # 没有 schema，承包商只能猜 arguments；required/enum 的 Procedure 必错。
+                schema = _agent_attr(definition, "arguments_schema", None)
+                if isinstance(schema, Mapping) and schema:
+                    item["arguments_schema"] = dict(schema)
+                items.append(item)
             return items
     if deps.resolve_procedure_catalog is not None:
         try:
@@ -544,7 +576,14 @@ async def run_contractor(
 
     time_budget_seconds = float(arguments.get("time_budget_seconds") or 0.0)
     catalog = _procedure_catalog_for_agent(deps, agent_id, agent, snapshot=snapshot)
-    system = _build_system_prompt(personality=personality, procedure_catalog=catalog, protocol=protocol)
+    system = _build_system_prompt(
+        personality=personality,
+        procedure_catalog=catalog,
+        protocol=protocol,
+        credit_budget=credit_budget,
+        time_budget_seconds=time_budget_seconds,
+        caller_agent_id=caller_agent_id,
+    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
         {"role": "user", "content": question},
@@ -681,7 +720,14 @@ async def run_contractor(
                 )
                 break
         else:
-            termination_reason = "returned"
+            # 轮数用尽和超时/余额不足一样是被迫中断，不能报告成正常 returned：
+            # 调用方无从分辨「答完了」与「在第 16 轮被截断」。
+            termination_reason = "max_turns"
+            force_return_text = _compose_force_return_text(
+                last_text=last_text,
+                attempted=(),
+                note=_FORCE_RETURN_MAX_TURNS,
+            )
     finally:
         charged = float(total_charged)
 

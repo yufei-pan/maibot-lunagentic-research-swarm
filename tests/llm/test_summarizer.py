@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict
 from pathlib import Path
 import pytest
@@ -103,6 +104,30 @@ async def test_formalizer_uses_a_fresh_system_plus_raw_context_and_chat_without_
     assert "不调用工具" in first_messages[0]["content"]
     assert all(item.tools is None for item in gateway.requests)
     assert all(item.max_tokens is None for item in gateway.requests)
+
+
+@pytest.mark.asyncio
+async def test_formalizer_accepts_host_build_readable_string() -> None:
+    """Host ``message.build_readable`` 返回 str；按字符 ``dict()`` 会 FormalizationFailed。"""
+
+    gateway = CapturingGateway(_generation("美国高铁调查任务"))
+    service = _service(gateway)
+    readable = (
+        "demonte(123): 我写了个深度调查插件，你使用一下看看？\n"
+        "麦麦: 可以，正好拿来试。选题是加州高铁。"
+    )
+
+    result = await service.formalize_task(
+        FormalizationRequest(raw_context='{"objective":"美国高铁"}', chat_messages=readable)
+    )
+
+    assert result.success
+    messages = gateway.requests[0].messages
+    assert [item["role"] for item in messages] == ["system", "user", "user"]
+    assert messages[1]["content"] == '{"objective":"美国高铁"}'
+    assert messages[2] == {"role": "user", "content": readable}
+    # 回归：绝不能把可读字符串拆成单字符 message
+    assert all(len(item.get("content", "")) > 1 or item["role"] == "system" for item in messages[1:])
 
 
 @pytest.mark.asyncio
@@ -393,3 +418,57 @@ def test_prompt_assets_are_chinese_role_specific_and_have_no_fifth_summarizer_ro
         text = (prompt_root / name).read_text(encoding="utf-8")
         assert text.strip()
         assert any("\u4e00" <= character <= "\u9fff" for character in text)
+
+
+# --- 输出长度：只设下限、可配置、不设上限 ------------------------------------
+
+
+def test_prompt_files_state_no_length_range() -> None:
+    """提示词里不得出现长度区间。
+
+    给出「N–M 字」会让模型去凑那个区间，而不是照材料本身该写多少写多少；上限
+    交给 ``summarizer.max_tokens``，异常冗长本身就是要排查的信号。
+    """
+
+    prompt_root = Path(__file__).parents[2] / "lunagentic_research_swarm" / "prompts" / "zh-CN"
+    range_pattern = re.compile(r"\d+\s*[–\-~]\s*\d+\s*字")
+    for path in sorted(prompt_root.glob("*.txt")):
+        text = path.read_text(encoding="utf-8")
+        assert not range_pattern.search(text), f"{path.name} 仍有长度区间"
+        assert "软长度目标" not in text, path.name
+        assert "不得超过" not in text, path.name
+
+
+@pytest.mark.asyncio
+async def test_configured_floor_is_appended_as_a_floor_not_a_target() -> None:
+    gateway = CapturingGateway(_generation("正式任务"))
+    service = SummarizerService(
+        gateway,
+        selector="task:mid_memory",
+        min_output_chars={"formalize_task": 150, "finalize_branch": 0, "finalize_task": 0, "compact_branch": 0},
+    )
+
+    await service.formalize_task(FormalizationRequest(raw_context='{"objective":"x"}'))
+
+    system = gateway.requests[0].messages[0]["content"]
+    assert "不应少于约 150 字符" in system
+    assert "不是目标长度" in system
+    assert "没有上限" in system
+
+
+@pytest.mark.asyncio
+async def test_zero_floor_says_nothing_about_length() -> None:
+    gateway = CapturingGateway(_generation("正式任务"))
+    service = SummarizerService(gateway, selector="task:mid_memory", min_output_chars={"formalize_task": 0})
+
+    await service.formalize_task(FormalizationRequest(raw_context='{"objective":"x"}'))
+
+    system = gateway.requests[0].messages[0]["content"]
+    assert "不应少于" not in system
+    assert "字符" not in system
+
+
+def test_invalid_floor_is_rejected() -> None:
+    for bad in (-1, 20001, True, "80"):
+        with pytest.raises(ValueError, match="min_output_chars"):
+            SummarizerService(CapturingGateway(), min_output_chars={"formalize_task": bad})

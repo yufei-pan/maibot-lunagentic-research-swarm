@@ -13,7 +13,7 @@ from maibot_sdk.config import (
     validate_plugin_config,
 )
 
-CURRENT_CONFIG_VERSION = "1.0.0"
+CURRENT_CONFIG_VERSION = "1.2.0"
 
 
 def _ui_field(
@@ -42,19 +42,85 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "插件"
     config_version: str = _ui_field(CURRENT_CONFIG_VERSION, label="配置版本", hint="由插件用于配置迁移。")
     enabled: bool = _ui_field(True, label="启用插件", hint="是否启用麦麦深度调查组。")
-    root_agent: str = _ui_field("builtin.quick_thinker", label="根智能体", hint="默认启动的根智能体。")
+    root_agent: str = _ui_field(
+        "builtin.quick_thinker",
+        label="根智能体",
+        hint=(
+            "默认启动的根智能体（下拉为当前可用且 can_be_root 的条目）。"
+            "列表可能因扩展未刷新而不完整；已选但已禁用/移除的 ID 仍会保留在选项中。"
+            "改动仅对新 Task/new round 生效。"
+            "若需要填入列表外的 ID，请用插件配置页的「源代码」模式直接编辑 TOML。"
+        ),
+    )
 
 
 class LLMSection(PluginConfigBase):
     __ui_label__ = "语言模型"
-    force_selector: str = _ui_field("", label="强制模型选择器", hint="留空时按任务选择模型。")
+    default_selector: str = _ui_field(
+        "",
+        label="默认模型选择器",
+        hint=(
+            "非空时覆盖各智能体/摘要器的内置默认 selector（不含 embedding）。"
+            "若某智能体在「智能体覆盖」中或摘要器单独指定了 selector，则以该指定为准。"
+            "格式：task:名称 或 model:物理名。"
+        ),
+    )
+
+
+class SummarizerMinCharsSection(PluginConfigBase):
+    """各总结角色的输出下限（字符）。
+
+    这里只有下限、没有上限，而且下限刻意压得很低：给出长度**区间**会让模型去凑那个
+    区间，而不是照材料本身该写多少写多少。上限交给 ``summarizer.max_tokens``——
+    异常冗长本身就是需要被截断并排查的信号，不是提示词该管的事。
+    ``0`` 表示完全不在提示词里提长度。
+    """
+
+    __ui_label__ = "摘要输出下限"
+    formalize_task: int = _ui_field(
+        80,
+        label="任务形式化下限（字符）",
+        hint="低于此长度通常意味着约束或未知点被丢掉了。0 = 不提及长度。",
+        ge=0,
+        le=20000,
+    )
+    finalize_branch: int = _ui_field(
+        80,
+        label="分支总结下限（字符）",
+        hint="防止退化成「已检索到相关资料」这类无信息量摘要。0 = 不提及长度。",
+        ge=0,
+        le=20000,
+    )
+    finalize_task: int = _ui_field(
+        120,
+        label="任务综合下限（字符）",
+        hint="用户实际读到的报告正文下限。0 = 不提及长度。",
+        ge=0,
+        le=20000,
+    )
+    compact_branch: int = _ui_field(
+        80,
+        label="分支压缩下限（字符）",
+        hint="防止把可继续工作的上下文压成一句话。0 = 不提及长度。",
+        ge=0,
+        le=20000,
+    )
 
 
 class SummarizerSection(PluginConfigBase):
     __ui_label__ = "摘要"
-    selector: str = _ui_field("task:mid_memory", label="摘要模型", hint="用于生成中间记忆摘要的模型选择器。")
+    selector: str = _ui_field(
+        "",
+        label="摘要模型",
+        hint="留空则使用 llm.default_selector，再回退内置 task:mid_memory；非空优先于全局默认。",
+    )
     temperature: float = _ui_field(0.2, label="摘要温度", hint="摘要生成的随机性。", ge=0.0, le=2.0)
     max_tokens: int = _ui_field(0, label="摘要最大 token", hint="0 表示由 Host 决定。", ge=0, le=65536)
+    min_output_chars: SummarizerMinCharsSection = _ui_factory(
+        factory=SummarizerMinCharsSection,
+        label="输出下限",
+        hint="各总结角色的输出字符下限；只设下限不设上限，上限由 max_tokens 负责。",
+    )
 
 
 class EmbeddingSection(PluginConfigBase):
@@ -244,7 +310,7 @@ def normalize_config(
     default_data = dict(defaults)
     extract_plugin_config_version(default_data)
     if config_data is None:
-        normalized = validate_plugin_config(LRSConfig, default_data).model_dump(mode="python")
+        normalized = validate_plugin_config(LRSConfig, default_data).model_dump(mode="python", exclude_none=True)
         return normalized, True, ["已生成默认配置"]
     if not isinstance(config_data, Mapping):
         raise TypeError("config_data 必须为 Mapping 或 None")
@@ -257,6 +323,13 @@ def normalize_config(
             commands_raw["maintenance_allowed_user_ids"] = commands_raw["maintenance_allowed_person_ids"]
         del commands_raw["maintenance_allowed_person_ids"]
         raw["commands"] = commands_raw
+    # 兼容 llm.force_selector → llm.default_selector（语义从强制覆盖改为默认回退）
+    llm_raw = dict(raw.get("llm") or {}) if isinstance(raw.get("llm"), Mapping) else {}
+    if "force_selector" in llm_raw:
+        if "default_selector" not in llm_raw or not str(llm_raw.get("default_selector") or "").strip():
+            llm_raw["default_selector"] = llm_raw.get("force_selector") or ""
+        del llm_raw["force_selector"]
+        raw["llm"] = llm_raw
     raw_version = extract_plugin_config_version(raw)
     rebuilt = rebuild_plugin_config_data(default_data, raw)
     merged, merged_changed = merge_plugin_config_data(default_data, rebuilt)
@@ -264,7 +337,8 @@ def normalize_config(
     plugin["config_version"] = CURRENT_CONFIG_VERSION
     merged["plugin"] = plugin
     validated = validate_plugin_config(LRSConfig, merged)
-    normalized = validated.model_dump(mode="python")
+    # Host 用 tomlkit 写回 config.toml，不能包含 None（如 model_context_window 默认未设置）
+    normalized = validated.model_dump(mode="python", exclude_none=True)
     changed = merged_changed or raw != normalized
     notes: list[str] = []
     if raw_version != CURRENT_CONFIG_VERSION:

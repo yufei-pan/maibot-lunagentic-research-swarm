@@ -184,20 +184,31 @@ def test_snapshot_entries_keep_provider_api_identity_and_stable_fingerprint() ->
     assert first_snapshot.fingerprint == second_snapshot.fingerprint
 
 
-def test_agent_allowlist_is_intersected_only_when_round_catalog_is_frozen() -> None:
+def test_agent_allowlist_no_longer_gates_callable_procedures() -> None:
+    """可调用集由 Procedure.allowed_agents 决定，与 agent.allowed_procedures 无关。"""
+
     agents = AgentRegistry(root_agent="one.root")
     procedures = ProcedureRegistry()
     agents.replace_provider(
         "provider.one",
         [agent("one.root", allowed_procedures=["tools.fetch", "missing.optional"])],
     )
-    procedures.replace_provider("provider.tools", [procedure("tools.fetch"), procedure("tools.off", enabled=False)])
+    procedures.replace_provider(
+        "provider.tools",
+        [
+            procedure("tools.fetch"),
+            procedure("tools.search", allowed_agents=["other.agent"]),
+            procedure("tools.off", enabled=False),
+        ],
+    )
 
     agent_snapshot = agents.snapshot({})
     procedure_snapshot = procedures.snapshot({})
 
     assert agent_snapshot.get("one.root").definition.allowed_procedures == ["tools.fetch", "missing.optional"]
+    # tools.fetch 默认 * → 可调用；tools.search 仅 other.agent → 对本 root 不可见
     assert agent_snapshot.resolve_allowed_procedures("one.root", procedure_snapshot) == ("tools.fetch",)
+    assert procedure_snapshot.resolve_callable_procedures("other.agent") == ("tools.fetch", "tools.search")
 
 
 def test_procedure_registry_replacement_overrides_and_removal() -> None:

@@ -24,7 +24,7 @@ for path in (PLUGIN_DIR, SDK_ROOT):
 
 import plugin as lrs_plugin  # noqa: E402
 from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions  # noqa: E402
-from lunagentic_research_swarm.config import LRSConfig  # noqa: E402
+from lunagentic_research_swarm.config import CURRENT_CONFIG_VERSION, LRSConfig  # noqa: E402
 from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider  # noqa: E402
 from lunagentic_research_swarm.procedures.core import CORE_PROCEDURE_IDS  # noqa: E402
 
@@ -66,7 +66,22 @@ def check_config_schema() -> None:
     text = (PLUGIN_DIR / "config.default.toml").read_text(encoding="utf-8")
     parsed = tomllib.loads(text)
     assert "reasoning" not in parsed
-    assert parsed["plugin"]["config_version"] == "1.0.0"
+    assert parsed["plugin"]["config_version"] == CURRENT_CONFIG_VERSION
+    # 模板与模型必须同步：默认下限落在模板里，用户才能看到并改。
+    assert parsed["summarizer"]["min_output_chars"] == dumped["summarizer"]["min_output_chars"]
+    hint = config.plugin.model_fields["root_agent"].json_schema_extra["hint"]
+    assert "源代码" in hint
+
+    plugin = lrs_plugin.create_plugin()
+    schema = plugin.get_webui_config_schema(
+        plugin_id="com.0-hz.lunagentic-research-swarm",
+        plugin_name="lrs",
+        plugin_version="0.1.0",
+    )
+    root_field = schema["sections"]["plugin"]["fields"]["root_agent"]
+    assert root_field["ui_type"] == "select"
+    assert root_field["choices"] == ["builtin.deep_thinker", "builtin.quick_thinker"]
+    assert "源代码" in (root_field.get("hint") or "")
 
 
 def check_bundled_definitions() -> None:

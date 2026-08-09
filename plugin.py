@@ -51,10 +51,72 @@ class LunagenticResearchSwarmPlugin(SwarmCommandsMixin, MaiBotPlugin):
         self._manager: Any | None = None
 
     def normalize_plugin_config(self, config_data: dict[str, Any] | None) -> tuple[dict[str, Any], bool]:
-        merged, changed, notes = normalize_config(config_data, LRSConfig().model_dump(mode="python"))
+        merged, changed, notes = normalize_config(
+            config_data, LRSConfig().model_dump(mode="python", exclude_none=True)
+        )
         if notes:
             self.ctx.logger.info("LRS 配置迁移：%s", "；".join(notes))
         return merged, changed
+
+    def get_webui_config_schema(
+        self,
+        *,
+        plugin_id: str = "",
+        plugin_name: str = "",
+        plugin_version: str = "",
+        plugin_description: str = "",
+        plugin_author: str = "",
+    ) -> dict[str, Any]:
+        """导出 WebUI Schema，并把 ``root_agent`` 做成动态下拉。"""
+
+        schema = super().get_webui_config_schema(
+            plugin_id=plugin_id,
+            plugin_name=plugin_name,
+            plugin_version=plugin_version,
+            plugin_description=plugin_description,
+            plugin_author=plugin_author,
+        )
+        try:
+            field = schema["sections"]["plugin"]["fields"]["root_agent"]
+        except (KeyError, TypeError):
+            return schema
+        choices = self._root_agent_select_choices()
+        field["type"] = "select"
+        field["ui_type"] = "select"
+        field["choices"] = choices
+        field["multiple"] = False
+        return schema
+
+    def _root_agent_select_choices(self) -> list[str]:
+        """收集可选根智能体 ID：内置 can_be_root + 在线目录 + 当前配置值。"""
+
+        from lunagentic_research_swarm.agents.bundled.catalog import bundled_agent_definitions
+
+        choices: set[str] = {
+            item.agent_id
+            for item in bundled_agent_definitions()
+            if item.can_be_root and item.enabled
+        }
+        services = self._services
+        if services is not None:
+            try:
+                config = self.config
+                overrides: Mapping[str, Any] = {}
+                if isinstance(config, LRSConfig):
+                    overrides = config.agents
+                choices.update(services.agent_registry.root_capable_agent_ids(overrides))
+            except Exception:
+                pass
+        try:
+            current = ""
+            config = self.config
+            if isinstance(config, LRSConfig):
+                current = str(config.plugin.root_agent or "")
+            if current:
+                choices.add(current)
+        except Exception:
+            pass
+        return sorted(choices)
 
     async def on_load(self) -> None:
         config = self.config

@@ -247,6 +247,20 @@ def procedure_result_summary(item: ProcedureExecutionResult) -> dict[str, Any]:
     return summary
 
 
+_MESSAGE_VIEW_DROPPED_KEYS = frozenset({"request_id", "provider_plugin_id", "duration_ms"})
+
+
+def procedure_result_message_view(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Agent 可见的结果视图：去掉纯审计字段。
+
+    完整 summary 仍然进事件与存储；但这条消息会被每一个后代分支继承，其中的
+    ``request_id`` / ``provider_plugin_id`` / ``duration_ms`` 对推理没有价值，
+    只会在扇出时成倍消耗上下文。
+    """
+
+    return {key: value for key, value in summary.items() if key not in _MESSAGE_VIEW_DROPPED_KEYS}
+
+
 def fold_procedure_results_into_messages(
     messages: Sequence[Mapping[str, Any]],
     results: Sequence[ProcedureExecutionResult],
@@ -260,11 +274,12 @@ def fold_procedure_results_into_messages(
             continue
         summary = procedure_result_summary(item)
         summaries.append(summary)
+        view = procedure_result_message_view(summary)
         folded.append(
             {
                 "role": "user",
-                "content": "procedure_result:\n"
-                + json.dumps(summary, ensure_ascii=False, sort_keys=True, allow_nan=False, default=str),
+                "content": f"【Procedure 结果 · {item.procedure_id}】\n"
+                + json.dumps(view, ensure_ascii=False, sort_keys=True, allow_nan=False, default=str),
             }
         )
     return tuple(folded), summaries
@@ -886,5 +901,6 @@ __all__ = [
     "ProcedureResultItem",
     "bundled_procedure_invoker",
     "fold_procedure_results_into_messages",
+    "procedure_result_message_view",
     "procedure_result_summary",
 ]

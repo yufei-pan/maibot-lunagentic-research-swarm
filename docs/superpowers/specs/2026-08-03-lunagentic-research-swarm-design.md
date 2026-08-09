@@ -16,7 +16,8 @@
 
 **增补：** Procedure 研究 credits 计费与旁路承包商 `builtin.contractor` 见
 `2026-08-06-contractor-procedure-design.md`（本文件相关不变量 / §9.1 / §11 / §12.2 / §15 / §25.3
-已与之对齐）。
+已与之对齐）。Procedure 访问权（`allowed_agents`）与 prompt 表面见
+`2026-08-07-procedure-access-and-prompt-surface-design.md`（§8.2 / §14 / §15 已与之对齐）。
 
 ## 1. 摘要
 
@@ -205,14 +206,22 @@ flowchart TD
 
 同一 round 的普通智能体消息按以下顺序组织：
 
-1. **System：** 整个 swarm 的共同身份、MaiBot behavior style、架构规则、credits/时间语义，以及冻结的智能体/Procedure 目录。目录为每个智能体提供角色、selector、protocol、能力、可用 Procedure、compact 阈值和不含 secrets 的估算成本信息，使根智能体和后代都能据此路由。
+1. **System：** 整个 swarm 的共同身份与宿主风格，以及冻结的智能体/Procedure 目录（可读 Markdown：控制与研究 Procedure、可委派智能体身份卡；有实质价格数据时附模型费用参考）。目录列出本 round **全部**启用 Procedure 的定义与 arguments schema；若某 Procedure 限制可调用智能体，在定义旁注明「仅这些 `agent_id` 可调用，其他请委派」。智能体卡含 id / 名称 / 简述，不含 `character_prompt`、provider 指纹、实现层字段，也不再列出 agent 侧 Procedure allowlist。工作方式与输出协议附在 system 末尾。等价目录必须渲染为字节相同的 system 前缀以利 cache。
 2. **User 1：** 不可变正式任务描述。
-3. **User 2：** 根任务分配；只在根调用中说明“你是本轮起始协调者，请决定下一步委派”，不在 system 中给模型特殊编排器身份。
-4. **后续消息：** 父分支全部已有消息、Procedure 结果、其他分支广播、新增信息和本次子任务/角色分配。
+3. **后续消息：** 父分支全部已有消息、Procedure 结果、其他分支广播和新增信息。
+4. **末尾 `[LRS runtime]` 块：** 每次普通智能体调用前追加一个，见下。
 
-角色和 personality 放在子任务 assignment 中，不放在 system 中。子智能体继承父智能体的完整消息序列并只追加新内容，从而在相同或共享 provider cache 的模型之间最大化前缀复用。任何 compact 都只改写可变历史，之后重新附加原样的正式任务描述。
+角色和 personality（`character_prompt`）随子任务分配下发，不放在 system 中。子智能体继承父智能体的完整消息序列并只追加新内容，从而在相同或共享 provider cache 的模型之间最大化前缀复用。任何 compact 都只改写可变历史，之后重新附加原样的正式任务描述。
 
-每次普通智能体调用前还会追加一个短小的 runtime header，包含当前 branch/turn、该智能体可用能力、调用时自动计算的剩余报告时间、当前 credits（已预扣本次估算 input 后）以及活动/排队摘要。余额为负时明确告知本 turn 返回后不能启动后代；余额为 0 时明确告知仍可进行零 credits 委派。runtime header 不进入稳定 system 前缀。
+### 8.2.1 `[LRS runtime]` 块
+
+每次普通智能体调用前，在消息末尾追加一个 `[LRS runtime]` 用户消息，内含三部分：
+
+- **身份：** 本智能体的 `agent_id`、显示名、职责，以及自委派时该写哪个 id；
+- **任务分配：** 本分支的 `character_prompt` 与子任务（根调用则是“你是本轮起始协调者，请决定下一步委派”）。这也是 §8.2 第 3 项过去所说的 “User 2”，现与身份/状态合并为同一个块；
+- **运行时状态：** 当前 branch/turn、本智能体本 turn **可调用的 Procedure ID 列表**（含 `core.*`；由 Procedure 的 `allowed_agents` 与冻结目录求交得出——冻结 system 对全轮所有智能体逐字节相同，故可调用子集只能在这里以 ID 给出，定义与 schema 仍读 system）、调用时自动计算的剩余报告时间、当前 credits（已预扣本次估算 input 后）、上一 turn 实际扣费以及活动/排队摘要。余额为负时明确告知本 turn 返回后不能启动后代；余额为 0 时明确告知仍可进行零 credits 委派。
+
+该块不进入稳定 system 前缀。**历史只追加：** 旧的 `[LRS runtime]` 块留在原位不被删改，因此上一次请求始终是下一次请求的逐字节前缀，provider 前缀 cache 可覆盖整条链。块内声明“只有最后一个有效、更早的块已过期”，system 前缀亦重复该规则。任务分配每 turn 重新渲染进当前块，因此被 compact 重写过的分支不会丢失自己的角色与子任务。
 
 ## 9. 普通智能体协议
 
@@ -252,7 +261,12 @@ flowchart TD
   两处 `credits` 都必须为非负数，允许为 0。
 - 智能体可把自己列为下一智能体，实现“调用 Procedure 后把结果交回自己”的工具循环。
 - 智能体也可同时请求 checkpoint、其他 Procedure 和多个子智能体。
-- 没有委派且没有显式终止时，视为自然结束，调用核心分支总结器。
+- 若本 turn 执行了至少一个**非控制** Procedure（非 `core.*`），且 `delegations` 为空、未
+  `terminate`、余额非负，runtime **静默注入一条自委派**（同一 `agent_id`，credits 为结算后
+  剩余余额），走与显式委派相同的 `plan_delegations` / 物化规则。这是未显式自委派时的兜底，
+  **不在 agent-facing prompt 中说明**；正常习惯仍应显式自委派以便阅读结果。
+- 若本 turn **没有**非控制 Procedure，且没有显式委派、没有 `terminate`，仍视为自然结束，
+  调用核心分支总结器（`no_further_work`）。`checkpoint` 且无委派时同样自然结束（无事可释放）。
 
 ### 9.2 JSON envelope 模式
 
@@ -296,12 +310,13 @@ submit_swarm_turn(report, procedures, delegations)
 8. 否则若余额为负，忽略 checkpoint 和所有委派，并按 credits 原因最终总结当前分支。
 9. 否则若请求 `checkpoint`，立即生成 checkpoint summary，把委派暂存到下一个报告时间点。
 10. 否则根据父分支余额缩放并创建子分支；零余额委派仍正常创建。
-11. 未请求任何委派时自然结束，调用分支总结器。
+11. 未请求任何委派时：若本 turn 已执行非控制 Procedure 且余额非负，则静默注入自委派一次
+    （同 agent、剩余 credits；不在 agent prompt 中宣传），再按步骤 10/12 物化；否则自然结束并调用分支总结器。
 12. 父 turn 的未分配余额或终结余额结算到 Task pool，父节点不再活动。
 
 Procedure 先执行、credits 终止后检查这一顺序是强制规则。这样即使模型估算错误导致本 turn 结束后变成负余额，它已经请求的搜索、计算或资料读取仍会完成并进入最终总结，但不会继续生成新的普通智能体调用。
 
-本 turn 的 `report` 与普通 Procedure 结果按请求顺序确定性地加入父 branch 上下文；随后创建的所有子 branch 都继承它们。若智能体希望自己理解结果，就把自己作为一个子委派目标。
+本 turn 的 `report` 与普通 Procedure 结果按请求顺序确定性地加入父 branch 上下文；随后创建的所有子 branch 都继承它们。若智能体希望自己理解结果，就把自己作为一个子委派目标；若忘记填写委派但已调用非控制 Procedure，runtime 会代为自委派一次。鼓励同一 envelope 内并行发出多条 procedure 与多条委派。
 
 若某个 turn 请求了委派，但每一条委派边都被拒绝（目标 agent 已被移除、超过分支深度或超过 Task 调用上限），则不会产生任何子分支来推进该 branch。此时分配给这些边的 credits 全额留在父分支：
 
@@ -587,6 +602,8 @@ coverage set 只有一个 summary 时可直接使用其正文；有多个时调�
 
 不定义 reasoning 字段。可选字段缺失时使用插件记录在 schema 中的安全默认值；显式非法值不能被静默替换。
 
+`allowed_procedures` 保留以兼容第三方定义，**不再用于执行裁决或 system 智能体卡**。可调用集由 Procedure 的 `allowed_agents` 决定（见 §15.1 与 `2026-08-07-procedure-access-and-prompt-surface-design.md`）。内置智能体统一写 `["*"]`。
+
 验证规则包括：
 
 - ID/版本格式、命名空间和长度；
@@ -594,7 +611,7 @@ coverage set 只有一个 summary 时可直接使用其正文；有多个时调�
 - selector 必须是显式 `task:` 或 `model:` 格式；
 - protocol 只能是 `json_envelope` 或 `native_tools`；
 - prompt/catalog 字段的大小上限；
-- Procedure allowlist 合法；
+- `allowed_procedures` 语法合法（`*` 或 Procedure ID，不与混用）；
 - compact threshold 和布尔字段类型；
 - root 权限和启用状态。
 
@@ -635,12 +652,12 @@ LRS 另提供可选 `refresh_extensions@1` API，刚加载的扩展可以请求 
 | 智能体 | 默认 selector | 默认启用 | 重点 |
 |---|---|---:|---|
 | 快速思考者 / Quick Thinker | `task:utils` | 是 | 默认 root，快速拆分问题、动态委派和收敛路线 |
-| 深度思考者 / Deep Thinker | `task:planner` | 是 | 复杂推理、长期规划、综合约束，建议使用大模型/高思考配置 |
+| 深度思考者 / Deep Thinker | `task:planner` | 是 | 复杂推理、长期规划与综合约束（运维可选更大/高思考模型，不进 agent-facing description） |
 | 辩手 / Debater | `task:replyer` | 是 | 质疑前提、提供第二意见、寻找反例和风险 |
 | 外部研究员 / Researcher | `task:utils` | 是 | 设计搜索词、选择搜索引擎、要求外部证据 |
-| 记忆研究员 / Memory Researcher | `task:utils` | 是 | 设计 `ctx.chat/message/person/knowledge` 查询，不负责过度解释原始结果 |
+| 记忆研究员 / Memory Researcher | `task:mid_memory` | 是 | 专职记忆族 Procedure；设计聊天/消息/人物/知识库查询，不负责过度解释原始结果 |
 | 知识报告员 / Knowledge Reporter | `task:replyer` | 是 | 低 deliberation 地报告模型已知知识和不确定性 |
-| 历史案例研究员 / Past-case Researcher | `task:utils` | 是 | 查询相似任务、历史决定、反馈和真实结果 |
+| 历史案例研究员 / Past-case Researcher | `task:utils` | 是 | 专职 `past_cases`；查询相似任务、历史决定、反馈和真实结果 |
 | 证据核验员 / Evidence Verifier | `task:planner` | 是 | 交叉验证引用、识别来源冲突、区分事实与推断 |
 | 定量分析员 / Quantitative Analyst | `task:planner` | 是 | 计算、比较数量级、检查数值假设和成本收益 |
 
@@ -663,12 +680,14 @@ Procedure definition 至少包括：
   "idempotent": true,
   "timeout_seconds": 30,
   "external_cost_kind": "none",
+  "allowed_agents": ["*"],
   "enabled": true
 }
 ```
 
 - `timeout_seconds` 允许为 `0`，表示禁用执行器硬超时（`asyncio.wait_for`）；`>0` 时仍为硬上限。
   配置 override 同样允许 `0`。内置 `builtin.contractor` 默认定义为 `0`。
+- `allowed_agents` 默认 `["*"]`（本 round 全体启用智能体可调用）。非通配时为显式 `agent_id` 列表（不得与 `*` 混用）；执行与 `[LRS runtime]` ID 列表按该字段求交。首发：记忆族六项仅 `builtin.memory_researcher`；`builtin.past_cases` 仅 `builtin.past_case_researcher`；其余内置与默认 add-on（含 `fetch_url.fetch`）为 `*`。
 
 所有结果归一化为：
 
@@ -715,14 +734,14 @@ LRS 始终使用完整 `plugin_id.api_name@version` 调用。提供方配置和 
 
 ### 15.4 首发内置 Procedure
 
-| 类别 | Procedure |
-|---|---|
-| 消息与记忆 | 查询/搜索 `ctx.chat`、`ctx.message`、`ctx.person`、`ctx.knowledge` |
-| Web 搜索 | 统一搜索接口，显式选择已配置的 SearXNG、Tavily、You 或 DuckDuckGo |
-| 历史案例 | 从 SQLite/LanceDB 检索相似正式任务、分支总结、最终报告和反馈 lessons |
-| 分析辅助 | 安全 calculator、基础统计和单位换算 |
-| 来源处理 | URL 标准化、去重、来源/provenance 整理 |
-| 旁路承包商 | `builtin.contractor`：以目录中另一智能体作 outsider 工具（新鲜上下文、无子委派扇出、可计费）；细则见 `2026-08-06-contractor-procedure-design.md` |
+| 类别 | Procedure | 默认可调用 |
+|---|---|---|
+| 消息与记忆 | 查询/搜索 `ctx.chat`、`ctx.message`、`ctx.person`、`ctx.knowledge` | 仅记忆研究员 |
+| Web 搜索 | 统一搜索接口，显式选择已配置的 SearXNG、Tavily、You 或 DuckDuckGo | 全体 |
+| 历史案例 | 从 SQLite/LanceDB 检索相似正式任务、分支总结、最终报告和反馈 lessons | 仅历史案例研究员 |
+| 分析辅助 | 安全 calculator、基础统计和单位换算 | 全体 |
+| 来源处理 | URL 标准化、去重、来源/provenance 整理 | 全体 |
+| 旁路承包商 | `builtin.contractor`：以目录中另一智能体作 outsider 工具（新鲜上下文、无子委派扇出、可计费）；细则见 `2026-08-06-contractor-procedure-design.md` | 全体 |
 
 Web 搜索由 LRS 内部实现，API keys 和 SearXNG instance 由用户配置。返回结果必须保留 engine、query、URL、标题、摘要、时间和错误，不得把无来源摘要冒充网页事实。
 
@@ -759,13 +778,13 @@ Web 搜索由 LRS 内部实现，API keys 和 SearXNG instance 由用户配置�
 - `task:planner`、`task:replyer`、`task:utils`、`task:mid_memory` 等任务别名；
 - `model:gpt-5.6-luna-max` 等物理模型名。
 
-不接受有歧义的裸字符串。用户可以通过全局 `force_selector` 把插件所有生成式 LLM 调用固定到同一 selector，也可逐 agent 和总结器配置。embedding selector 单独配置。
+不接受有歧义的裸字符串。用户可以通过全局 `default_selector` 覆盖各 agent/摘要器的内置默认 selector，也可在 agent 覆盖或摘要器上单独指定。embedding selector 单独配置。
 
 建议优先级：
 
-1. 非空全局 `force_selector`；
-2. 总结器/agent 自身 selector；
-3. 内置 definition 默认 selector。
+1. agent / 摘要器上用户显式配置的非空 selector；
+2. 非空全局 `llm.default_selector`；
+3. 内置 definition / 摘要器默认 selector（摘要器内置为 `task:mid_memory`）。
 
 ### 16.2 任务别名
 
@@ -995,15 +1014,15 @@ feedback 是不可变、按时间追加的事件。新反馈可 supersede 旧反
 
 ```toml
 [plugin]
-config_version = "1.0.0"
+config_version = "1.1.0"
 enabled = true
 root_agent = "builtin.quick_thinker"
 
 [llm]
-force_selector = ""
+default_selector = ""
 
 [summarizer]
-selector = "task:mid_memory"
+selector = ""
 temperature = 0.2
 max_tokens = 0                 # 0 = 继承 Host 模型/任务配置
 

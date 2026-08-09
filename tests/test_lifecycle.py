@@ -746,6 +746,104 @@ async def test_health_is_explicit_for_root_summarizer_and_physical_pinning(plugi
     await healthy.close()
 
 
+def _host_model_dump_with_task_metadata(*, model_name: str = "m") -> dict[str, Any]:
+    """模拟当前 MaiBot model_config.model_dump(mode='json') 混入 schema 元数据的形状。"""
+
+    return {
+        "field_docs": {"models": "模型列表"},
+        "suppress_any_warning": False,
+        "api_providers": [{"name": "secret", "api_key": "never-store"}],
+        "models": [{"name": model_name, "price_in": 1, "price_out": 2, "api_provider": "secret"}],
+        "model_task_config": {
+            "field_docs": {
+                "utils": "执行文本概括等小任务",
+                "mid_memory": "聊天回想模型配置",
+            },
+            "suppress_any_warning": False,
+            "utils": {
+                "field_docs": {"model_list": "使用的模型列表"},
+                "suppress_any_warning": True,
+                "model_list": [model_name],
+                "temperature": 0.7,
+                "max_tokens": 0,
+            },
+            "mid_memory": {
+                "field_docs": {"model_list": "使用的模型列表"},
+                "suppress_any_warning": False,
+                "model_list": [model_name],
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_host_model_dump_metadata_keeps_price_root_and_summarizer_health(
+    plugin_module, tmp_path: Path
+) -> None:
+    """回归 Mein：Host dump 含 field_docs/suppress_any_warning 时不应再出现三连 degraded。"""
+
+    snapshot = _host_model_dump_with_task_metadata()
+    container, _, _, _, _ = build_container(
+        plugin_module,
+        tmp_path,
+        snapshot_loader=lambda: snapshot,
+        pinning_available=True,
+    )
+    await container.start()
+    health = container.health()
+
+    assert health["initial_price_snapshot"] == {"status": "healthy"}
+    assert health["root_selector"] == {
+        "status": "healthy",
+        "selector": "task:utils",
+    }
+    assert health["summarizer_selector"] == {
+        "status": "healthy",
+        "selector": "task:mid_memory",
+    }
+    assert set(container.price_catalog.debug_snapshot()["tasks"]) == {"utils", "mid_memory"}
+    assert "never-store" not in repr(container)
+    await container.close()
+
+
+@pytest.mark.asyncio
+async def test_host_model_reload_with_metadata_keeps_the_three_health_keys(
+    plugin_module, tmp_path: Path
+) -> None:
+    """热更新路径同样必须吞掉 schema 元数据；否则会出现 swarm_health 三连错误。"""
+
+    container, context, _, _, _ = build_container(
+        plugin_module,
+        tmp_path,
+        snapshot_loader=lambda: {
+            "models": [{"name": "seed", "price_in": 1}],
+            "model_task_config": {
+                "utils": {"model_list": ["seed"]},
+                "mid_memory": {"model_list": ["seed"]},
+            },
+        },
+    )
+    await container.start()
+    plugin = plugin_module.create_plugin()
+    plugin._set_context(context)
+    plugin.set_plugin_config(LRSConfig().model_dump(mode="python", exclude_none=True))
+    plugin._services = container
+
+    await plugin.on_config_update(
+        ON_MODEL_CONFIG_RELOAD, _host_model_dump_with_task_metadata(model_name="reloaded"), "host-meta-v1"
+    )
+    health = container.health()
+
+    assert health["initial_price_snapshot"] == {"status": "healthy"}
+    assert health["root_selector"] == {"status": "healthy", "selector": "task:utils"}
+    assert health["summarizer_selector"] == {"status": "healthy", "selector": "task:mid_memory"}
+    assert container.price_catalog.debug_snapshot()["tasks"] == {
+        "utils": ["reloaded"],
+        "mid_memory": ["reloaded"],
+    }
+    await plugin.on_unload()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("model", "budget", "expect_warning"),
@@ -919,7 +1017,7 @@ async def test_self_reload_atomically_replaces_detached_next_round_snapshot(plug
 
     initial = config_with(
         plugin={"root_agent": "agents.old_root"},
-        llm={"force_selector": "task:old_force"},
+        llm={"default_selector": "task:old_force"},
         summarizer={"selector": "task:old_summary"},
         budget={"default_effort_credits": 25.0},
         pricing={"models": {"priced": {"price_in": 1.0}}},
@@ -947,7 +1045,7 @@ async def test_self_reload_atomically_replaces_detached_next_round_snapshot(plug
     plugin._services = container
     updated = config_with(
         plugin={"root_agent": "agents.new_root"},
-        llm={"force_selector": "task:new_force"},
+        llm={"default_selector": "task:new_force"},
         summarizer={"selector": "task:new_summary"},
         budget={"default_effort_credits": 250.0},
         pricing={"models": {"priced": {"price_in": 2.0, "price_out": 3.0}}},
@@ -962,7 +1060,7 @@ async def test_self_reload_atomically_replaces_detached_next_round_snapshot(plug
     after = await container.snapshot_next_round()
 
     assert before.root_agent == "agents.old_root"
-    assert before.root_force_selector == "task:old_force"
+    assert before.root_default_selector == "task:old_force"
     assert before.summarizer_selector == "task:old_summary"
     assert before.default_effort_credits == 25.0
     assert before.agent_catalog.get("agents.old_root").definition.model_selector == "task:old_agent"
@@ -970,7 +1068,7 @@ async def test_self_reload_atomically_replaces_detached_next_round_snapshot(plug
     assert before.price_catalog.resolve_model("priced").profile.price_in == 1.0
 
     assert after.root_agent == "agents.new_root"
-    assert after.root_force_selector == "task:new_force"
+    assert after.root_default_selector == "task:new_force"
     assert after.summarizer_selector == "task:new_summary"
     assert after.default_effort_credits == 250.0
     assert after.agent_catalog.get("agents.new_root").definition.model_selector == "task:new_agent"
