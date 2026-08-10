@@ -154,18 +154,20 @@ class FakeProcedureProvider:
         request_id: str,
         arguments: dict[str, Any],
         scoped_metadata: dict[str, Any],
+        timeout_ms: int | None = None,
     ) -> dict[str, Any]:
-        self.requests.append(
-            {
-                "operation": "call",
-                "api_name": api_name,
-                "version": version,
-                "procedure_id": procedure_id,
-                "request_id": request_id,
-                "arguments": dict(arguments),
-                "scoped_metadata": dict(scoped_metadata),
-            }
-        )
+        record: dict[str, Any] = {
+            "operation": "call",
+            "api_name": api_name,
+            "version": version,
+            "procedure_id": procedure_id,
+            "request_id": request_id,
+            "arguments": dict(arguments),
+            "scoped_metadata": dict(scoped_metadata),
+        }
+        if timeout_ms is not None:
+            record["timeout_ms"] = timeout_ms
+        self.requests.append(record)
         return self.responses.get(
             request_id,
             {

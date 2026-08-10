@@ -328,7 +328,7 @@ async def invoke_procedure(
     }
 ```
 
-`allowed_agents` 限制哪些研究角色能调用该工具。对接完成后，用一次真实调查验证即可。
+`allowed_agents` 限制哪些研究角色能调用该工具。`scoped_metadata.credit_budget` 是请求外层 `credits` 的**预算提示**（调用前不预扣）；若你的工具产生可计量研究花费，请在结果里回报 `research_credits_charged`。内置 `builtin.contractor` 按此契约结算。对接完成后，用一次真实调查验证即可。
 
 ---
 
