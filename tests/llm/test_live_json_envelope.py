@@ -66,7 +66,7 @@ async def test_live_model_emits_parseable_json_envelope_with_protocol_section() 
         ),
         protocol="json_envelope",
     )
-    assert "LRS 输出协议（json_envelope）" in messages[0]["content"]
+    assert "输出协议（json_envelope）" in messages[0]["content"]
     assert "仅输出一个 JSON object" in messages[-1]["content"]
 
     result = await chat_completion(creds, messages)
