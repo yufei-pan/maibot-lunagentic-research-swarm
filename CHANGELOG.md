@@ -12,6 +12,7 @@
 
 ### 变更
 
+- Host 最低版本升至 **1.1.0**（需要 `ctx.paths.data_dir` 统一持久化，以及 Docker `MaiMBot-plugin-data` 数据目录布局）；SDK 仍为 **≥2.7.1**
 - 内置角色默认模型选择：工具向角色用 `task:utils`，规划/核验向角色用 `task:planner`（摘要仍为 `task:mid_memory`），便于缓存友好的快慢模型混用
 - README / marketplace 描述：说明 Lunagentic 命名与 swarm 架构，并补充记忆、embedding 历史经验、多引擎搜索、credits 价格警告等
 

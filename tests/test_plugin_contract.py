@@ -14,6 +14,7 @@ def test_manifest_and_factory_contract(plugin_module) -> None:
 
     assert manifest["id"] == "com.0-hz.lunagentic-research-swarm"
     assert manifest["version"] == "0.2.0"
+    assert manifest["host_application"]["min_version"] == "1.1.0"
     assert manifest["sdk"]["min_version"] == "2.7.1"
     assert isinstance(instance, MaiBotPlugin)
     assert instance.plugin_id == manifest["id"]
