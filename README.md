@@ -1,8 +1,8 @@
-# 麦麦深度调查组（Lunagentic Research Swarm）
+# 麦麦 ~~雷霆大思考~~ 深度调查组（Lunagentic Research Swarm）
 
 面向 MaiBot 的深度研究智能体蜂群插件。
 
-~~雷霆大思考~~ 给麦麦用的ultra mode / agentic swarm——多智能体拆题、检索、互怼、收束，再加一套 **credits 预算** 管住深度与花费。
+给麦麦用的ultra mode / agentic swarm——多智能体拆题、检索、互怼、收束，再加一套 **credits 预算** 管住深度与花费。
 
 **Lunagentic** 是 **Luna** 与 **agentic** 的组合词。本插件以 *agentic research swarm* 架构协调多代专职智能体：拆分问题、检索证据、互相质疑、压缩上下文，并在时间提示与 credits 预算下持续产出带统计信息的中间报告与最终结论——把「帮我认真查清楚」变成可启动、可暂停、可追踪的深度调查。
 
