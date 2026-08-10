@@ -11,7 +11,7 @@
 **开箱即用（batteries included）**
 
 - **九个内置角色：** 快速/深度思考、辩手、外部与记忆研究员、知识报告、历史案例、证据核验、定量分析  
-- **网页搜索与取证：** 多引擎搜索开箱可用；可选 SearXNG / Tavily / You；配合推荐的 [fetch-url](https://github.com/yufei-pan/maibot-fetch-url-plugin) 抓取全文  
+- **网页搜索与取证：** 默认 **ddgs** 开箱可用；可选自建 SearXNG / Tavily / You；配合推荐的 [fetch-url](https://github.com/yufei-pan/maibot-fetch-url-plugin) 抓取全文  
 - **记忆与知识库：** 可查询聊天、消息、人物与 Host 知识库（记忆研究员）  
 - **历史经验与 embedding：** 索引过往调查与质量反馈；新任务可检索相似案例与 lesson，从成功与失误中改进  
 - **其它研究工具：** 计算/统计/换算、来源整理  
@@ -204,6 +204,7 @@ Credits 与价格细节见 [docs/credits-and-reporting.md](docs/credits-and-repo
 | 集成 | 建议 |
 |---|---|
 | fetch-url 插件 | 强烈推荐 |
+| ddgs | 默认引擎，无需密钥；一般开箱即可搜 |
 | 自建 SearXNG | 适合不想用公网聚合搜索、或要内网源的情况 |
 | Tavily / You | 在配置里填密钥即可 |
 | 其它扩展插件 | 安装后若作者已对接本插件，角色/工具会出现在 `/swarm agents`、`/swarm procedures` |
