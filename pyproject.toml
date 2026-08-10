@@ -1,6 +1,6 @@
 [project]
 name = "maibot-lunagentic-research-swarm"
-version = "0.1.0"
+version = "0.2.0"
 description = "麦麦深度调查组：可扩展的多智能体深度研究蜂群"
 requires-python = ">=3.10"
 dependencies = [

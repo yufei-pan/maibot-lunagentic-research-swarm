@@ -2,171 +2,347 @@
 
 面向 MaiBot 的深度研究智能体蜂群插件。
 
-**Lunagentic** 是 **Luna** 与 **agentic** 的组合词。本插件以 *agentic research swarm* 架构协调多代专职智能体：拆分问题、检索证据、互相质疑、压缩上下文，并在时间提示与 credits 预算下持续产出带统计信息的中间报告与最终结论。
+**Lunagentic** 是 **Luna** 与 **agentic** 的组合词。本插件以 *agentic research swarm* 架构协调多代专职智能体：拆分问题、检索证据、互相质疑、压缩上下文，并在时间提示与 credits 预算下持续产出带统计信息的中间报告与最终结论——把「帮我认真查清楚」变成可启动、可暂停、可追踪的深度调查。
 
-部署时可把价格有竞争力的快速模型（例如 GPT-5.6 Luna、DeepSeek-V4-Flash-0731）与大型知识模型（例如 GPT-5.6 Sol、Claude Opus 5，可降低 reasoning 档位）组合使用。**这些名称只是部署示例，不构成依赖或默认固定路由。** 插件兼容任何满足 MaiBot LLM 调用契约的模型。
+你用自然语言提出目标即可。后台角色会**上网检索**、查麦麦记忆与知识库、交叉核验、算数量级、整理来源；中间进展与最终结论推送到对话，也可用 `/swarm` 看状态、交反馈。搜索引擎可配 **ddgs**、自建 **SearXNG**、**Tavily**、**You** 等，并在装了推荐抓取插件时打开原文核对——不是只靠模型「凭印象回答」。插件还带有 **embedding 向量索引**，能检索相似的历史调查与你留下的反馈（含踩过的坑），在后续任务里主动参考，越用越会避开重复失误。
 
-## 安装
+部署时可把价格有竞争力的快速模型（例如 GPT-5.6 Luna、DeepSeek-V4-Flash）与大型知识模型（例如 GPT-5.6 Sol、Claude Opus 5，可酌情降低 reasoning 档位）组合使用：轻量角色走快模型，重推理与核验走大模型。
 
-1. 将本仓库放入 Host 的 `plugins/`（或符号链接）。
-2. 复制 `config.default.toml` 为插件 live `config.toml`，按需填写搜索引擎密钥等；**不要提交含密钥的 live config**。
-3. 在 Host 中配置 `task:` / `model:` selector（见下）。依赖见 `_manifest.json` / `pyproject.toml` / `requirements.txt`（三者已同步）。
-4. **推荐（非必需）** 同时安装 [`maibot-fetch-url-plugin`](https://github.com/yufei-pan/maibot-fetch-url-plugin)，以提供网页全文抓取 Procedure。缺失时插件仍可正常加载，`/swarm health` 会显示 `recommended_fetch: recommended_missing`。
+**开箱即用（batteries included）**
 
-运行期依赖：`pydantic`、`httpx`、`ddgs`、`lancedb`（见 manifest）。**不**把 fetch-url 列为硬依赖。
+- **九个内置角色：** 快速/深度思考、辩手、外部与记忆研究员、知识报告、历史案例、证据核验、定量分析  
+- **网页搜索与取证：** 多引擎搜索开箱可用；可选 SearXNG / Tavily / You；配合推荐的 [fetch-url](https://github.com/yufei-pan/maibot-fetch-url-plugin) 抓取全文  
+- **记忆与知识库：** 可查询聊天、消息、人物与 Host 知识库（记忆研究员）  
+- **历史经验与 embedding：** 索引过往调查与质量反馈；新任务可检索相似案例与 lesson，从成功与失误中改进  
+- **其它研究工具：** 计算/统计/换算、来源整理  
+- **任务全周期：** 启动后立刻有 `task_id`；支持暂停/继续/停止、补充背景、中间报告与最终报告、结束后的质量反馈  
+- **可预期的花费与节奏：** 按 Host 模型价格计 credits，时间预算与宽限可配；快慢模型可混用控成本  
 
-## 模型选择与物理 pinning
+**可扩展：** 其它 MaiBot 插件可通过公开 API 注册自定义角色与工具，装上即出现在调查组的可用目录里（见文末「进阶」）。你只安装启用，不必改本插件代码。
 
-- Selector 必须写成 `task:…` 或 `model:…`，禁止裸字符串。
-- 全局 `llm.default_selector`、逐 agent override、总结器 selector 可分别配置；优先级为 agent/摘要器显式配置 > 非空 default_selector > 内置默认；embedding selector 独立。
-- `model:` 物理 pinning 走 Host 内部路径，**脆弱且非正式 SDK 合约**。加载时做兼容检查，健康状态见 `/swarm health` 的 `physical_pinning`。不可用时该 selector 被显式拒绝，不会静默回退。
-- **`@LLMProvider` 不用于 pinning**；它只注册新的 backend `client_type`。
+- **插件 ID：** `com.0-hz.lunagentic-research-swarm`
+- **许可：** MIT（见 [LICENSE](LICENSE)）
+- **仓库：** <https://github.com/yufei-pan/maibot-lunagentic-research-swarm>
 
-## Credits 与价格
+---
 
-- 模型配置价格数值 `1.0` = **100 credits**；界面货币标签（¥ / $ / € 等）一律忽略。
-- 默认基础预算 **100 credits**；`initial = default_effort_credits × effort_level`。
-- **Host 价格优先**；仅当插件 `[pricing.models."<name>"]` 写了该模型条目时，才**完整覆盖** Host 同模型全部价格字段（未写字段按 0 / 免费）。详见 `config.default.toml` 中醒目 Note，以及 [docs/credits-and-reporting.md](docs/credits-and-reporting.md)。
-- Host 与插件均无价格时按免费（0）计；低于约 500k cache-miss 输入 / 50k 输出 token 估算阈值时发出低预算警告，但不拒绝启动。
+## 1. 快速开始
 
-## 时间、控制与报告
+1. 在 MaiBot **插件市场**安装并启用本插件。  
+2. 打开 Host **WebUI → 本插件配置**，确认模型与（可选）网页搜索等设置合理（见 §4）。  
+3. （推荐）同样安装 [网页抓取插件（fetch-url）](https://github.com/yufei-pan/maibot-fetch-url-plugin)，调查时才能稳定取网页全文。  
+4. 在聊天里用自然语言提出调查需求，例如：「帮我深度调研……」。  
+5. 等待对话中的中间报告 / 最终报告；需要时用下面的 `/swarm` 命令查看状态或提交反馈。
 
-- 默认时间预算 120s，超时后 **60s grace**；frontier 齐备可提前结束 grace。
-- 用户命令与 Planner 工具见下方「用户命令」；`start_deep_research` **立即返回** `task_id`。
-- `pause_deep_research`：等待在途调用结算后进入 `PAUSED`；超时未 `continue_deep_research` → `EXPIRED` 并释放 raw 上下文。
-- `stop_deep_research`：取消当前 generation，释放 raw 上下文，进入 `STOPPED`。
-- 中间报告：先持久化到 SQLite / outbox，再 Maisaka append + trigger；最终报告含确定性统计区块。
-- `continue_deep_research` 在无活动叶子时只从 **summary layer** 开新 round，不回放 raw。
-- Core procedures：`core.compact` / `core.checkpoint` / `core.terminate`。
-- Procedure 请求可带外层 `credits`（预算提示，不预扣）；handler 经 `research_credits_charged` 事后扣研究余额。自动 compact 不扣；智能体请求的 `core.compact` 会扣。
-- **Turn 语义：** Procedure 结果进入分支上下文供子委派继承，不会像聊天 tool-call 自动回传同一气泡。若 agent 要自己阅读结果，应**显式自委派**。若本 turn 已执行非控制 Procedure 且 `delegations` 为空，runtime 会静默注入一次自委派作为兜底（余额规则与显式委派相同；不在 agent prompt 中宣传）。鼓励同一 envelope 内并行多条 procedure / 委派。
-- **System 契约：** 冻结目录以可读 Markdown 呈现（可用 Procedure：控制 + 研究；可委派智能体身份卡；有用时附模型费用参考，按「每 100 万 token 多少 credits」渲染）。共同身份段来自 `prompts/zh-CN/swarm_system.txt`。`character_prompt` 只出现在子任务 assignment。工作方式与输出协议在 system 末尾单独说明；不向 agent 暴露实现细节（如 external_cost、目录指纹、第三方 provider 边界）。
-- **`[LRS runtime]` 块：** system 前缀对全轮所有智能体逐字节相同（cache 要求），因此逐 agent 的信息全部集中在每次调用末尾追加的这一个块里：身份（`agent_id` / 职责 / 自委派该写什么）、任务分配（`character_prompt` + 子任务；根调用为协调者说明）、以及运行时状态（可调用 Procedure 子集、剩余时间、credits、上一 turn 实际扣费、活动/排队数）。
-- **历史只追加：** 旧的 `[LRS runtime]` 块保留原位不删改，上一次请求因此始终是下一次请求的逐字节前缀，最大化 provider 前缀 cache；块内与 system 都声明「只有最后一个有效」。任务分配每 turn 重新渲染，故 compact 后分支仍知道自己的角色与子任务。
+首次使用建议先发一条 `/swarm health`，确认没有明显错误。
 
-## 九个默认智能体与内置 Procedures
+> **和麦麦怎么配合：** 麦麦能听懂这类请求并替你启动、查询、暂停/继续/停止调查，或把你补充的背景写进进行中的任务。你也可以不经过它、自己发 `/swarm …` 命令。两种方式可以混用。
 
-| 智能体 | 默认 selector | 角色摘要 |
-|---|---|---|
-| `builtin.quick_thinker` | `task:utils` | 默认 root：快速建图与委派 |
-| `builtin.deep_thinker` | `task:planner` | 复杂推理与长期约束 |
-| `builtin.debater` | `task:replyer` | 第二意见与反例 |
-| `builtin.researcher` | `task:utils` | 外部搜索与证据 |
-| `builtin.memory_researcher` | `task:mid_memory` | 专职记忆族查询 |
-| `builtin.knowledge_reporter` | `task:replyer` | 报告模型已知知识 |
-| `builtin.past_case_researcher` | `task:utils` | 专职相似历史案例 |
-| `builtin.evidence_verifier` | `task:planner` | 证据核验 |
-| `builtin.quantitative_analyst` | `task:planner` | 数值与量级 |
+---
 
-内置 Procedures（节选）：`builtin.web_search`、memory 六件套、`builtin.past_cases`、`builtin.calculate` / `statistics` / `convert_units`、`builtin.normalize_urls` / `organize_provenance`、`builtin.contractor`（旁路承包商：目录智能体作 outsider 工具，新鲜上下文、无子委派）。四搜索引擎（DuckDuckGo / SearXNG / Tavily / You）仅在配置有效时进入目录。计费语义见 [docs/credits-and-reporting.md](docs/credits-and-reporting.md)。
+## 2. 日常怎么用
 
-## 用户命令
+### 2.1 发起与跟踪
 
-聊天中通过 `/swarm …` 调用（可由 `[commands].enabled` 关闭）。复杂任务控制与完整反馈请用下方 Planner 工具。
+- **发起：** 直接在对话里说明你要查什么、有哪些约束或必须覆盖的点（麦麦会据此开一次调查）。  
+- **跟踪：**  
+  - 看插件推送到对话里的报告；或  
+  - 自己发送 `/swarm status`、`/swarm status <task_id>`、`/swarm tasks`；或  
+  - 问麦麦：「那个调研现在怎么样了？」  
+- **补充材料：** 继续发背景、链接或纠正；需要写进任务时，可以说「把这些补进正在做的调查」。  
+- **暂停 / 继续 / 停止：** 直接说「先暂停 / 继续做 / 停掉这个调研」即可；也可用 `/swarm status` 确认是否已变成 `PAUSED`、`STOPPED` 等。
 
-| 命令 | 功能 |
+启动后会有一个 `task_id`（出现在状态输出或麦麦的回复里），之后查进度、反馈都用得到它。
+
+### 2.2 常见任务状态
+
+| 状态 | 含义 |
 |---|---|
-| `/swarm status` | 插件运行概要：当前忙任务、根智能体与健康摘要 |
-| `/swarm status <task_id>` | 指定任务的状态、round、分支、队列与报告概况 |
-| `/swarm tasks` | 列出本会话最近深度调查任务 |
-| `/swarm tasks <status>` | 按状态过滤任务列表（如 `RUNNING`、`PAUSED`） |
-| `/swarm stats` | 插件聚合统计 |
-| `/swarm stats <task_id>` | 指定任务的统计 |
-| `/swarm agents` | 列出 live 智能体目录（不含 prompt / 密钥） |
-| `/swarm procedures` | 列出 live Procedure 目录 |
-| `/swarm health` | SQLite / 向量 / pinning / 扩展 / 推荐 fetch / 队列 / outbox / 提醒等健康度 |
-| `/swarm vectors status` | 向量索引 generation、selector 与重建 job 状态 |
-| `/swarm vectors rebuild` | 手动重建向量索引（维护命令，见下） |
-| `/swarm vectors rebuild --force` | 即使 fingerprint 未变也强制创建新 generation |
-| `/swarm feedback <task_id> accepted\|mixed\|rejected [notes…]` | 提交简化反馈；复杂反馈请用 Planner 工具 |
+| 进行中（如 `RUNNING`） | 正在调查 |
+| `PAUSED` | 已暂停；在时限内需要继续，否则可能变为 `EXPIRED` |
+| `COMPLETED` / `COMPLETED_WITH_ERRORS` | 已结束（后者表示过程中有错误但仍产出了结论） |
+| `STOPPED` | 已手动停止 |
+| `EXPIRED` | 暂停过久未继续 |
+| `INTERRUPTED` | Host 重启等导致中断 |
 
-维护命令（`/swarm vectors rebuild`）受 `[commands]` 约束：
+### 2.3 反馈
 
-- `allow_vector_rebuild` 默认 **false**；设为 true 才允许手动重建。
-- `maintenance_allowed_user_ids` 每项可填 Host 命令 RPC 的 **`user_id`**（平台用户 ID），也可填 MaiBot **`person_id`**（`md5(f"{platform}_{user_id}")` 的 32 位 hex，跨适配器唯一）。两种格式不会碰撞，可混填；person_id 由插件用 `ctx.person.get_id` 现算比对。
-- **空列表 = 不限制**（任何聊天成员都可通过白名单检查）。生产环境请填入维护者身份，或保持 `allow_vector_rebuild = false`。
+调查结束后，可用：
 
-### Planner 工具（Maisaka / LLM）
+```text
+/swarm feedback <task_id> accepted|mixed|rejected [备注…]
+```
 
-| 工具 | 功能 |
+也可以在对话里更详细地跟麦麦说哪些有用、哪些错了、缺了什么，让它帮你记反馈。反馈会留下可检索的经验记录，**不会**自动改插件的默认提示词或模型路由。
+
+---
+
+## 3. 聊天命令一览
+
+在聊天框**由你直接输入**（可在配置里关闭整组命令）。下面这些不依赖麦麦是否主动调用工具：
+
+| 命令 | 作用 |
 |---|---|
-| `start_deep_research` | 异步启动一次深度调查；立即返回 `task_id`，不等 formalize / 总结器 |
-| `pause_deep_research` | 暂停：等待在途工作结算，不启动新的研究调用 |
-| `continue_deep_research` | 继续或重启；可增减 signed credits、重置报告时间预算；无活动叶子时只从 summary layer 开新 round |
-| `stop_deep_research` | 停止并丢弃迟到结果；不调用总结器；释放 raw 上下文 |
-| `add_research_context` | 向仍在运行或可继续的任务广播补充信息 |
-| `get_research_status` | 查询指定任务的运行状态、round、分支与上下文释放状态 |
-| `list_research_tasks` | 列出任务；可按状态与 ISO 时间范围过滤（最多 100 条） |
-| `submit_research_feedback` | 提交完整质量反馈、纠正与 outcome；生成可检索 lesson |
+| `/swarm status` | 插件是否在忙、根智能体、健康摘要 |
+| `/swarm status <task_id>` | 某个任务的详细状态 |
+| `/swarm tasks` | 最近任务列表 |
+| `/swarm tasks <status>` | 按状态筛选（如 `RUNNING`） |
+| `/swarm stats` / `/swarm stats <task_id>` | 统计 |
+| `/swarm agents` | 当前可用的研究角色列表 |
+| `/swarm procedures` | 当前可用的研究工具列表 |
+| `/swarm health` | 健康检查（存储、向量、扩展、推荐抓取插件等） |
+| `/swarm vectors status` | 向量索引状态 |
+| `/swarm vectors rebuild` | 重建向量索引（默认关闭，见下） |
+| `/swarm vectors rebuild --force` | 强制重建 |
+| `/swarm feedback <task_id> …` | 提交简化反馈 |
 
-公开 API：`refresh_extensions@1` — 请求重新扫描智能体与 Procedure provider。
+**维护命令：** `/swarm vectors rebuild` 默认不允许。若要在 WebUI 打开：
 
-## 协议
+- 将 `allow_vector_rebuild` 设为 `true`；  
+- 建议同时填写 `maintenance_allowed_user_ids`（平台用户 ID 或 MaiBot `person_id`）。列表为空表示不限制调用者——生产环境请谨慎。
 
-- 默认 **JSON envelope**；可按 agent 覆写为 **native tools**。
-- Native 允许 toolcall 无正文。
-- 格式错误：有限本地修复 + **同模型一次** correction turn；之后仍非法则终结分支。
+> **提示：** 列任务、看健康、交简单反馈等，用命令往往最快；需要麦麦结合上下文理解「刚才那个」并操作时，用自然语言即可。
 
-## 存储、隐私与恢复
+---
 
-- SQLite 权威；LanceDB 仅存可重建向量。默认不落盘 agent transcript / raw procedure payload。
-- Embedding selector / 模型 fingerprint / 维度 / schema 任一变化 → 明确 mismatch，自动或 `/swarm vectors rebuild` 手动重建，原子切换 generation。
-- 进程崩溃后活动 round → `INTERRUPTED`（默认不发 feedback 提醒）。
-- 详见 [docs/privacy-and-recovery.md](docs/privacy-and-recovery.md)。
+## 4. 配置（WebUI）
 
-## Feedback 与学习边界
+在 Host WebUI 编辑本插件配置即可。完整字段说明与默认值见插件自带的 `config.default.toml`（带注释）。下面是最常改的几块。
 
-- Feedback 为不可变事件；可用于检索排序、统计与可见 lesson。
-- **不**自动改写内置 prompt、agent selector 或路由。
-- `COMPLETED` / `COMPLETED_WITH_ERRORS` / 手动 `STOPPED` 后默认 600s 无反馈提醒一次；`continue` 或提交 feedback 取消；`EXPIRED` / `INTERRUPTED` 不提醒。
-- 详见 [docs/credits-and-reporting.md](docs/credits-and-reporting.md)。
+### 4.1 模型
 
-## 可选集成
+本插件通过 **selector** 选用 Host 里已配置的模型，格式为 `task:名称` 或 `model:物理名`。
 
-| 集成 | 状态 |
+请先保证 Host 模型配置里存在对应任务/模型，再改本插件：
+
+| 配置 | 作用 |
 |---|---|
-| `maibot-fetch-url-plugin` | **推荐**，非硬依赖 |
-| 文件仓库（file depot） | **独立未来 provider**；LRS 不提供 shell / 任意路径访问 |
-| `@LLMProvider` | 不用于物理 pinning |
+| `llm.default_selector` | 非空时，统一覆盖各研究角色与摘要器的默认模型（不含向量化） |
+| 各 `[agents."…"].selector` | 只改某一个角色 |
+| `summarizer.selector` | 摘要用模型；留空则跟随上面的默认，再否则为 `task:mid_memory` |
+| `embedding.selector` | 向量化，默认 `task:embedding` |
+| `plugin.root_agent` | 默认从哪个角色开局，一般保持 `builtin.quick_thinker` |
 
-扩展作者契约见 [docs/extension-authoring.md](docs/extension-authoring.md)。
+出厂时研究角色大致分成两档（可在 WebUI 改）：
 
-## 测试
+- **`task:utils`：** 快速思考者、外部研究员、记忆研究员、历史案例研究员  
+- **`task:planner`：** 深度思考者、辩手、知识报告员、证据核验员、定量分析员  
+
+摘要默认 `task:mid_memory`。若 `/swarm health` 里 `physical_pinning` 报错，说明某个 `model:` 在当前 Host 不可用，需要改回 `task:` 或修好 Host 侧配置。
+
+### 4.2 时间与花费
+
+| 配置 | 默认 | 含义 |
+|---|---:|---|
+| `timing.default_time_budget_seconds` | 600 | 单次调查默认时间预算（秒） |
+| `timing.grace_period_seconds` | 60 | 超时后的收尾宽限 |
+| `timing.pause_timeout_seconds` | 1200 | 暂停过久未继续则过期 |
+| `timing.feedback_wait_seconds` | 600 | 结束后多久提醒你反馈 |
+| `budget.default_effort_credits` | 100 | 基础 credits；实际初始预算还会乘上启动时的努力程度 |
+
+Credits 与价格细节见 [docs/credits-and-reporting.md](docs/credits-and-reporting.md)。简要规则：Host 模型价格优先；只有你在本插件里为某模型单独写了价格覆盖时才改用插件价格；`1.0` 价格单位 = **100 credits**。
+
+> **警告：模型价格配错时，credits 预算可能形同虚设。**  
+> 调查组按「模型单价 × 用量」扣 credits 来约束深度与轮次。若 Host（或本插件的价格覆盖）把**付费模型**的 `price_in` / `price_out` 写成 `0`，或根本没填价格，系统会按**免费**计量——任务仍会按预算继续跑，但真实 API 账单可能迅速膨胀。请务必在 Host 里为实际在用的模型填好单价；只有真正免费的模型才应保持为 `0`。时间预算仍会限制墙钟时间，但挡不住「单价被当成 0」时的费用失控。
+
+### 4.3 网页搜索
+
+调查过程中由研究角色自动搜索，无需你在聊天里单独点「搜索」。
+
+| 配置 | 说明 |
+|---|---|
+| `enabled_engines` | 启用 `ddgs` / `searxng` / `tavily` / `you` 中的哪些 |
+| `timeout_seconds` / `max_results` | 超时与条数 |
+| `ddgs_region` / `ddgs_safesearch` / `ddgs_backend` | ddgs 选项 |
+| `searxng_url` | 自建 SearXNG 地址 |
+| `tavily_api_key`、`you_*` | 对应服务的密钥与地址 |
+
+密钥只保存在你的 Host 上，不要发到公开场合。
+
+### 4.4 报告、隐私与其它
+
+- **报告：** `[reporting]` 控制是否投递中间/最终报告及长度上限。  
+- **反馈提醒：** `[feedback]`。  
+- **隐私：** 默认不把智能体全文对话和工具原始载荷写入调试存储；需要排障再开 `[storage]` 相关开关。说明见 [docs/privacy-and-recovery.md](docs/privacy-and-recovery.md)。  
+- **扩展刷新间隔：** `[extensions].refresh_interval_seconds`（一般保持默认即可）。
+
+---
+
+## 5. 内置研究角色与能力
+
+用 `/swarm agents`、`/swarm procedures` 可看当前实例里**实际启用**的列表（含你另外装的扩展插件）。
+
+### 5.1 角色（默认九个）
+
+| 角色 | 做什么 |
+|---|---|
+| 快速思考者 | 默认开局：拆问题、分工、收敛 |
+| 深度思考者 | 复杂推理与长期约束 |
+| 辩手 | 找反例、风险与替代解释 |
+| 外部研究员 | 外网检索与证据收集 |
+| 记忆研究员 | 查聊天、消息、人物、知识库 |
+| 知识报告员 | 整理模型已知知识与不确定点 |
+| 历史案例研究员 | 查以往类似调查与反馈 |
+| 证据核验员 | 核对来源是否支撑结论 |
+| 定量分析员 | 数量级、单位与计算核对 |
+
+### 5.2 常用能力
+
+| 能力 | 说明 |
+|---|---|
+| 网页搜索 | ddgs / SearXNG / Tavily / You（取决于你的配置） |
+| 网页全文 | 需安装 fetch-url 插件 |
+| 记忆与知识库查询 | 仅记忆研究员使用 |
+| 历史案例 | 仅历史案例研究员使用 |
+| 计算 / 统计 / 单位换算 | 定量分析等场景 |
+| 来源整理 | URL 规范化与 provenance 整理 |
+
+---
+
+## 6. 可选集成
+
+| 集成 | 建议 |
+|---|---|
+| fetch-url 插件 | 强烈推荐 |
+| 自建 SearXNG | 适合不想用公网聚合搜索、或要内网源的情况 |
+| Tavily / You | 在配置里填密钥即可 |
+| 其它扩展插件 | 安装后若作者已对接本插件，角色/工具会出现在 `/swarm agents`、`/swarm procedures` |
+
+---
+
+## 7. 进阶：为调查组增加自定义角色与工具（插件开发者）
+
+如果你在写**另一个** MaiBot 插件，希望把自定义智能体或工具提供给深度调查组调用，按下列公开 API 对接。普通使用者只需安装你的插件，不必阅读本节。
+
+完整备忘：[docs/extension-authoring.md](docs/extension-authoring.md)。
+
+### 7.1 发现
+
+本插件会扫描带元数据的公开 API。你的插件可在加载后请求刷新：
+
+```python
+await self.ctx.api.call(
+    "com.0-hz.lunagentic-research-swarm.refresh_extensions",
+    version="1",
+)
+```
+
+也可等待配置的周期刷新。密钥留在你自己的插件配置中。
+
+### 7.2 提供智能体：`describe_agents@1`
+
+```python
+from maibot_sdk import API
+
+@API(
+    "describe_agents",
+    description="向深度调查组描述本插件提供的智能体",
+    version="1",
+    public=True,
+    metadata={
+        "lunagentic_extension": "agents",
+        "lunagentic_contract": "1",
+    },
+)
+async def describe_agents(self) -> list[dict]:
+    return [
+        {
+            "agent_id": "myplugin.researcher",
+            "version": "1",
+            "display_name": "自定义研究员",
+            "description": "能力与边界",
+            "character_prompt": "角色说明……",
+            "model_selector": "task:utils",
+            "protocol": "json_envelope",
+            "allowed_procedures": ["*"],
+            "can_be_root": False,
+            "auto_compact_tokens": None,
+            "enabled": True,
+        }
+    ]
+```
+
+`agent_id` 命名空间须与你的插件一致。用户可在本插件配置里覆盖 selector / 启用状态等。
+
+### 7.3 提供工具：`describe_procedures@1` + `invoke_procedure@1`
+
+```python
+@API(
+    "describe_procedures",
+    description="向深度调查组描述 Procedures",
+    version="1",
+    public=True,
+    metadata={
+        "lunagentic_extension": "procedures",
+        "lunagentic_contract": "1",
+    },
+)
+async def describe_procedures(self) -> list[dict]:
+    return [
+        {
+            "procedure_id": "myplugin.lookup",
+            "version": "1",
+            "display_name": "查找",
+            "description": "……",
+            "arguments_schema": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+            "result_schema": {"type": "object"},
+            "idempotent": True,
+            "timeout_seconds": 30,
+            "external_cost_kind": "none",
+            "allowed_agents": ["*"],
+            "enabled": True,
+        }
+    ]
+
+
+@API(
+    "invoke_procedure",
+    description="执行深度调查组请求的 Procedure",
+    version="1",
+    public=True,
+)
+async def invoke_procedure(
+    self,
+    *,
+    procedure_id: str,
+    request_id: str,
+    arguments: dict,
+    scoped_metadata: dict,
+) -> dict:
+    return {
+        "success": True,
+        "data": {"ok": True},
+        "error": None,
+        "research_credits_charged": 0.0,
+        "metadata": {
+            "provider_plugin_id": self.plugin_id,
+            "duration_ms": 0,
+            "provenance": [],
+            "external_cost": None,
+        },
+    }
+```
+
+`allowed_agents` 限制哪些研究角色能调用该工具。对接完成后，用一次真实调查验证即可。
+
+---
+
+## 8. 本仓库开发（维护者）
+
+仅用于开发本插件源码，与插件市场使用无关。
 
 ```bash
-# 离线 smoke（最后一行应为 ok: …）
 PYTHONPATH=../maibot-plugin-sdk python tests/smoke_test.py
-
-# 完整 pytest
 PYTHONPATH=.:../maibot-plugin-sdk pytest -q
-
-# 窄范围 ruff
-python -m ruff check plugin.py lunagentic_research_swarm tests
 ```
 
-仅在明确平台条件（例如缺少 Lance wheel）时允许 pytest marker skip，并应在此 README 说明。默认离线套件（不含 live markers）在 Linux x86_64 / aarch64 常规环境期望 **0 skipped**。
+Live 测试见 `.debug_api_call_credentials.example`，勿提交真实密钥。
 
-### Live LLM tests
-
-可选真实 LLM / 工具层，按 marker 分档。默认 `pytest` 通过 `addopts` **排除**全部 `live_llm*` markers（即使存在可用凭证也不会跑慢速 live 测试）。显式 `-m live_llm…` 覆盖默认过滤以 opt-in；无可用凭证时 **skip**（不算失败）。模板见仓库根 `.debug_api_call_credentials.example`（复制为 gitignored 的 `.debug_api_call_credentials`）。**不要**提交真实 endpoint / API key。
-
-| Marker | 内容 |
-|---|---|
-| `live_llm` | 协议 smoke（JSON envelope） |
-| `live_llm_e2e` | 薄垂直切片 A/B + light judge |
-| `live_llm_thorough` | 真实九智能体目录 + 完整内置 Procedure 目录；`web_search` 用 stub fixture；真实 `prompts/zh-CN` 总结器 + deep judge |
-| `live_llm_live_tools` | 同上，但真实 `web_search`（需 `web_search_enabled = true`）+ deep judge；含 `test_live_agent_identity`（身份 / 可调用 ID / 委派角色卡） |
-
-```bash
-# 默认：仅离线（live markers 被 deselect）
-pytest -q
-
-# opt-in 各档（-m 覆盖 pyproject addopts）
-pytest -m live_llm -v
-pytest -m live_llm_e2e -v
-pytest -m live_llm_thorough -v
-pytest -m live_llm_live_tools -v
-```
+---
 
 ## 许可
 

@@ -165,7 +165,7 @@ def use_stub_procedures(harness: Any, fixtures: Mapping[str, Any]) -> None:
     ctx = _harness_procedure_ctx(harness)
     provider = BundledProcedureProvider(
         ctx,
-        web_search_config=WebSearchSection(enabled_engines=["duckduckgo"]),
+        web_search_config=WebSearchSection(enabled_engines=["ddgs"]),
         store=getattr(harness, "store", None),
     )
     harness._bundled_procedure_provider = provider
@@ -230,7 +230,7 @@ def use_live_procedures(harness: Any, web_search_config: Mapping[str, Any] | Non
 
     raw = dict(web_search_config or {})
     if "enabled_engines" not in raw or not raw.get("enabled_engines"):
-        raw["enabled_engines"] = ["duckduckgo"]
+        raw["enabled_engines"] = ["ddgs"]
     section = WebSearchSection.model_validate(raw)
     ctx = _harness_procedure_ctx(harness)
     provider = BundledProcedureProvider(
@@ -308,7 +308,7 @@ def _web_search_fallback_definition() -> Any:
             "arguments_schema": {
                 "type": "object",
                 "properties": {
-                    "engine": {"type": "string", "enum": ["duckduckgo"]},
+                    "engine": {"type": "string", "enum": ["ddgs"]},
                     "query": {"type": "string", "minLength": 1, "maxLength": 2000},
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
@@ -335,7 +335,7 @@ def _install_web_search_catalog(harness: Any) -> None:
 
         provider = BundledProcedureProvider(
             _harness_procedure_ctx(harness),
-            web_search_config=WebSearchSection(enabled_engines=["duckduckgo"]),
+            web_search_config=WebSearchSection(enabled_engines=["ddgs"]),
             store=getattr(harness, "store", None),
         )
         harness._bundled_procedure_provider = provider
@@ -517,8 +517,14 @@ async def drive_until_terminal(
     *,
     timeout_seconds: float,
     artifact_dir: Path | None = None,
+    auto_advance_clock: bool = True,
 ) -> dict[str, Any]:
-    """Drain ``FakeScheduler.enqueued`` through ``RuntimeEffectRunner`` until terminal status."""
+    """Drain ``FakeScheduler.enqueued`` through ``RuntimeEffectRunner`` until terminal status.
+
+    When the queue is idle, optionally advance ``harness.clock`` so real deadline/grace
+    timer tasks (``_sleep_until``) can fire — same machinery as production, not injected
+    ``ReportDeadlineReached`` / ``GraceExpired`` events.
+    """
 
     runner = attach_effect_runner(harness)
     deadline = time.monotonic() + float(timeout_seconds)
@@ -551,6 +557,22 @@ async def drive_until_terminal(
                     f"pending={len(harness.scheduler.enqueued)}（runner.run 未在剩余时间内完成）"
                 ) from None
             continue
+        # Synthesis runs as create_task on the loop, not via FakeScheduler.  Idle
+        # with pending=0 must still wait for it or we time out in FINALIZING/
+        # REPORTING after the FINAL report is already persisted.
+        coordinator = getattr(harness, "coordinator", None) or (
+            harness.manager.report_coordinators.get(harness.task_id)
+            if getattr(harness, "manager", None) is not None
+            else None
+        )
+        harness.coordinator = coordinator
+        synthesis_tasks = getattr(coordinator, "_synthesis_tasks", None) if coordinator is not None else None
+        if synthesis_tasks:
+            await coordinator.wait_for_synthesis()
+            continue
+        clock = getattr(harness, "clock", None)
+        if auto_advance_clock and clock is not None and callable(getattr(clock, "advance", None)):
+            clock.advance(1.0)
         await asyncio.sleep(0.05)
     if artifact_dir is not None:
         await _dump_timeout_artifacts(harness, Path(artifact_dir))

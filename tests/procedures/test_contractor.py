@@ -295,7 +295,7 @@ async def test_contractor_system_prompt_states_identity_budget_and_schemas(
             "description": "按指定引擎执行网页搜索。",
             "arguments_schema": {
                 "type": "object",
-                "properties": {"engine": {"type": "string", "enum": ["duckduckgo"]}, "query": {"type": "string"}},
+                "properties": {"engine": {"type": "string", "enum": ["ddgs"]}, "query": {"type": "string"}},
                 "required": ["engine", "query"],
             },
         }
@@ -319,7 +319,7 @@ async def test_contractor_system_prompt_states_identity_budget_and_schemas(
     assert "30 秒" in system
     # arguments schema：只给 id + 描述时，required/enum 的 Procedure 必然被猜错
     assert '"required"' in system and "engine" in system
-    assert "duckduckgo" in system
+    assert "ddgs" in system
 
 
 @pytest.mark.asyncio
@@ -972,7 +972,7 @@ async def test_contractor_gets_argument_schemas_from_the_frozen_round_snapshot()
                 "arguments_schema": {
                     "type": "object",
                     "properties": {
-                        "engine": {"type": "string", "enum": ["duckduckgo"]},
+                        "engine": {"type": "string", "enum": ["ddgs"]},
                         "query": {"type": "string"},
                     },
                     "required": ["engine", "query"],
@@ -1012,7 +1012,7 @@ async def test_contractor_gets_argument_schemas_from_the_frozen_round_snapshot()
     system = str(llm.calls[0]["messages"][0]["content"])
     assert "builtin.web_search" in system
     assert '"required"' in system
-    assert "duckduckgo" in system
+    assert "ddgs" in system
 
 
 @pytest.mark.asyncio

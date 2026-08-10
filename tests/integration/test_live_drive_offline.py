@@ -144,7 +144,7 @@ async def test_use_live_procedures_before_open_reaches_drain(tmp_path: Path) -> 
 
     harness = RuntimeHarness(tmp_path / "before-open")
     assert harness._shared_snapshot is None
-    harness.use_live_procedures({"enabled_engines": ["duckduckgo"]})
+    harness.use_live_procedures({"enabled_engines": ["ddgs"]})
     assert getattr(harness, "_live_procedure_catalog", None) is not None
     await harness.open()
     try:

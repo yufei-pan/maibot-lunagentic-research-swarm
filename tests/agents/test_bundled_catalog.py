@@ -18,16 +18,20 @@ def test_bundled_catalog_contains_nine_valid_agents() -> None:
 
 
 def test_default_selectors_match_design() -> None:
+    """两桶默认：utils（路由/检索）与 planner（推理）；摘要器另用 mid_memory。"""
+
     selectors = {item.agent_id: item.model_selector for item in bundled_agent_definitions()}
-    assert selectors["builtin.quick_thinker"] == "task:utils"
-    assert selectors["builtin.deep_thinker"] == "task:planner"
-    assert selectors["builtin.debater"] == "task:replyer"
-    assert selectors["builtin.researcher"] == "task:utils"
-    assert selectors["builtin.memory_researcher"] == "task:mid_memory"
-    assert selectors["builtin.knowledge_reporter"] == "task:replyer"
-    assert selectors["builtin.past_case_researcher"] == "task:utils"
-    assert selectors["builtin.evidence_verifier"] == "task:planner"
-    assert selectors["builtin.quantitative_analyst"] == "task:planner"
+    assert selectors == {
+        "builtin.quick_thinker": "task:utils",
+        "builtin.researcher": "task:utils",
+        "builtin.memory_researcher": "task:utils",
+        "builtin.past_case_researcher": "task:utils",
+        "builtin.deep_thinker": "task:planner",
+        "builtin.debater": "task:planner",
+        "builtin.knowledge_reporter": "task:planner",
+        "builtin.evidence_verifier": "task:planner",
+        "builtin.quantitative_analyst": "task:planner",
+    }
 
 
 def test_agent_facing_descriptions_omit_operator_guidance() -> None:

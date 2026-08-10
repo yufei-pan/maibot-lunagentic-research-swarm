@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "com.0-hz.lunagentic-research-swarm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "name": "麦麦深度调查组 (Lunagentic Research Swarm)",
-  "description": "以 agentic research swarm 架构进行持续、多智能体深度调查；结合价格有竞争力的快速模型与大型知识模型，通过多代专职 agent、动态 credits、模型路由和上下文优化，提供近似可预测的时间与成本特征。",
+  "description": "面向 MaiBot 的深度研究智能体蜂群。Lunagentic = Luna + agentic：以 agentic research swarm 协调多代专职智能体——拆题、检索证据、互相质疑、压缩上下文，并在时间与 credits 预算下持续产出带统计的中间报告与最终结论。开箱即用：九个内置角色、多引擎网页搜索（ddgs / SearXNG / Tavily / You）、记忆/知识库查询、embedding 索引历史调查与质量反馈（含踩过的坑）以便后续改进；可暂停/继续。适合把有竞争力的快模型与大型知识模型组合使用。架构可扩展（其它插件可注册角色与工具）。推荐搭配 fetch-url 抓取全文。",
   "author": {
     "name": "kes",
     "url": "https://github.com/yufei-pan"

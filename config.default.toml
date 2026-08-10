@@ -2,7 +2,7 @@
 # 复制为 config.toml 后按需修改。不要把含密钥的 live config 提交到版本库。
 
 [plugin]
-config_version = "1.2.0"
+config_version = "1.4.0"
 enabled = true
 root_agent = "builtin.quick_thinker"
 
@@ -31,7 +31,7 @@ auto_rebuild = true
 retired_generation_retention_seconds = 86400
 
 [timing]
-default_time_budget_seconds = 120
+default_time_budget_seconds = 600
 grace_period_seconds = 60
 pause_timeout_seconds = 1200
 feedback_wait_seconds = 600
@@ -110,9 +110,12 @@ maintenance_allowed_user_ids = []
 allow_vector_rebuild = false
 
 [web_search]
-enabled_engines = ["duckduckgo"]
+enabled_engines = ["ddgs"]
 timeout_seconds = 30.0
 max_results = 10
+ddgs_region = "us-en"
+ddgs_safesearch = "moderate"
+ddgs_backend = "auto"
 searxng_url = ""
 tavily_api_key = ""
 you_base_url = ""
@@ -132,7 +135,7 @@ you_api_key = ""
 #
 # [agents."builtin.debater"]
 # enabled = true
-# selector = "task:replyer"
+# selector = "task:planner"
 #
 # [agents."builtin.researcher"]
 # enabled = true
@@ -140,11 +143,11 @@ you_api_key = ""
 #
 # [agents."builtin.memory_researcher"]
 # enabled = true
-# selector = "task:mid_memory"
+# selector = "task:utils"
 #
 # [agents."builtin.knowledge_reporter"]
 # enabled = true
-# selector = "task:replyer"
+# selector = "task:planner"
 #
 # [agents."builtin.past_case_researcher"]
 # enabled = true

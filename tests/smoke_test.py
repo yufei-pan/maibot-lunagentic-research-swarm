@@ -76,7 +76,7 @@ def check_config_schema() -> None:
     schema = plugin.get_webui_config_schema(
         plugin_id="com.0-hz.lunagentic-research-swarm",
         plugin_name="lrs",
-        plugin_version="0.1.0",
+        plugin_version="0.2.0",
     )
     root_field = schema["sections"]["plugin"]["fields"]["root_agent"]
     assert root_field["ui_type"] == "select"
@@ -118,7 +118,7 @@ def check_dependency_sync() -> None:
     assert set(req_deps) == set(_RUNTIME_PACKAGES)
     assert set(man_deps) == set(_RUNTIME_PACKAGES)
     assert "fetch-url" not in man_deps and "maibot-fetch-url" not in str(manifest["dependencies"])
-    assert manifest["version"] == "0.1.0"
+    assert manifest["version"] == "0.2.0"
 
 
 def check_prompts_readable() -> None:
@@ -142,7 +142,7 @@ def main() -> None:
     check_bundled_definitions()
     check_dependency_sync()
     check_prompts_readable()
-    print("ok: Lunagentic Research Swarm 0.1.0 offline smoke test passed")
+    print("ok: Lunagentic Research Swarm 0.2.0 offline smoke test passed")
 
 
 if __name__ == "__main__":

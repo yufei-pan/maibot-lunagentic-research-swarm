@@ -1,4 +1,4 @@
-"""四引擎统一网页搜索 Procedure：DuckDuckGo / SearXNG / Tavily / You。"""
+"""四引擎统一网页搜索 Procedure：ddgs / SearXNG / Tavily / You。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from lunagentic_research_swarm.extensions.contracts import ProcedureDefinition, 
 
 Handler = Callable[[Any, Mapping[str, Any]], Awaitable[ProcedureResult]]
 
-_ENGINE_ORDER = ("duckduckgo", "searxng", "tavily", "you")
+_ENGINE_ORDER = ("ddgs", "searxng", "tavily", "you")
 _TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 DdgsFactory = Callable[[int], Any]
@@ -72,6 +72,33 @@ def _http_status_class(status_code: int) -> str:
     return f"{status_code // 100}xx"
 
 
+_DDGS_TIMELIMIT_ALIASES = {
+    "d": "d",
+    "day": "d",
+    "daily": "d",
+    "w": "w",
+    "week": "w",
+    "weekly": "w",
+    "m": "m",
+    "month": "m",
+    "monthly": "m",
+    "y": "y",
+    "year": "y",
+    "yearly": "y",
+}
+
+
+def _ddgs_timelimit(recency: str | None) -> str | None:
+    """把 procedure 的 recency 归一成 ddgs timelimit（d/w/m/y）。"""
+
+    if recency is None:
+        return None
+    key = str(recency).strip().lower()
+    if not key:
+        return None
+    return _DDGS_TIMELIMIT_ALIASES.get(key, key)
+
+
 class WebSearchService:
     """按配置广告可用引擎，并把四引擎结果归一化为统一 provenance。"""
 
@@ -96,7 +123,7 @@ class WebSearchService:
         return tuple(engine for engine in _ENGINE_ORDER if engine in enabled and self._engine_configured(engine))
 
     def _engine_configured(self, engine: str) -> bool:
-        if engine == "duckduckgo":
+        if engine == "ddgs":
             return True
         if engine == "searxng":
             return bool(self._config.searxng_url.strip())
@@ -133,8 +160,8 @@ class WebSearchService:
             return _failure("invalid_arguments", "recency 必须为字符串或 null")
 
         try:
-            if engine == "duckduckgo":
-                items = await self._search_duckduckgo(query, max_results=max_results, recency=recency)
+            if engine == "ddgs":
+                items = await self._search_ddgs(query, max_results=max_results, recency=recency)
                 external_cost = None
             elif engine == "searxng":
                 items = await self._search_searxng(query, max_results=max_results, language=language, recency=recency)
@@ -161,22 +188,38 @@ class WebSearchService:
             metadata={"external_cost": external_cost},
         )
 
-    async def _search_duckduckgo(self, query: str, *, max_results: int, recency: str | None) -> list[dict[str, Any]]:
+    async def _search_ddgs(self, query: str, *, max_results: int, recency: str | None) -> list[dict[str, Any]]:
+        """调用 ddgs；透传 timeout/region/safesearch/backend，并把 recency 映射为 timelimit。"""
+
         timeout = int(self._config.timeout_seconds)
+        region = (self._config.ddgs_region or "us-en").strip() or "us-en"
+        safesearch = self._config.ddgs_safesearch
+        backend = (self._config.ddgs_backend or "auto").strip() or "auto"
+        timelimit = _ddgs_timelimit(recency)
+        text_kwargs: dict[str, Any] = {
+            "query": query,
+            "max_results": max_results,
+            "timeout": timeout,
+            "region": region,
+            "safesearch": safesearch,
+            "backend": backend,
+            "timelimit": timelimit,
+        }
         if self._ddgs_text is not None:
-            raw = await asyncio.to_thread(
-                self._ddgs_text,
-                query=query,
-                backend="duckduckgo",
-                max_results=max_results,
-                timeout=timeout,
-            )
+            raw = await asyncio.to_thread(self._ddgs_text, **text_kwargs)
         else:
             client = self._ddgs_factory(timeout)
 
             def _call() -> list[dict[str, Any]]:
                 return list(
-                    client.text(query, backend="duckduckgo", max_results=max_results)
+                    client.text(
+                        query,
+                        max_results=max_results,
+                        region=region,
+                        safesearch=safesearch,
+                        backend=backend,
+                        timelimit=timelimit,
+                    )
                 )
 
             raw = await asyncio.to_thread(_call)
@@ -190,7 +233,7 @@ class WebSearchService:
                     title=row.get("title"),
                     snippet=row.get("body"),
                     published_at=None,
-                    source="duckduckgo",
+                    source="ddgs",
                 )
             )
         return items

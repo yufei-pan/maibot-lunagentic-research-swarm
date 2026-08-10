@@ -888,7 +888,11 @@ class RuntimeHarness:
         timeout_seconds: float,
         artifact_dir: Any = None,
     ) -> dict[str, Any]:
-        """Delegate to ``live_harness.drive_until_terminal``."""
+        """Delegate to ``live_harness.drive_until_terminal``.
+
+        Live LLM turns use wall time; do not burn FakeClock during idle spins
+        (that falsely trips the report deadline while models are still working).
+        """
 
         from live_harness import drive_until_terminal
 
@@ -896,6 +900,7 @@ class RuntimeHarness:
             self,
             timeout_seconds=timeout_seconds,
             artifact_dir=artifact_dir,
+            auto_advance_clock=False,
         )
 
     async def store_count_child_branches(self) -> int:

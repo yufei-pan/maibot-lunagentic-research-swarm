@@ -99,17 +99,17 @@ class WebHarness:
     ddgs_results: list[dict[str, str]] = field(default_factory=list)
 
     def configure(self, engine: str) -> None:
-        self.section.enabled_engines = ["duckduckgo", "searxng", "tavily", "you"]
+        self.section.enabled_engines = ["ddgs", "searxng", "tavily", "you"]
         self.section.searxng_url = "https://searx.example"
         self.section.tavily_api_key = "tvly-secret"
         self.section.you_base_url = "https://api.you.example/search"
         self.section.you_api_key = "you-secret"
-        if engine == "duckduckgo":
+        if engine == "ddgs":
             self.ddgs_results = [
                 {
-                    "href": "https://ddg.example/a",
-                    "title": "DDG Title",
-                    "body": "DDG body snippet",
+                    "href": "https://ddgs.example/a",
+                    "title": "DDGS Title",
+                    "body": "DDGS body snippet",
                 }
             ]
         elif engine == "searxng":
@@ -176,16 +176,16 @@ def web_harness() -> WebHarness:
 
 
 def test_only_correctly_configured_engines_are_advertised(config) -> None:
-    config.web_search.enabled_engines = ["duckduckgo", "searxng", "tavily", "you"]
+    config.web_search.enabled_engines = ["ddgs", "searxng", "tavily", "you"]
     config.web_search.searxng_url = ""
     config.web_search.tavily_api_key = ""
     config.web_search.you_base_url = "https://example.invalid/search"
     config.web_search.you_api_key = "key"
     service = WebSearchService(config.web_search, fake_http())
-    assert service.available_engines == ("duckduckgo", "you")
+    assert service.available_engines == ("ddgs", "you")
 
 
-@pytest.mark.parametrize("engine", ["duckduckgo", "searxng", "tavily", "you"])
+@pytest.mark.parametrize("engine", ["ddgs", "searxng", "tavily", "you"])
 @pytest.mark.asyncio
 async def test_all_engines_normalize_results(engine, web_harness) -> None:
     web_harness.configure(engine)
@@ -198,7 +198,7 @@ async def test_all_engines_normalize_results(engine, web_harness) -> None:
 
 @pytest.mark.asyncio
 async def test_unavailable_engine_does_not_fallback(web_harness) -> None:
-    web_harness.section.enabled_engines = ["duckduckgo"]
+    web_harness.section.enabled_engines = ["ddgs"]
     web_harness.section.searxng_url = ""
     result = await web_harness.service().search("searxng", "q", max_results=3, language="en", recency=None)
     assert not result.success
@@ -313,40 +313,70 @@ async def test_http_error_reports_status_class_without_secrets(web_harness) -> N
 
 
 @pytest.mark.asyncio
-async def test_duckduckgo_normalizes_href_title_body(web_harness) -> None:
-    web_harness.configure("duckduckgo")
-    result = await web_harness.search("duckduckgo", "q")
+async def test_ddgs_normalizes_href_title_body(web_harness) -> None:
+    web_harness.configure("ddgs")
+    result = await web_harness.search("ddgs", "q")
     assert result.success
     item = result.data["results"][0]
     assert item == {
-        "url": "https://ddg.example/a",
-        "title": "DDG Title",
-        "snippet": "DDG body snippet",
+        "url": "https://ddgs.example/a",
+        "title": "DDGS Title",
+        "snippet": "DDGS body snippet",
         "published_at": None,
-        "source": "duckduckgo",
+        "source": "ddgs",
     }
 
 
 @pytest.mark.asyncio
-async def test_ddgs_invoked_with_fixed_backend_and_timeout(web_harness) -> None:
+async def test_ddgs_invoked_with_config_and_timeout(web_harness) -> None:
     calls: list[dict[str, Any]] = []
 
     def fake_ddgs_text(**kwargs: Any) -> list[dict[str, str]]:
         calls.append(dict(kwargs))
         return [{"href": "https://x", "title": "t", "body": "b"}]
 
-    web_harness.configure("duckduckgo")
+    web_harness.configure("ddgs")
     web_harness.section.timeout_seconds = 17.0
+    web_harness.section.ddgs_region = "wt-wt"
+    web_harness.section.ddgs_safesearch = "off"
+    web_harness.section.ddgs_backend = "brave,wikipedia"
     service = WebSearchService(web_harness.section, web_harness.http, ddgs_text=fake_ddgs_text)
-    result = await service.search("duckduckgo", "q", max_results=3, language="en", recency=None)
+    result = await service.search("ddgs", "q", max_results=3, language="en", recency=None)
     assert result.success
-    assert calls == [{"query": "q", "backend": "duckduckgo", "max_results": 3, "timeout": 17}]
+    assert calls == [
+        {
+            "query": "q",
+            "max_results": 3,
+            "timeout": 17,
+            "region": "wt-wt",
+            "safesearch": "off",
+            "backend": "brave,wikipedia",
+            "timelimit": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ddgs_maps_recency_to_timelimit(web_harness) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_ddgs_text(**kwargs: Any) -> list[dict[str, str]]:
+        calls.append(dict(kwargs))
+        return [{"href": "https://x", "title": "t", "body": "b"}]
+
+    web_harness.configure("ddgs")
+    service = WebSearchService(web_harness.section, web_harness.http, ddgs_text=fake_ddgs_text)
+    for recency, expected in [("d", "d"), ("week", "w"), ("month", "m"), ("y", "y")]:
+        calls.clear()
+        result = await service.search("ddgs", "q", max_results=2, language="en", recency=recency)
+        assert result.success, recency
+        assert calls[0]["timelimit"] == expected, (recency, calls[0])
 
 
 def test_web_search_procedure_definition_is_provider_metered() -> None:
     from lunagentic_research_swarm.procedures.bundled.web_search import web_search_procedure_definitions
 
-    section = WebSearchSection(enabled_engines=["duckduckgo", "you"], you_base_url="https://x", you_api_key="k")
+    section = WebSearchSection(enabled_engines=["ddgs", "you"], you_base_url="https://x", you_api_key="k")
     service = WebSearchService(section, fake_http())
     definitions = web_search_procedure_definitions(service)
     assert len(definitions) == 1
@@ -355,7 +385,7 @@ def test_web_search_procedure_definition_is_provider_metered() -> None:
     assert definition.idempotent is True
     assert definition.external_cost_kind == "provider_metered"
     engine_schema = definition.arguments_schema["properties"]["engine"]
-    assert engine_schema["enum"] == ["duckduckgo", "you"]
+    assert engine_schema["enum"] == ["ddgs", "you"]
 
 
 @pytest.mark.asyncio
@@ -364,7 +394,7 @@ async def test_provider_exposes_web_search_invoke() -> None:
 
     from lunagentic_research_swarm.procedures.bundled.provider import BundledProcedureProvider
 
-    section = WebSearchSection(enabled_engines=["duckduckgo"])
+    section = WebSearchSection(enabled_engines=["ddgs"])
     service = WebSearchService(
         section,
         fake_http(),
@@ -375,10 +405,10 @@ async def test_provider_exposes_web_search_invoke() -> None:
     assert "builtin.web_search" in ids
     result = await provider.invoke(
         "builtin.web_search",
-        {"engine": "duckduckgo", "query": "hello", "max_results": 2},
+        {"engine": "ddgs", "query": "hello", "max_results": 2},
     )
     assert result.success
-    assert result.data["engine"] == "duckduckgo"
+    assert result.data["engine"] == "ddgs"
 
 
 @pytest.mark.asyncio
@@ -390,7 +420,7 @@ async def test_replace_config_applies_new_timeout_per_http_request(web_harness) 
     assert web_harness.http.gets[-1]["timeout"] == 12.0
 
     refreshed = WebSearchSection(
-        enabled_engines=["duckduckgo", "searxng", "tavily", "you"],
+        enabled_engines=["ddgs", "searxng", "tavily", "you"],
         searxng_url="https://searx.example",
         tavily_api_key="tvly-secret",
         you_base_url="https://api.you.example/search",

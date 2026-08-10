@@ -78,6 +78,12 @@ class FrontierEntry:
         return bool(self.checkpoint_summary_id or self.terminal_summary_id or self.failed)
 
 
+# Unexpected synthesize crashes (not SummaryResult failures) clear sticky
+# ``synthesis_started`` and re-arm. Cap attempts so a permanent bug cannot
+# spin forever when the frontier is already fully ready.
+_MAX_SYNTHESIS_ATTEMPTS = 3
+
+
 @dataclass(slots=True)
 class ReportEpoch:
     epoch: int
@@ -91,6 +97,7 @@ class ReportEpoch:
     # exact object captured at synthesis start prevents a later terminal
     # summary from replacing this epoch's checkpoint coverage.
     frozen_coverage: CoverageSet | None = None
+    synthesis_attempts: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +344,40 @@ class ReportCoordinator:
         await self._maybe_start_synthesis(active_epoch)
         return active_epoch
 
+    async def on_parent_retired(self, parent_branch_id: str) -> None:
+        """Finalize a parent that left via ``retire_parent`` (not a safe-point).
+
+        ``ChildMaterialized(retire_parent=True)`` removes the parent from
+        ``active_leaves`` without going through ``on_branch_safe_point``.  If that
+        parent is already a member of an open report frontier, the slot would
+        otherwise stay not-ready forever (grace may also never arm when the epoch
+        was opened early).  Checkpoint the frozen frontier history so synthesis
+        can become eligible, then mark the coordinator branch FINALIZED.
+        """
+
+        branch = self.branches.get(parent_branch_id)
+        if branch is not None:
+            branch.lifecycle = BranchLifecycle.FINALIZED
+        active_epoch = self.current_epoch
+        if (
+            active_epoch is None
+            or active_epoch.synthesis_finished
+            or parent_branch_id not in active_epoch.frontier
+        ):
+            return
+        entry = active_epoch.frontier[parent_branch_id]
+        if entry.ready:
+            return
+        entry.checkpoint_requested = True
+        summary_id = await self._summarize_branch(
+            parent_branch_id, checkpoint=True, history=entry.stable_history
+        )
+        entry.checkpoint_summary_id = summary_id
+        entry.failed = summary_id is None
+        if summary_id is not None and parent_branch_id in self.branches:
+            self.branches[parent_branch_id].latest_checkpoint_id = summary_id
+        await self._maybe_start_synthesis(active_epoch)
+
     async def synthesize(self, epoch: ReportEpoch | None = None) -> ReportRecord | None:
         """Persist an immutable kind/coverage snapshot, then invoke finalizer."""
 
@@ -432,25 +473,84 @@ class ReportCoordinator:
 
     async def wait_for_synthesis(self) -> None:
         while self._synthesis_tasks:
-            await asyncio.gather(*tuple(self._synthesis_tasks))
+            # return_exceptions: a crashed attempt re-arms another synthesize task
+            # inside its done-callback; do not abort the wait on the first failure.
+            await asyncio.gather(*tuple(self._synthesis_tasks), return_exceptions=True)
+            # Task done-callbacks are scheduled via call_soon.  If the replacement
+            # task already finished before the next gather, that gather returns
+            # without suspending and the discard/re-arm callback never runs —
+            # yielding once flushes those callbacks so the set can shrink.
+            await asyncio.sleep(0)
 
     async def _maybe_start_synthesis(self, epoch: ReportEpoch) -> None:
         if epoch.synthesis_started or not all(entry.ready for entry in epoch.frontier.values()):
             return
+        self._arm_synthesis_task(epoch)
+
+    def _arm_synthesis_task(self, epoch: ReportEpoch) -> bool:
+        """Synchronously mark started and schedule ``synthesize``.
+
+        Used by both the normal start path and the done-callback re-arm so the
+        replacement task is visible in ``_synthesis_tasks`` before any
+        ``wait_for_synthesis`` poll can observe an empty set.
+        """
+
+        if epoch.synthesis_attempts >= _MAX_SYNTHESIS_ATTEMPTS:
+            _LOG.error(
+                "报告综合已达最大尝试次数仍未完成 task_id=%s epoch=%s attempts=%s",
+                self.task_id,
+                epoch.epoch,
+                epoch.synthesis_attempts,
+            )
+            return False
         coverage = build_coverage(self._summaries, active_branch_ids=self.active_branch_ids())
         # Mark the epoch started and freeze its kind synchronously, before
         # yielding to the task that calls the finalizer.  A terminal event may
         # arrive in the small scheduling gap, but it must not upgrade this
         # already-created checkpoint report to FINAL.
         epoch.synthesis_started = True
+        epoch.synthesis_attempts += 1
         epoch.kind = freeze_report_kind(
             active_branch_count=len(self.active_branch_ids()),
             coverage_has_checkpoint=coverage.has_checkpoint,
         )
         epoch.frozen_coverage = coverage
-        task = asyncio.create_task(self.synthesize(epoch))
+        task = asyncio.create_task(self.synthesize(epoch), name=f"lrs-synthesize-{self.task_id}-{epoch.epoch}")
         self._synthesis_tasks.add(task)
-        task.add_done_callback(self._synthesis_tasks.discard)
+
+        def _on_synthesis_done(done: asyncio.Task[Any], *, bound_epoch: ReportEpoch = epoch) -> None:
+            self._synthesis_tasks.discard(done)
+            should_rearm = False
+            if done.cancelled():
+                # Stop/cancel must not leave the epoch permanently wedged: a later
+                # frontier-ready path (or FINAL open_epoch) needs to be able to start
+                # synthesis again after the cancelled task is gone.
+                if not bound_epoch.synthesis_finished:
+                    bound_epoch.synthesis_started = False
+                    bound_epoch.frozen_coverage = None
+                    should_rearm = True
+            else:
+                exc = done.exception()
+                if exc is not None:
+                    _LOG.exception(
+                        "报告综合任务异常退出（已清除 synthesis_started 以便重试）task_id=%s epoch=%s",
+                        self.task_id,
+                        bound_epoch.epoch,
+                        exc_info=exc,
+                    )
+                    # Sticky True here is what left REPORTING with leaves=0 and no report:
+                    # create_task exceptions were discarded and _maybe_start_synthesis
+                    # refused to start again.  When the frontier is already fully ready,
+                    # no further branch event will call _maybe_start_synthesis — re-arm.
+                    if not bound_epoch.synthesis_finished:
+                        bound_epoch.synthesis_started = False
+                        bound_epoch.frozen_coverage = None
+                        should_rearm = True
+            if should_rearm and all(entry.ready for entry in bound_epoch.frontier.values()):
+                self._arm_synthesis_task(bound_epoch)
+
+        task.add_done_callback(_on_synthesis_done)
+        return True
 
     async def _summarize_branch(
         self, branch_id: str, *, checkpoint: bool, history: Sequence[Mapping[str, Any]]

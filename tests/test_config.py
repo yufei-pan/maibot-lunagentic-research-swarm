@@ -13,7 +13,7 @@ def test_config_defaults_match_approved_spec() -> None:
     assert config.summarizer.selector == ""
     assert config.summarizer.temperature == 0.2
     assert config.summarizer.max_tokens == 0
-    assert config.timing.default_time_budget_seconds == 120
+    assert config.timing.default_time_budget_seconds == 600
     assert config.timing.grace_period_seconds == 60
     assert config.timing.pause_timeout_seconds == 1200
     assert config.timing.feedback_wait_seconds == 600
@@ -74,6 +74,26 @@ def test_normalize_migrates_legacy_maintenance_person_ids() -> None:
     assert normalized["commands"]["maintenance_allowed_user_ids"] == ["u1"]
     assert "maintenance_allowed_person_ids" not in normalized["commands"]
     assert changed is True
+
+
+def test_normalize_migrates_duckduckgo_engine_to_ddgs() -> None:
+    defaults = LRSConfig().model_dump(mode="python", exclude_none=True)
+    raw = {
+        "plugin": {"config_version": "1.2.0"},
+        "web_search": {"enabled_engines": ["duckduckgo", "searxng", "duckduckgo"]},
+    }
+    normalized, changed, notes = normalize_config(raw, defaults)
+    assert normalized["web_search"]["enabled_engines"] == ["ddgs", "searxng"]
+    assert changed is True
+    assert any(CURRENT_CONFIG_VERSION in note for note in notes)
+    assert LRSConfig().web_search.enabled_engines == ["ddgs"]
+
+
+def test_web_search_ddgs_defaults() -> None:
+    section = LRSConfig().web_search
+    assert section.ddgs_region == "us-en"
+    assert section.ddgs_safesearch == "moderate"
+    assert section.ddgs_backend == "auto"
 
 def test_default_config_exposes_sdk_canonical_plugin_version() -> None:
     defaults = LRSConfig().model_dump(mode="python")

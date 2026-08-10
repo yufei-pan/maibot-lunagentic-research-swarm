@@ -1447,7 +1447,9 @@ class ResearchManager:
         coordinator = self.report_coordinators.get(effect.task_id)
         if coordinator is not None:
             if payload.get("retire_parent") and parent_id in coordinator.branches:
-                coordinator.branches[parent_id].lifecycle = BranchLifecycle.FINALIZED
+                # Mark frontier-ready (if needed) before clearing history: the
+                # frontier entry already froze stable_history at open_epoch.
+                await coordinator.on_parent_retired(parent_id)
                 coordinator.branches[parent_id].messages.clear()
             elif parent_credits_after is not None and parent_id in coordinator.branches:
                 coordinator.branches[parent_id].credits = float(parent_credits_after)
@@ -1637,20 +1639,33 @@ class ResearchManager:
         epoch = int(effect.payload.get("epoch", controller.state.report_epoch))
         current = getattr(coordinator, "current_epoch", None)
         if current is not None and getattr(current, "epoch", None) == epoch:
-            return
-        opened = await coordinator.open_epoch(epoch=epoch)
-        # FINAL epochs (empty frontier or explicit kind) do not use grace clones.
-        if controller.state.status is TaskStatus.FINALIZING or str(effect.payload.get("kind") or "") == "FINAL":
-            return
-        grace_due = getattr(opened, "grace_deadline_at", None)
-        if grace_due is not None:
-            self._arm_grace_timer(
+            # Early open_epoch (e.g. first terminal while still RUNNING) creates the
+            # epoch without going through this path, so grace was never armed.  The
+            # deadline OpenReportEpoch must still arm grace or unready frontier
+            # slots (including retire_parent parents) can wedge REPORTING forever.
+            self._arm_grace_for_open_epoch(
                 effect.task_id,
-                due_at=float(grace_due),
+                controller,
+                current,
                 round_id=str(effect.round_id or ""),
                 generation=effect.generation,
-                epoch=int(getattr(opened, "epoch", epoch)),
+                effect_kind=str(effect.payload.get("kind") or ""),
             )
+            return
+        # open_epoch freezes coordinator.active_branch_ids(), not controller.active_leaves.
+        # If a live leaf exists only on the controller/manager side, an empty frontier
+        # would immediately start synthesis, set sticky synthesis_started, and then
+        # ignore later terminal summaries from those leaves — REPORTING with no report.
+        self._sync_coordinator_live_leaves(effect.task_id, controller)
+        opened = await coordinator.open_epoch(epoch=epoch)
+        self._arm_grace_for_open_epoch(
+            effect.task_id,
+            controller,
+            opened,
+            round_id=str(effect.round_id or ""),
+            generation=effect.generation,
+            effect_kind=str(effect.payload.get("kind") or ""),
+        )
 
     async def arm_deadline_effect(self, effect: ArmDeadline) -> None:
         """Arm wall-clock report deadline or grace from a committed effect."""
@@ -1778,6 +1793,37 @@ class ResearchManager:
             )
         )
 
+    def _arm_grace_for_open_epoch(
+        self,
+        task_id: str,
+        controller: TaskController,
+        report_epoch: Any,
+        *,
+        round_id: str,
+        generation: int,
+        effect_kind: str = "",
+    ) -> None:
+        """Arm grace for an intermediate REPORTING epoch that is not yet synthesized."""
+
+        if report_epoch is None:
+            return
+        if controller.state.status is TaskStatus.FINALIZING or effect_kind == "FINAL":
+            return
+        if controller.state.status is not TaskStatus.REPORTING:
+            return
+        if bool(getattr(report_epoch, "synthesis_finished", False)):
+            return
+        grace_due = getattr(report_epoch, "grace_deadline_at", None)
+        if grace_due is None:
+            return
+        self._arm_grace_timer(
+            task_id,
+            due_at=float(grace_due),
+            round_id=round_id,
+            generation=generation,
+            epoch=int(getattr(report_epoch, "epoch", 0) or 0),
+        )
+
     async def _deadline_wait(
         self,
         task_id: str,
@@ -1870,10 +1916,15 @@ class ResearchManager:
         if record.kind is ReportKind.FINAL:
             if state.status in {TaskStatus.RUNNING, TaskStatus.REPORTING, TaskStatus.FINALIZING}:
                 # Shared FinalEpochCommitted path: same-epoch freeze or +1 bump.
-                if record.epoch not in {state.report_epoch, state.report_epoch + 1}:
-                    return
-                if state.status is TaskStatus.REPORTING and record.epoch != state.report_epoch:
-                    return
+                # When already FINALIZING (last-leaf path), the coordinator may have
+                # opened epoch N>report_epoch+1 because early intermediate epochs
+                # ran while still RUNNING and never bumped controller.report_epoch.
+                # Do not drop that FINAL report — otherwise we sit in FINALIZING forever.
+                if state.status is not TaskStatus.FINALIZING:
+                    if record.epoch not in {state.report_epoch, state.report_epoch + 1}:
+                        return
+                    if state.status is TaskStatus.REPORTING and record.epoch != state.report_epoch:
+                        return
                 await self._submit(
                     controller,
                     FinalEpochCommitted(
@@ -2051,6 +2102,47 @@ class ResearchManager:
             # other local handoff effects.
             return max(0, int(task.get("active", 0))) + max(0, int(task.get("pause_runnable_queued", 0)))
         return 0
+
+    def _sync_coordinator_live_leaves(self, task_id: str, controller: TaskController) -> None:
+        """Ensure every controller leaf exists as a non-finalized coordinator branch.
+
+        ``ReportCoordinator.open_epoch`` freezes ``coordinator.active_branch_ids()``.
+        Controller ``active_leaves`` is the durable source of truth for what is still
+        live at the report deadline.  If a leaf is missing from the coordinator (or
+        was incorrectly marked FINALIZED while still in ``active_leaves``), the epoch
+        frontier goes empty, synthesis starts immediately with incomplete coverage,
+        and later terminal summaries from those leaves cannot reopen synthesis.
+        """
+
+        coordinator = self.report_coordinators.get(task_id)
+        snapshot = self._round_snapshots.get(task_id)
+        if coordinator is None or snapshot is None:
+            return
+        branches = getattr(coordinator, "branches", None)
+        if not isinstance(branches, dict):
+            # Injected test doubles may only implement open_epoch / safe-point hooks.
+            return
+        managed = self._branches.get(task_id) or {}
+        fingerprint = str(getattr(snapshot.agent_catalog, "fingerprint", "") or "")
+        for branch_id, credits in controller.state.active_leaves.items():
+            info = managed.get(branch_id) or {}
+            runtime = branches.get(branch_id)
+            if runtime is None:
+                branches[branch_id] = BranchRuntime(
+                    branch_id=branch_id,
+                    task=coordinator.formalized_task,
+                    catalog_fingerprint=fingerprint,
+                    generation=controller.state.generation,
+                    messages=[dict(item) for item in info.get("messages", ())],
+                    credits=float(credits),
+                    depth=int(info.get("depth", 0) or 0),
+                    parent_branch_id=str(info.get("parent_branch_id") or "") or None,
+                )
+                continue
+            runtime.credits = float(credits)
+            if runtime.lifecycle is BranchLifecycle.FINALIZED:
+                # Still listed as an active leaf: treat as live for the frontier.
+                runtime.lifecycle = BranchLifecycle.READY
 
     def _sync_branch_credits(self, task_id: str, controller: TaskController) -> None:
         """Mirror reducer-owned balances into status cache and report coordinator."""

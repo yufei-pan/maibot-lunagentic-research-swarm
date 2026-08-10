@@ -245,3 +245,47 @@ async def test_non_frontier_last_leaf_opens_final_after_prior_epoch(report_harne
     assert epoch is not None
     assert epoch.kind is ReportKind.FINAL
     assert report_harness.coordinator.reports[-1].kind is ReportKind.FINAL
+
+
+@pytest.mark.asyncio
+async def test_synthesis_exception_clears_sticky_started_flag(report_harness: ReportHarness) -> None:
+    """A crashed synthesize task must not permanently block later report attempts.
+
+    Single-branch FINAL short-circuits past ``finalize_task`` (one coverage item),
+    so this freezes two live leaves into the frontier first.  After an unexpected
+    exception the done-callback clears sticky ``synthesis_started`` and re-arms
+    synthesis — nothing else would call it once the frontier is already ready.
+    """
+
+    class FlakySummarizer(FakeSummarizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def finalize_task(self, request):
+            self.calls += 1
+            await self.gate.wait()
+            if self.calls == 1:
+                raise RuntimeError("finalize_task exploded")
+            return await super().finalize_task(request)
+
+    branch = report_harness.branch("A")
+    report_harness.coordinator.branches["B"] = BranchRuntime(
+        branch_id="B", task=branch.task, catalog_fingerprint="catalog", generation=0,
+        messages=[{"role": "assistant", "content": "B stable"}], credits=1.0, depth=1,
+    )
+    flaky = FlakySummarizer()
+    report_harness.coordinator.summarizer = flaky
+    # Freeze both leaves into the frontier while they are still live, otherwise
+    # the first terminal alone opens an empty-frontier epoch and short-circuits
+    # past finalize_task (single coverage item).
+    epoch = await report_harness.coordinator.open_epoch()
+    assert set(epoch.frontier) == {"A", "B"}
+    await report_harness.coordinator.on_branch_safe_point("A", terminal=True)
+    await report_harness.coordinator.on_branch_safe_point("B", terminal=True)
+    await report_harness.coordinator.wait_for_synthesis()
+
+    assert flaky.calls >= 2
+    assert epoch.synthesis_finished is True
+    assert report_harness.coordinator.reports
+    assert report_harness.coordinator.reports[-1].status == "SUCCEEDED"

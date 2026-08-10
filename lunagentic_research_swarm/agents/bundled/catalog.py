@@ -29,7 +29,7 @@ _CATALOG: tuple[dict[str, object], ...] = (
         "version": "1",
         "display_name": "辩手 (Debater)",
         "description": "质疑前提、提供第二意见，寻找反例与风险。",
-        "model_selector": "task:replyer",
+        "model_selector": "task:planner",
         "allowed_procedures": ["*"],
     },
     {
@@ -48,7 +48,7 @@ _CATALOG: tuple[dict[str, object], ...] = (
             "专职记忆族 Procedure：设计聊天、消息、人物与知识库查询，"
             "不负责过度解释原始结果。"
         ),
-        "model_selector": "task:mid_memory",
+        "model_selector": "task:utils",
         "allowed_procedures": ["*"],
     },
     {
@@ -56,7 +56,7 @@ _CATALOG: tuple[dict[str, object], ...] = (
         "version": "1",
         "display_name": "知识报告员 (Knowledge Reporter)",
         "description": "低 deliberation 地报告模型已知知识与不确定性。",
-        "model_selector": "task:replyer",
+        "model_selector": "task:planner",
         "allowed_procedures": ["*"],
     },
     {

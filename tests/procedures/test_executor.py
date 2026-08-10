@@ -53,8 +53,11 @@ class FakeAPI:
     def __post_init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
-    async def call(self, name: str, *, version: str = "", **kwargs: Any) -> Any:
-        self.calls.append((name, version, kwargs))
+    async def call(self, name: str, *, version: str = "", timeout_ms: int | None = None, **kwargs: Any) -> Any:
+        recorded = dict(kwargs)
+        if timeout_ms is not None:
+            recorded["timeout_ms"] = timeout_ms
+        self.calls.append((name, version, recorded))
         response = self.responses[kwargs["procedure_id"]]
         if isinstance(response, list):
             value = response.pop(0)
@@ -187,6 +190,72 @@ async def test_idempotent_retry_reuses_request_id_only_for_explicit_retryable_er
     assert api.calls[0][2]["request_id"] == api.calls[1][2]["request_id"]
     assert event.results[0].attempts == 2
     assert event.results[0].result.success
+
+
+@pytest.mark.asyncio
+async def test_executor_passes_definition_timeout_as_api_rpc_timeout_ms() -> None:
+    """Host api.call 默认 RPC 30s；须把 procedure.timeout_seconds 传成 timeout_ms。"""
+
+    api = FakeAPI(
+        {
+            "fetch_url.fetch": {
+                "success": True,
+                "data": {"ok": True},
+                "error": None,
+                "metadata": {},
+            }
+        }
+    )
+    executor = ProcedureExecutor(
+        catalog(definition("fetch_url.fetch", timeout_seconds=120.0)),
+        api=api,
+    )
+    event = await executor.invoke_many(
+        effect([ProcedureRequest(procedure_id="fetch_url.fetch", arguments={"url": "https://example.test"})])
+    )
+    assert event.results[0].result.success is True
+    assert api.calls[0][2]["timeout_ms"] == 120_000
+    assert "url" in api.calls[0][2]["arguments"]
+
+
+@pytest.mark.asyncio
+async def test_composite_api_forwards_timeout_ms_via_call_capability() -> None:
+    """真实 ctx.api 不接受 timeout_ms 进 invoke 参数；应走 call_capability(timeout_ms=…)。"""
+
+    from lunagentic_research_swarm.procedures.executor import CompositeProcedureAPI
+
+    captured: dict[str, Any] = {}
+
+    class _Ctx:
+        async def call_capability(self, capability: str, timeout_ms: int | None = None, **kwargs: Any) -> Any:
+            captured["capability"] = capability
+            captured["timeout_ms"] = timeout_ms
+            captured["kwargs"] = kwargs
+            return {"success": True, "data": {}, "error": None, "metadata": {}}
+
+    class _HostAPI:
+        def __init__(self) -> None:
+            self._ctx = _Ctx()
+
+        async def call(self, *_a: Any, **_k: Any) -> Any:
+            raise AssertionError("不应回退到 api.call，以免 timeout_ms 泄漏进 provider args")
+
+    api = CompositeProcedureAPI(host_api=_HostAPI())
+    result = await api.call(
+        "com.0-hz.fetch-url.invoke_procedure",
+        version="1",
+        timeout_ms=120_000,
+        procedure_id="fetch_url.fetch",
+        request_id="r1",
+        arguments={"url": "https://example.test"},
+        scoped_metadata={},
+    )
+    assert result["success"] is True
+    assert captured["capability"] == "api.call"
+    assert captured["timeout_ms"] == 120_000
+    assert captured["kwargs"]["api_name"] == "com.0-hz.fetch-url.invoke_procedure"
+    assert captured["kwargs"]["args"]["procedure_id"] == "fetch_url.fetch"
+    assert "timeout_ms" not in captured["kwargs"]["args"]
 
 
 @pytest.mark.asyncio

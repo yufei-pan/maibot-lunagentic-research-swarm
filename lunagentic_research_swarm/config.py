@@ -13,7 +13,7 @@ from maibot_sdk.config import (
     validate_plugin_config,
 )
 
-CURRENT_CONFIG_VERSION = "1.2.0"
+CURRENT_CONFIG_VERSION = "1.4.0"
 
 
 def _ui_field(
@@ -136,7 +136,7 @@ class EmbeddingSection(PluginConfigBase):
 
 class TimingSection(PluginConfigBase):
     __ui_label__ = "时间"
-    default_time_budget_seconds: int = _ui_field(120, label="默认时间预算（秒）", hint="每项研究任务的默认执行时间。", ge=1)
+    default_time_budget_seconds: int = _ui_field(600, label="默认时间预算（秒）", hint="每项研究任务的默认执行时间。", ge=1)
     grace_period_seconds: int = _ui_field(60, label="宽限期（秒）", hint="任务超时后的收尾时间。", ge=0)
     pause_timeout_seconds: int = _ui_field(1200, label="暂停超时（秒）", hint="等待恢复前的最长暂停时间。", ge=1)
     feedback_wait_seconds: int = _ui_field(600, label="反馈等待（秒）", hint="等待用户反馈的最长时间。", ge=1)
@@ -244,11 +244,30 @@ class CommandsSection(PluginConfigBase):
 
 class WebSearchSection(PluginConfigBase):
     __ui_label__ = "网页搜索"
-    enabled_engines: list[Literal["duckduckgo", "searxng", "tavily", "you"]] = _ui_factory(
-        factory=lambda: ["duckduckgo"], label="启用的搜索引擎", hint="按顺序尝试的网页搜索引擎。"
+    enabled_engines: list[Literal["ddgs", "searxng", "tavily", "you"]] = _ui_factory(
+        factory=lambda: ["ddgs"],
+        label="启用的搜索引擎",
+        hint="按顺序尝试的网页搜索引擎。ddgs 使用 ddgs 库的自动后端聚合。",
     )
     timeout_seconds: float = _ui_field(30.0, label="搜索超时（秒）", hint="单次网页搜索最长等待时间。", gt=0.0, le=120.0)
     max_results: int = _ui_field(10, label="最大结果数", hint="每次搜索返回的最大结果数。", ge=1, le=20)
+    ddgs_region: str = _ui_field(
+        "us-en",
+        label="ddgs 区域",
+        hint="ddgs.text 的 region（如 us-en、wt-wt、cn-zh）。",
+        placeholder="us-en",
+    )
+    ddgs_safesearch: Literal["on", "moderate", "off"] = _ui_field(
+        "moderate",
+        label="ddgs 安全搜索",
+        hint="ddgs.text 的 safesearch：on / moderate / off。",
+    )
+    ddgs_backend: str = _ui_field(
+        "auto",
+        label="ddgs 后端",
+        hint='ddgs.text 的 backend：auto、all，或逗号分隔列表（如 brave,wikipedia）。',
+        placeholder="auto",
+    )
     searxng_url: str = _ui_field("", label="SearXNG 地址", hint="自建 SearXNG 服务地址。", placeholder="https://searxng.example")
     tavily_api_key: str = _ui_field("", label="Tavily API 密钥", hint="Tavily 搜索 API 密钥。", repr=False)
     you_base_url: str = _ui_field("", label="You.com 地址", hint="You.com API 服务地址。", placeholder="https://api.you.com")
@@ -330,6 +349,21 @@ def normalize_config(
             llm_raw["default_selector"] = llm_raw.get("force_selector") or ""
         del llm_raw["force_selector"]
         raw["llm"] = llm_raw
+    # 兼容 web_search.enabled_engines: duckduckgo → ddgs（自动后端）
+    web_search_raw = dict(raw.get("web_search") or {}) if isinstance(raw.get("web_search"), Mapping) else {}
+    engines_raw = web_search_raw.get("enabled_engines")
+    if isinstance(engines_raw, list):
+        migrated: list[str] = []
+        seen: set[str] = set()
+        for engine in engines_raw:
+            name = "ddgs" if engine == "duckduckgo" else engine
+            if not isinstance(name, str) or name in seen:
+                continue
+            seen.add(name)
+            migrated.append(name)
+        if migrated != engines_raw:
+            web_search_raw["enabled_engines"] = migrated
+            raw["web_search"] = web_search_raw
     raw_version = extract_plugin_config_version(raw)
     rebuilt = rebuild_plugin_config_data(default_data, raw)
     merged, merged_changed = merge_plugin_config_data(default_data, rebuilt)

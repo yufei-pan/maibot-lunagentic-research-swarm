@@ -226,7 +226,7 @@ async def test_spec_15_4_missing_search_engines_omits_procedure_invoke_fails_vis
     assert service.available_engines == ()
     assert web_search_procedure_definitions(service) == []
 
-    # Misconfigured paid engines only (no duckduckgo) also omit the procedure.
+    # Misconfigured paid engines only (no ddgs) also omit the procedure.
     section2 = WebSearchSection(enabled_engines=["searxng", "tavily", "you"])
     service2 = WebSearchService(section2, object())
     assert service2.available_engines == ()
@@ -246,7 +246,7 @@ async def test_spec_15_4_missing_search_engines_omits_procedure_invoke_fails_vis
                 "requests": [
                     {
                         "procedure_id": WEB_SEARCH_PROCEDURE,
-                        "arguments": {"engine": "duckduckgo", "query": "lrs"},
+                        "arguments": {"engine": "ddgs", "query": "lrs"},
                     }
                 ],
             },

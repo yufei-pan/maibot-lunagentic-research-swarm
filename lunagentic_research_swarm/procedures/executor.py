@@ -52,18 +52,39 @@ class CompositeProcedureAPI:
     def local_api_names(self) -> frozenset[str]:
         return frozenset(self._local)
 
-    async def call(self, name: str, *, version: str = "1", **kwargs: Any) -> Any:
+    async def call(self, name: str, *, version: str = "1", timeout_ms: int | None = None, **kwargs: Any) -> Any:
         invoker = self._local.get(str(name))
         if invoker is not None:
             return await invoker(version=version, **kwargs)
         if self._host is None:
             raise RuntimeError("Procedure executor 缺少 ctx.api，且无匹配的本地 invoker")
+        # SDK ``api.call`` 目前不会把 timeout_ms 提升为 Host RPC 超时（会误进 provider args）。
+        # 有 PluginContext 时直接走 call_capability(timeout_ms=…)，覆盖默认 30s。
+        ctx = getattr(self._host, "_ctx", None)
+        call_capability = getattr(ctx, "call_capability", None) if ctx is not None else None
+        if callable(call_capability):
+            if timeout_ms is not None and int(timeout_ms) > 0:
+                return await call_capability(
+                    "api.call",
+                    timeout_ms=int(timeout_ms),
+                    api_name=name,
+                    version=version,
+                    args=kwargs,
+                )
+            return await call_capability(
+                "api.call",
+                api_name=name,
+                version=version,
+                args=kwargs,
+            )
         call = getattr(self._host, "call", None)
         if not callable(call):
             if callable(self._host):
                 call = self._host
             else:
                 raise RuntimeError("ctx.api 必须提供 call()")
+        if timeout_ms is not None and int(timeout_ms) > 0:
+            return await call(name, version=version, timeout_ms=int(timeout_ms), **kwargs)
         return await call(name, version=version, **kwargs)
 
 
@@ -446,6 +467,8 @@ class ProcedureExecutor:
         entry: Any,
         procedure_id: str,
         invocation: ProcedureInvocation,
+        *,
+        timeout_seconds: float,
     ) -> Any:
         if self.api is None:
             raise RuntimeError("Procedure executor 缺少 ctx.api")
@@ -459,10 +482,15 @@ class ProcedureExecutor:
                 call = self.api
             else:
                 raise RuntimeError("ctx.api 必须提供 call()")
+        # 与 catalog timeout_seconds 对齐 Host/RPC 超时；缺省 30s 会先于 wait_for 杀掉慢 fetch。
+        timeout_ms: int | None = None
+        if timeout_seconds > 0:
+            timeout_ms = max(1, int(timeout_seconds * 1000))
         # API contract 的固定 envelope：procedure_id、request_id、arguments、scoped_metadata。
         return await call(
             api_name,
             version=api_version,
+            timeout_ms=timeout_ms,
             procedure_id=procedure_id,
             request_id=invocation.request_id,
             arguments=dict(invocation.arguments),
@@ -589,7 +617,12 @@ class ProcedureExecutor:
         while True:
             attempts += 1
             try:
-                call = self._api_call(entry, procedure_id, invocation)
+                call = self._api_call(
+                    entry,
+                    procedure_id,
+                    invocation,
+                    timeout_seconds=timeout_seconds,
+                )
                 if timeout_seconds > 0:
                     raw = await asyncio.wait_for(call, timeout=timeout_seconds)
                 else:

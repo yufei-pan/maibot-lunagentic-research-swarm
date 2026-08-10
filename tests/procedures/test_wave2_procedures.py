@@ -92,7 +92,7 @@ async def test_bc1_procedure_results_fold_into_parent_and_child_messages() -> No
             "builtin.web_search": {
                 "success": True,
                 "data": {
-                    "engine": "duckduckgo",
+                    "engine": "ddgs",
                     "query": "lunar research",
                     "results": [{"url": "https://example.com", "title": "Hit", "snippet": "snippet"}],
                 },
@@ -103,7 +103,7 @@ async def test_bc1_procedure_results_fold_into_parent_and_child_messages() -> No
     )
     executor = ProcedureExecutor(catalog(definition("builtin.web_search")), api=api)
     completed = await executor.invoke_many(
-        _effect([ProcedureRequest(procedure_id="builtin.web_search", arguments={"engine": "duckduckgo", "query": "q"})])
+        _effect([ProcedureRequest(procedure_id="builtin.web_search", arguments={"engine": "ddgs", "query": "q"})])
     )
 
     assert any(
@@ -155,7 +155,7 @@ async def test_bi1_allowed_procedures_rejected_at_invoke() -> None:
     )
     event = await executor.invoke_many(
         _effect(
-            [ProcedureRequest(procedure_id="builtin.web_search", arguments={"engine": "duckduckgo", "query": "x"})],
+            [ProcedureRequest(procedure_id="builtin.web_search", arguments={"engine": "ddgs", "query": "x"})],
             allowed_procedures=("builtin.knowledge_search",),
         )
     )

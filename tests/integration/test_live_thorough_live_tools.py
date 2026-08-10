@@ -12,7 +12,7 @@ LIVE_TOOLS_OBJECTIVE = (
     "调研问题：加州高铁（California High-Speed Rail）Merced–Bakersfield 段"
     "当前规划开通目标年份（或最新官方业务计划中给出的服务日期）是什么？"
     "硬性要求：必须至少一次调用 builtin.web_search；"
-    "arguments 必须同时包含 engine 与 query；优先 engine=\"searxng\"（若失败可改 duckduckgo）；"
+    "arguments 必须同时包含 engine 与 query；优先 engine=\"searxng\"（若失败可改 ddgs）；"
     "query 须包含子串 \"California High-Speed Rail\" 与 \"Merced\"。"
     "根据检索到的网页结果给出简短结论，并在 report 中点名至少一处来源标题或域名；"
     "若某次搜索失败，必须换引擎或改写 query 再搜，不得在无结果时直接终结；"
