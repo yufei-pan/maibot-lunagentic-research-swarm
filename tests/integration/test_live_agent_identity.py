@@ -3,7 +3,7 @@
 
 与 ``test_live_thorough_live_tools`` 的区别：那条用例只跑一个 root 智能体和测试本地
 总结器 prompt。这条把**仓库真正发货的东西**放进回路——冻结的 bundled 目录、
-``prompts/zh-CN/*.txt`` 四个总结角色——然后检查真实模型收到的消息与它实际给出的
+``i18n/zh-CN/*.txt`` 四个总结角色——然后检查真实模型收到的消息与它实际给出的
 回答：智能体是否知道自己是谁、是否只调用了自己被允许的 Procedure、参数是否符合
 schema、`report` 是否有实质内容。
 """

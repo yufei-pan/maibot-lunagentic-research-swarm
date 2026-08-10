@@ -122,7 +122,7 @@ def check_dependency_sync() -> None:
 
 
 def check_prompts_readable() -> None:
-    prompts = PLUGIN_DIR / "lunagentic_research_swarm" / "prompts" / "zh-CN"
+    prompts = PLUGIN_DIR / "i18n" / "zh-CN"
     for name in (
         "swarm_system.txt",
         "formalize_task.txt",

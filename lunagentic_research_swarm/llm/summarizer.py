@@ -92,7 +92,8 @@ class SummaryResult:
     error: GenerationError | None
 
 
-_PROMPT_ROOT = Path(__file__).resolve().parents[1] / "prompts" / "zh-CN"
+# Manifest i18n 资源：仓库根目录 i18n/<locale>/（与 Python 包并列）。
+_PROMPT_ROOT = Path(__file__).resolve().parents[2] / "i18n" / "zh-CN"
 
 
 def _json_text(value: Any) -> str:

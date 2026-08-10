@@ -66,6 +66,8 @@
     "send.text"
   ],
   "i18n": {
-    "default_locale": "zh-CN"
+    "default_locale": "zh-CN",
+    "locales_path": "i18n",
+    "supported_locales": ["zh-CN"]
   }
 }

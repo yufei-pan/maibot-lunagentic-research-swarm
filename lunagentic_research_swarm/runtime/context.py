@@ -182,7 +182,8 @@ def _collect_procedure_cards(procedure_catalog: Any) -> list[dict[str, Any]]:
     return cards
 
 
-_IDENTITY_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "zh-CN" / "swarm_system.txt"
+# Manifest i18n 资源：仓库根目录 i18n/<locale>/（与 Python 包并列）。
+_IDENTITY_PROMPT_PATH = Path(__file__).resolve().parents[2] / "i18n" / "zh-CN" / "swarm_system.txt"
 _IDENTITY_PLACEHOLDER = "{swarm_identity}"
 
 

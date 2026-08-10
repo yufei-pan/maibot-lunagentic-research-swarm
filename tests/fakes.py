@@ -834,7 +834,7 @@ class RuntimeHarness:
             self.manager.summarizer = self.summarizer
 
     def use_real_summarizer(self, creds: Any) -> None:
-        """Install the shipped ``SummarizerService`` (real ``prompts/zh-CN/*.txt``).
+        """Install the shipped ``SummarizerService`` (real ``i18n/zh-CN/*.txt``).
 
         ``use_live_summarizer`` swaps in test-local prompts, so it cannot tell us
         anything about the prompt files we actually ship.  This one drives the real

@@ -14,7 +14,7 @@
 
 - **九个内置角色：** 快速/深度思考、辩手、外部与记忆研究员、知识报告、历史案例、证据核验、定量分析  
 - **网页搜索与取证：** 默认 **ddgs** 开箱可用；可选自建 SearXNG / Tavily / You；配合推荐的 [fetch-url](https://github.com/yufei-pan/maibot-fetch-url-plugin) 抓取全文  
-- **记忆与知识库：** 可查询聊天、消息、人物与 Host 知识库（记忆研究员）  
+- **记忆与知识库：** 记忆研究员可读取**当前聊天流的历史消息**，并查询人物与 Host 知识库（数据不出 Host；仅该角色可调用）  
 - **历史经验与 embedding：** 索引过往调查与质量反馈；新任务可检索相似案例与 lesson，从成功与失误中改进  
 - **其它研究工具：** 计算/统计/换算、来源整理  
 - **任务全周期：** 启动后立刻有 `task_id`；支持暂停/继续/停止、补充背景、中间报告与最终报告、结束后的质量反馈  
@@ -166,6 +166,7 @@ Credits 与价格细节见 [docs/credits-and-reporting.md](docs/credits-and-repo
 - **报告：** `[reporting]` 控制是否投递中间/最终报告及长度上限。  
 - **反馈提醒：** `[feedback]`。  
 - **隐私：** 默认不把智能体全文对话和工具原始载荷写入调试存储；需要排障再开 `[storage]` 相关开关。说明见 [docs/privacy-and-recovery.md](docs/privacy-and-recovery.md)。  
+- **记忆读取：** 启用记忆研究员后，调查过程中可经由 Host 能力读取**该任务聊天流的历史消息**（以及人物/知识库）；不会外传，其它角色不能直接调用这些 Procedure。  
 - **扩展刷新间隔：** `[extensions].refresh_interval_seconds`（一般保持默认即可）。
 
 ---
@@ -182,7 +183,7 @@ Credits 与价格细节见 [docs/credits-and-reporting.md](docs/credits-and-repo
 | 深度思考者 | 复杂推理与长期约束 |
 | 辩手 | 找反例、风险与替代解释 |
 | 外部研究员 | 外网检索与证据收集 |
-| 记忆研究员 | 查聊天、消息、人物、知识库 |
+| 记忆研究员 | 读取本聊天流历史消息，并查人物、知识库 |
 | 知识报告员 | 整理模型已知知识与不确定点 |
 | 历史案例研究员 | 查以往类似调查与反馈 |
 | 证据核验员 | 核对来源是否支撑结论 |
@@ -194,7 +195,7 @@ Credits 与价格细节见 [docs/credits-and-reporting.md](docs/credits-and-repo
 |---|---|
 | 网页搜索 | ddgs / SearXNG / Tavily / You（取决于你的配置） |
 | 网页全文 | 需安装 fetch-url 插件 |
-| 记忆与知识库查询 | 仅记忆研究员使用 |
+| 记忆与知识库查询 | 仅记忆研究员；可含该聊天流历史消息 |
 | 历史案例 | 仅历史案例研究员使用 |
 | 计算 / 统计 / 单位换算 | 定量分析等场景 |
 | 来源整理 | URL 规范化与 provenance 整理 |

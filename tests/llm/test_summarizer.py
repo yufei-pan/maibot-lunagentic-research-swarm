@@ -404,7 +404,7 @@ def test_summary_result_has_no_reasoning_and_max_tokens_is_strict() -> None:
 def test_prompt_assets_are_chinese_role_specific_and_have_no_fifth_summarizer_role() -> None:
     """若角色 prompt 混用、遗漏或新增第五个总结角色，本测试应失败。"""
 
-    prompt_root = Path(__file__).parents[2] / "lunagentic_research_swarm" / "prompts" / "zh-CN"
+    prompt_root = Path(__file__).parents[2] / "i18n" / "zh-CN"
     expected = {
         "swarm_system.txt",
         "formalize_task.txt",
@@ -430,7 +430,7 @@ def test_prompt_files_state_no_length_range() -> None:
     交给 ``summarizer.max_tokens``，异常冗长本身就是要排查的信号。
     """
 
-    prompt_root = Path(__file__).parents[2] / "lunagentic_research_swarm" / "prompts" / "zh-CN"
+    prompt_root = Path(__file__).parents[2] / "i18n" / "zh-CN"
     range_pattern = re.compile(r"\d+\s*[–\-~]\s*\d+\s*字")
     for path in sorted(prompt_root.glob("*.txt")):
         text = path.read_text(encoding="utf-8")
