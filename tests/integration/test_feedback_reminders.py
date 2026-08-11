@@ -94,6 +94,7 @@ class ReminderHarness:
     scheduler: FakeScheduler
     controller: TaskController
     task_id: str = "lrs_remind"
+    stream_id: str = "stream-remind"
     round_id: str = "rnd_remind"
     generation: int = 0
     _seq: int = field(default=0, init=False)
@@ -262,7 +263,12 @@ class ReminderHarness:
         await self.outbox.deliver_once()
 
     async def submit_feedback(self) -> None:
-        await self.service.submit(task_id=self.task_id, disposition="accepted", notes="已审阅")
+        await self.service.submit(
+            task_id=self.task_id,
+            disposition="accepted",
+            notes="已审阅",
+            stream_id=self.stream_id,
+        )
 
     async def continue_round(self) -> None:
         """经 ContinueRequested → _feedback_commands 取消 pending，而非直接 cancel_due_to_continue。"""

@@ -467,6 +467,9 @@ class LunagenticResearchSwarmPlugin(SwarmCommandsMixin, MaiBotPlugin):
         }
         if (message := validate_feedback_arguments(payload)) is not None:
             return failure_result("invalid_argument", message, task_id=task_id if isinstance(task_id, str) else None)
+        stream_id, error = self._stream_from_host(kwargs, task_id=task_id if isinstance(task_id, str) else None)
+        if error is not None:
+            return error
         services = self._services
         feedback = getattr(services, "feedback", None) if services is not None else None
         if feedback is None:
@@ -475,6 +478,7 @@ class LunagenticResearchSwarmPlugin(SwarmCommandsMixin, MaiBotPlugin):
             result = await feedback.submit(
                 task_id=task_id,
                 disposition=disposition,
+                stream_id=str(stream_id),
                 round_number=round_number,
                 rating=rating,
                 useful_findings=useful_findings,
@@ -486,6 +490,8 @@ class LunagenticResearchSwarmPlugin(SwarmCommandsMixin, MaiBotPlugin):
                 notes=notes,
                 supersedes_feedback_id=supersedes_feedback_id,
             )
+        except PermissionError as exc:
+            return failure_result("task_access_denied", str(exc)[:256] or "无权访问该调查任务", task_id=task_id)
         except LookupError as exc:
             return failure_result("task_not_found", str(exc)[:256], task_id=task_id)
         except ValueError as exc:

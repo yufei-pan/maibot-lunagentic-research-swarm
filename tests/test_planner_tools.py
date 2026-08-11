@@ -154,6 +154,44 @@ async def test_start_requires_host_stream_id_and_manager_errors_are_structured(f
 
 
 @pytest.mark.asyncio
+async def test_submit_feedback_requires_stream_and_enforces_ownership(plugin_module) -> None:
+    plugin = plugin_module.create_plugin()
+    submits: list[dict] = []
+
+    class _Feedback:
+        async def submit(self, **kwargs):
+            submits.append(dict(kwargs))
+            if kwargs.get("stream_id") != "s1":
+                raise PermissionError("任务不属于当前 stream")
+            return SimpleNamespace(
+                feedback_id="fb_1",
+                lesson_id="les_1",
+                disposition=kwargs["disposition"],
+                round_id="rnd_1",
+                lesson_indexing="indexed",
+                lesson_index_error=None,
+            )
+
+    plugin._services = SimpleNamespace(feedback=_Feedback(), manager=None)
+    plugin._manager = None
+
+    missing = await plugin.submit_research_feedback("lrs_fake", "accepted")
+    assert missing["success"] is False
+    assert missing["error"]["code"] == "stream_id_required"
+    assert submits == []
+
+    denied = await plugin.submit_research_feedback("lrs_fake", "accepted", stream_id="other")
+    assert denied["success"] is False
+    assert denied["error"]["code"] == "task_access_denied"
+    assert len(submits) == 1
+
+    ok = await plugin.submit_research_feedback("lrs_fake", "accepted", stream_id="s1")
+    assert ok["success"] is True
+    assert ok["feedback_id"] == "fb_1"
+    assert submits[-1]["stream_id"] == "s1"
+
+
+@pytest.mark.asyncio
 async def test_structured_manager_failure_and_strict_time_filtering(fake_plugin) -> None:
     plugin, manager = fake_plugin
 

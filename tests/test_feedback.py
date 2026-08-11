@@ -105,6 +105,7 @@ class FeedbackHarness:
 
     async def submit(self, **kwargs: Any) -> Any:
         self._clock[0] += 1.0
+        kwargs.setdefault("stream_id", "stream-1")
         return await self.service.submit(**kwargs)
 
     async def events(self) -> list[_FeedbackRow]:
@@ -138,6 +139,22 @@ async def feedback_harness(tmp_path: Path) -> AsyncIterator[FeedbackHarness]:
         yield harness
     finally:
         await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_feedback_submit_enforces_stream_ownership(feedback_harness: FeedbackHarness) -> None:
+    with pytest.raises(PermissionError, match="不属于"):
+        await feedback_harness.submit(
+            task_id="lrs_1",
+            disposition="accepted",
+            stream_id="other-stream",
+        )
+    with pytest.raises(PermissionError, match="stream_id"):
+        await feedback_harness.service.submit(task_id="lrs_1", disposition="accepted", stream_id="")
+    ok = await feedback_harness.submit(task_id="lrs_1", disposition="accepted", stream_id="stream-1")
+    assert ok.disposition == "accepted"
+    rows = await feedback_harness.events()
+    assert len(rows) == 1
 
 
 @pytest.mark.asyncio

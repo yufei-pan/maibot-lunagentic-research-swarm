@@ -200,6 +200,7 @@ class FeedbackService:
         *,
         task_id: str,
         disposition: str,
+        stream_id: str,
         round_number: int | None = None,
         rating: int | None = None,
         useful_findings: Sequence[str] | None = None,
@@ -214,6 +215,9 @@ class FeedbackService:
         task_id = str(task_id).strip()
         if not task_id:
             raise ValueError("task_id 不能为空")
+        if not isinstance(stream_id, str) or not stream_id.strip():
+            raise PermissionError("stream_id 不能为空")
+        stream_id = stream_id.strip()
         disposition = str(disposition).strip().lower()
         if disposition not in DISPOSITIONS:
             raise ValueError(f"disposition 必须为 {sorted(DISPOSITIONS)} 之一")
@@ -240,11 +244,14 @@ class FeedbackService:
 
         def _commit(connection: Any) -> FeedbackResult:
             task = connection.execute(
-                "SELECT task_id, current_round_number FROM tasks WHERE task_id = ?",
+                "SELECT task_id, current_round_number, stream_id FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
             if task is None:
                 raise LookupError(f"调查任务不存在：{task_id}")
+            owner = str(task["stream_id"] or "")
+            if owner != stream_id:
+                raise PermissionError("任务不属于当前 stream")
             if round_number is None:
                 target_number = int(task["current_round_number"])
             else:

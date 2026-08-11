@@ -720,8 +720,17 @@ class SwarmCommandsMixin:
         if statistics is None:
             return await self._swarm_fail("统计服务尚未初始化", stream_id)
         task_id = _groups(kwargs).get("task_id")
+        manager = getattr(self, "_manager", None) or getattr(services, "manager", None)
         try:
             if task_id:
+                if manager is None:
+                    return await self._swarm_fail("研究运行时尚未初始化", stream_id)
+                try:
+                    await manager.status(task_id, stream_id=stream_id)
+                except PermissionError:
+                    return await self._swarm_fail("无权访问该调查任务", stream_id)
+                except LookupError as exc:
+                    return await self._swarm_fail(str(exc), stream_id)
                 text = format_task_stats(await statistics.task(task_id))
             else:
                 text = format_plugin_stats(await statistics.plugin())
@@ -877,7 +886,12 @@ class SwarmCommandsMixin:
         if feedback is None:
             return await self._swarm_fail("反馈服务尚未初始化", stream_id)
         try:
-            result = await feedback.submit(task_id=task_id, disposition=disposition, notes=notes)
+            result = await feedback.submit(
+                task_id=task_id,
+                disposition=disposition,
+                notes=notes,
+                stream_id=stream_id,
+            )
             text = (
                 f"反馈已提交：feedback_id={result.feedback_id} lesson_id={getattr(result, 'lesson_id', None)} "
                 f"disposition={result.disposition} indexing={getattr(result, 'lesson_indexing', 'skipped')}"
@@ -887,6 +901,8 @@ class SwarmCommandsMixin:
             if index_error:
                 errors.append(str(index_error))
             return await self._swarm_send(text, stream_id, errors=errors)
+        except PermissionError:
+            return await self._swarm_fail("无权访问该调查任务", stream_id)
         except LookupError as exc:
             return await self._swarm_fail(str(exc), stream_id)
         except ValueError as exc:

@@ -93,10 +93,17 @@ class _FakeStatistics:
 
 
 class _FakeFeedback:
-    def __init__(self) -> None:
+    def __init__(self, manager: "_FakeManager | None" = None) -> None:
         self.submits: list[dict[str, Any]] = []
+        self._manager = manager
 
     async def submit(self, **kwargs: Any) -> Any:
+        stream_id = kwargs.get("stream_id")
+        task_id = str(kwargs.get("task_id") or "")
+        if self._manager is not None:
+            self._manager._assert_stream_owner(task_id, stream_id if isinstance(stream_id, str) else None)
+        elif not isinstance(stream_id, str) or not stream_id.strip():
+            raise PermissionError("stream_id 不能为空")
         self.submits.append(dict(kwargs))
         return SimpleNamespace(
             feedback_id="fb_1",
@@ -141,19 +148,32 @@ class _FakeManager:
                 "created_at": "2026-08-04T11:00:00Z",
             },
         ]
+        self._task_streams = {"lrs_a": "s", "lrs_b": "s"}
         self.store = _FakeStore()
         self.report_coordinators: dict[str, Any] = {}
 
+    def _assert_stream_owner(self, task_id: str, stream_id: str | None) -> None:
+        if stream_id is None:
+            return
+        owner = self._task_streams.get(task_id)
+        if owner is None:
+            raise LookupError(f"task {task_id} 不存在")
+        if owner != stream_id:
+            raise PermissionError("任务不属于当前 stream")
+
     async def status(self, task_id: str, *, stream_id: str | None = None) -> dict[str, Any]:
-        del stream_id
+        self._assert_stream_owner(task_id, stream_id)
         for item in self.tasks:
             if item["task_id"] == task_id:
                 return dict(item)
         raise LookupError(f"task {task_id} 不存在")
 
     async def list_tasks(self, *, stream_id: str | None = None) -> list[dict[str, Any]]:
-        del stream_id
-        return [dict(item) for item in self.tasks]
+        return [
+            dict(item)
+            for item in self.tasks
+            if stream_id is None or self._task_streams.get(item["task_id"]) == stream_id
+        ]
 
 
 class _FakeScheduler:
@@ -244,9 +264,9 @@ class _FakeServices:
     def __init__(self) -> None:
         self.vector_index = _FakeVector()
         self.statistics = _FakeStatistics()
-        self.feedback = _FakeFeedback()
         self.scheduler = _FakeScheduler()
         self.manager = _FakeManager()
+        self.feedback = _FakeFeedback(self.manager)
         self.agent_registry = _FakeRegistry("agents")
         self.procedure_registry = _FakeRegistry("procedures")
         self._config = SimpleNamespace(
@@ -469,7 +489,20 @@ async def test_swarm_stats_and_feedback(command_harness) -> None:
     await command_harness.invoke("/swarm feedback lrs_a accepted 不错", stream_id="s")
     assert command_harness.services.feedback.submits
     assert command_harness.services.feedback.submits[0]["disposition"] == "accepted"
+    assert command_harness.services.feedback.submits[0]["stream_id"] == "s"
     assert "fb_1" in command_harness.sent_text or "反馈" in command_harness.sent_text
+
+
+@pytest.mark.asyncio
+async def test_swarm_stats_and_feedback_deny_other_stream(command_harness) -> None:
+    stats = await command_harness.invoke("/swarm stats lrs_a", stream_id="other")
+    assert stats[0] is False
+    assert "无权" in command_harness.sent_text or "不属于" in command_harness.sent_text
+    command_harness.send.texts.clear()
+    feedback = await command_harness.invoke("/swarm feedback lrs_a accepted 不错", stream_id="other")
+    assert feedback[0] is False
+    assert command_harness.services.feedback.submits == []
+    assert "无权" in command_harness.sent_text or "不属于" in command_harness.sent_text
 
 
 @pytest.mark.asyncio
