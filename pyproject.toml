@@ -1,10 +1,10 @@
 [project]
 name = "maibot-lunagentic-research-swarm"
-version = "0.2.0"
+version = "0.2.1"
 description = "麦麦深度调查组：可扩展的多智能体深度研究蜂群"
 requires-python = ">=3.10"
 dependencies = [
-    "maibot-plugin-sdk>=2.7.1,<3.0.0",
+    "maibot-plugin-sdk>=2.8.1,<3.0.0",
     "pydantic>=2.10.0,<3.0.0",
     "httpx>=0.28.0,<0.29.0",
     "ddgs>=9.14.4,<10.0.0",

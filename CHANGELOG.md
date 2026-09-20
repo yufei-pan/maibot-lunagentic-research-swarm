@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-09-20
+
+### 修复
+
+- `task:` selector 的公开 LLM 调用改为传 `task_name` 而非 `model`。SDK 2.8.1 会默认附带 `task_name="utils"`，若再把 `utils`/`planner` 放进 `model`，Host 会当成具体模型名并报「未找到名为 … 的模型」。`model:` selector 仍走物理 pinning，不受影响
+
 ## 0.2.0 — 2026-08-09
 
 运行时硬化、网页搜索可用性与文档更新。

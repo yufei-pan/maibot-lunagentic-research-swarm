@@ -169,7 +169,7 @@ class LLMGateway:
             if selector.scheme == "task":
                 kwargs = {
                     "prompt": prompt,
-                    "model": selector.name,
+                    "task_name": selector.name,
                     "temperature": request.temperature,
                     "max_tokens": request.max_tokens,
                     "rpc_timeout_ms": DEFAULT_LLM_RPC_TIMEOUT_MS,

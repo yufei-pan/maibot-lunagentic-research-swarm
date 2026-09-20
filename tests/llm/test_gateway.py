@@ -86,7 +86,7 @@ async def test_task_selector_routes_plain_and_native_tool_calls_through_public_c
     assert [name for name, _ in public.calls] == ["generate", "generate_with_tools"]
     assert public.calls[0][1] == {
         "prompt": "hello",
-        "model": "utils",
+        "task_name": "utils",
         "temperature": 0.4,
         "max_tokens": None,
         "rpc_timeout_ms": DEFAULT_LLM_RPC_TIMEOUT_MS,
@@ -94,7 +94,7 @@ async def test_task_selector_routes_plain_and_native_tool_calls_through_public_c
     assert public.calls[1][1] == {
         "prompt": [{"role": "user", "content": "go"}],
         "tools": tools,
-        "model": "planner",
+        "task_name": "planner",
         "temperature": None,
         "max_tokens": None,
         "rpc_timeout_ms": DEFAULT_LLM_RPC_TIMEOUT_MS,
