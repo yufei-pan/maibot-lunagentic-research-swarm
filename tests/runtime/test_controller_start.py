@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -119,6 +120,7 @@ class FakeSummarizer:
 class FakeMessageAPI:
     def __init__(self) -> None:
         self.calls = []
+        self.readable_failure = None
 
     async def get_recent(self, stream_id: str, limit: int):
         self.calls.append(("get_recent", stream_id, limit))
@@ -126,6 +128,8 @@ class FakeMessageAPI:
 
     async def build_readable(self, messages):
         self.calls.append(("build_readable", tuple(item["message_id"] for item in messages)))
+        if self.readable_failure is not None:
+            return dict(self.readable_failure)
         # 与 Host SDK 一致：返回可读字符串，而非 message dict 列表。
         return str(messages[0]["content"]) if messages else ""
 
@@ -383,6 +387,25 @@ async def test_formalization_uses_only_public_recent_message_and_config_apis_wit
     assert "不要落盘的原始目标" not in persisted
     assert "最近消息中的秘密" not in persisted
     assert "好奇" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_formalization_drops_failed_build_readable_payload_instead_of_sending_it_as_a_message(
+    harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Host build_readable 失败返回 {success: False}；不能当成缺 role 的聊天消息送进 LLM。"""
+
+    manager, _, summarizer, _, message, _ = harness
+    message.readable_failure = {"success": False, "error": "消息字典中 'user_info' 字段缺少有效的 'user_id' 或 'user_nickname'"}
+    caplog.set_level(logging.WARNING)
+
+    result = await manager.start(objective="调查目标", stream_id="stream-webui", time_budget_seconds=120)
+    await manager.wait_idle(result["task_id"])
+
+    request = summarizer.requests[0]
+    assert request.chat_messages == ""
+    assert "调查目标" in request.raw_context
+    assert any("聊天记录" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio

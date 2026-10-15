@@ -304,6 +304,14 @@ class ResearchManager:
         try:
             recent = await self.ctx.message.get_recent(stream_id, self._recent_message_limit)
             readable = await self.ctx.message.build_readable(recent)
+            if isinstance(readable, Mapping) and readable.get("success") is False:
+                # Host 失败时返回 {success: False, error}；当成聊天消息送进 LLM 会因缺 role 让整个任务失败。
+                _LOG.warning(
+                    "LRS 形式化读取聊天记录失败，改为不带聊天上下文继续 task_id=%s：%s",
+                    task_id,
+                    readable.get("error"),
+                )
+                readable = ""
             values = []
             for key in ("bot.nickname", "personality.personality", "personality.behavior_style", "personality.reply_style"):
                 values.append((key, await self.ctx.config.get(key)))

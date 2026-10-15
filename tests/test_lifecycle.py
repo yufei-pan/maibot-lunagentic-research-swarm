@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import weakref
 from collections.abc import Callable
 from contextlib import suppress
@@ -681,7 +682,10 @@ async def test_real_descriptor_validation_failure_degrades_and_clean_scan_recove
 
 
 @pytest.mark.asyncio
-async def test_health_is_explicit_for_root_summarizer_and_physical_pinning(plugin_module, tmp_path: Path) -> None:
+async def test_health_is_explicit_for_root_summarizer_and_physical_pinning(
+    plugin_module, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
     partial, _, _, _, _ = build_container(
         plugin_module,
         tmp_path / "partial",
@@ -711,7 +715,10 @@ async def test_health_is_explicit_for_root_summarizer_and_physical_pinning(plugi
         "status": "degraded",
         "code": "physical_pinning_unsupported",
     }
+    # 不兼容必须在加载期写日志，不能只藏在 health 里等任务失败才发现。
+    assert any("物理模型 pinning 不可用" in record.getMessage() for record in caplog.records)
     await partial.close()
+    caplog.clear()
 
     def root_provider(agents: Any, procedures: Any) -> None:
         agents.replace_provider("provider.agents", [agent_payload("agents.root")])
@@ -743,6 +750,7 @@ async def test_health_is_explicit_for_root_summarizer_and_physical_pinning(plugi
         "selector": "task:mid_memory",
     }
     assert health["physical_pinning"] == {"status": "healthy"}
+    assert not any("物理模型 pinning 不可用" in record.getMessage() for record in caplog.records)
     await healthy.close()
 
 

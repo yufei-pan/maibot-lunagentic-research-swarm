@@ -1,14 +1,13 @@
 """Spec §14–16 / §25.4 — extension mid-task removal, missing optional providers, pinning smoke.
 
 Builds on ``test_extension_removal`` / ``test_optional_providers`` / ``test_physical_pinning``
-with discoverable ``test_spec_*`` names. Offline only (Fake Host modules for pinning).
+with discoverable ``test_spec_*`` names. Offline only (fake SDK ``ctx.llm`` for pinning).
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-from types import ModuleType
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -62,23 +61,31 @@ def _procedure_event(*, delegations: tuple[dict[str, Any], ...], live_agent_ids:
     )
 
 
-def _install_host_fakes(monkeypatch: pytest.MonkeyPatch, orchestrator_type: type) -> None:
-    modules = {
-        "src": ModuleType("src"),
-        "src.config": ModuleType("src.config"),
-        "src.config.model_configs": ModuleType("src.config.model_configs"),
-        "src.llm_models": ModuleType("src.llm_models"),
-        "src.llm_models.utils_model": ModuleType("src.llm_models.utils_model"),
-    }
+class _PinningLLM:
+    """SDK ≥ 2.8.1 形状的 ``ctx.llm``；记录调用以证明不会改走其他路由。"""
 
-    class TaskConfig:
-        def __init__(self, **kwargs: Any) -> None:
-            self.model_list = kwargs["model_list"]
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
 
-    modules["src.config.model_configs"].TaskConfig = TaskConfig  # type: ignore[attr-defined]
-    modules["src.llm_models.utils_model"].LLMOrchestrator = orchestrator_type  # type: ignore[attr-defined]
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
+    async def generate(self, prompt: Any, *, task_name: str | None = None, model_name: str = "", **kwargs: Any) -> Any:
+        self.calls.append({"prompt": prompt, "task_name": task_name, "model_name": model_name, **kwargs})
+        return {"success": True, "response": "ok", "model_name": model_name}
+
+    async def generate_with_tools(
+        self, prompt: Any, tools: Any, *, task_name: str | None = None, model_name: str = "", **kwargs: Any
+    ) -> Any:
+        self.calls.append({"prompt": prompt, "tools": tools, "task_name": task_name, "model_name": model_name})
+        return {"success": True, "response": "ok", "model_name": model_name}
+
+
+class _LegacyLLM:
+    """SDK < 2.8.1：没有 model_name 直选参数。"""
+
+    async def generate(self, prompt: Any, model: str = "") -> Any:
+        raise AssertionError("签名检查后不应调用")
+
+    async def generate_with_tools(self, prompt: Any, tools: Any, model: str = "") -> Any:
+        raise AssertionError("签名检查后不应调用")
 
 
 # ---------------------------------------------------------------------------
@@ -262,62 +269,23 @@ async def test_spec_15_4_missing_search_engines_omits_procedure_invoke_fails_vis
 # ---------------------------------------------------------------------------
 
 
-def test_spec_16_3_physical_pinning_compatibility_smoke_without_host(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """§16.3 — capability check reports healthy vs unsupported via faked Host modules."""
+def test_spec_16_3_physical_pinning_compatibility_smoke_without_host() -> None:
+    """§16.3 — capability check reports healthy vs unsupported from the SDK ``ctx.llm`` shape."""
 
-    class CompatibleOrchestrator:
-        def __init__(self, task_name: str, request_type: str = "", session_id: str = "") -> None:
-            pass
-
-        async def generate_response_async(
-            self,
-            prompt: str,
-            temperature: float | None = None,
-            max_tokens: int | None = None,
-            tools: list[dict[str, Any]] | None = None,
-        ) -> Any:
-            return None
-
-        async def generate_response_with_message_async(
-            self,
-            message_factory: Any,
-            temperature: float | None = None,
-            max_tokens: int | None = None,
-            tools: list[dict[str, Any]] | None = None,
-        ) -> Any:
-            return None
-
-    _install_host_fakes(monkeypatch, CompatibleOrchestrator)
-    ok = PhysicalPinningAdapter().check_compatibility()
+    ok = PhysicalPinningAdapter(SimpleNamespace(llm=_PinningLLM())).check_compatibility()
     assert ok.available is True
     assert ok.error_code is None
 
-    class MissingMessageRoute(CompatibleOrchestrator):
-        generate_response_with_message_async = None  # type: ignore[assignment]
-
-    _install_host_fakes(monkeypatch, MissingMessageRoute)
-    bad = PhysicalPinningAdapter().check_compatibility()
+    bad = PhysicalPinningAdapter(SimpleNamespace(llm=_LegacyLLM())).check_compatibility()
     assert bad.available is False
     assert bad.error_code == "physical_pinning_unsupported"
 
 
 @pytest.mark.asyncio
-async def test_spec_16_3_physical_pinning_incompatible_rejects_without_alternate_route(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """§16.3 — signature mismatch → explicit error; never attempts an alternate model route."""
+async def test_spec_16_3_physical_pinning_incompatible_rejects_without_alternate_route() -> None:
+    """§16.3 — legacy SDK → explicit error; never attempts an alternate model route."""
 
-    class IncompatibleOrchestrator:
-        def __init__(self, renamed_task: str) -> None:
-            raise AssertionError("签名检查后不应实例化")
-
-        async def generate_response_async(self, renamed_prompt: str) -> Any:
-            raise AssertionError("签名检查后不应调用")
-
-    _install_host_fakes(monkeypatch, IncompatibleOrchestrator)
-    result = await PhysicalPinningAdapter().generate(
+    result = await PhysicalPinningAdapter(SimpleNamespace(llm=_LegacyLLM())).generate(
         physical_name="physical",
         prompt="hello",
         tools=None,
@@ -326,3 +294,20 @@ async def test_spec_16_3_physical_pinning_incompatible_rejects_without_alternate
     )
     assert result["success"] is False
     assert result["error"]["code"] == "physical_pinning_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_spec_16_3_physical_pinning_sends_exact_model_name_only() -> None:
+    """§16.3 — pinned call names the physical model explicitly; Host must not pick another."""
+
+    llm = _PinningLLM()
+    result = await PhysicalPinningAdapter(SimpleNamespace(llm=llm)).generate(
+        physical_name="physical",
+        prompt="hello",
+        tools=None,
+        temperature=None,
+        max_tokens=None,
+    )
+    assert result["success"] is True
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["model_name"] == "physical"

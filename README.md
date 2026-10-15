@@ -130,7 +130,7 @@
 - **`task:utils`：** 快速思考者、外部研究员、记忆研究员、历史案例研究员  
 - **`task:planner`：** 深度思考者、辩手、知识报告员、证据核验员、定量分析员  
 
-摘要默认 `task:mid_memory`。若 `/swarm health` 里 `physical_pinning` 报错，说明某个 `model:` 在当前 Host 不可用，需要改回 `task:` 或修好 Host 侧配置。
+摘要默认 `task:mid_memory`。`model:物理名` 通过公开 LLM 能力的 `model_name` 直选该模型（需要 Host ≥ 1.2.5、SDK ≥ 2.8.1），该模型失败时直接报错，不会换用其他模型；请求的超时与 temperature/max_tokens 兜底取 Host `utils` 任务配置。若 `/swarm health` 里 `physical_pinning` 报错（加载时也会在日志里告警），说明当前 SDK 不支持直选，需要改回 `task:` 或升级 Host。
 
 ### 4.2 时间与花费
 

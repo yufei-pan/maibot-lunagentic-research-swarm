@@ -792,6 +792,8 @@ Web 搜索由 LRS 内部实现，API keys 和 SearXNG instance 由用户配置�
 
 ### 16.3 物理模型 pinning
 
+> **0.2.2 更新：** Host 1.2.0 重命名了内部 `generate_response_with_message_async`、1.3.0 删除了 `TaskConfig.slow_threshold`，下文的内部路径因此失效。自 0.2.2 起改用公开 `ctx.llm.generate(_with_tools)(task_name="utils", model_name=<物理名>)`（Host ≥ 1.2.5 / SDK ≥ 2.8.1），Host 对显式 `model_name` 失败直接报错、不换模型，仍满足下列「不回退」要求；health 检查改为 SDK 签名检查，不可用时加载期写 warning 日志。以下为首发设计原文。
+
 `model:` selector 使用与 `maibook-plugin` 类似的 Host 内部 `TaskConfig`/`LLMOrchestrator` pinning 路径。该实现当前可行但脆弱，必须满足：
 
 - 全部内部 import 和调用封装在 `llm/physical_pinning.py`；

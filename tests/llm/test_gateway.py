@@ -211,6 +211,7 @@ async def test_model_selector_never_falls_back_to_public_task_selector() -> None
             "tools": None,
             "temperature": None,
             "max_tokens": 4096,
+            "rpc_timeout_ms": DEFAULT_LLM_RPC_TIMEOUT_MS,
         }
     ]
 

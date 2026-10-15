@@ -1,14 +1,24 @@
-"""隔离的 Host 内部物理模型固定适配器。
+"""``model:`` selector 的物理模型固定适配器。
 
-此模块是 LRS 唯一接触 ``src.*`` 的位置；接口不兼容时必须显式失败。
+Host ≥ 1.2.5 的公开 ``llm.generate`` / ``llm.generate_with_tools`` capability 支持 ``model_name``
+直选具体模型（SDK ≥ 2.8.1 暴露 ``task_name`` / ``model_name`` 参数）：指定模型失败时 Host 直接报错，
+不会换用任务内其他模型，正好满足 pinning 语义。因此本模块不再 import Host 内部的 LLM 实现。
+
+唯一保留的 ``src.*`` 读取是初次加载时的 ``model_config`` 价格快照——公开 capability 只给任务名，
+不给价格；读取失败只会让价格按 0 计，不影响加载。
 """
 
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+
+# pinning 请求借用的 Host 任务：只提供 hard_timeout 与 temperature/max_tokens 的最终 fallback，
+# 实际模型由 model_name 固定。与 Host 对未指定任务的插件调用所用默认任务一致。
+PINNED_MODEL_HOST_TASK = "utils"
 
 
 def read_initial_host_model_snapshot() -> dict[str, Any] | None:
@@ -35,71 +45,34 @@ def _error(code: str, message: str) -> dict[str, Any]:
     return {"success": False, "response": "", "error": {"code": code, "message": message}}
 
 
-def _tool_calls_to_payload(raw_calls: Any) -> list[dict[str, Any]] | None:
-    if raw_calls is None:
-        return None
-    result: list[dict[str, Any]] = []
-    for raw in raw_calls:
-        if isinstance(raw, Mapping):
-            result.append(dict(raw))
-            continue
-        call_id = str(getattr(raw, "call_id", "") or getattr(raw, "id", ""))
-        name = str(getattr(raw, "func_name", "") or getattr(raw, "name", ""))
-        arguments = getattr(raw, "args", {}) or {}
-        item: dict[str, Any] = {"id": call_id, "function": {"name": name, "arguments": arguments}}
-        extra_content = getattr(raw, "extra_content", None)
-        if extra_content:
-            item["extra_content"] = extra_content
-        result.append(item)
-    return result
-
-
 @dataclass(frozen=True, slots=True)
 class PhysicalPinningStatus:
     available: bool
     error_code: str | None = None
 
 
-_TASK_CONFIG_FIELDS = {"model_list", "temperature", "max_tokens", "selection_strategy", "slow_threshold"}
-_GENERATION_FIELDS = {"temperature", "max_tokens", "tools"}
+_ROUTE_FIELDS = {"task_name", "model_name"}
 
 
 class PhysicalPinningAdapter:
-    """把一个 synthetic task 固定为唯一物理模型。"""
+    """通过公开 LLM capability 把一次调用固定到唯一物理模型。"""
 
-    def __init__(self, *, message_factory_builder: Callable[[Any], Callable[..., Any]] | None = None) -> None:
-        self._message_factory_builder = message_factory_builder
+    def __init__(self, ctx: Any | None = None) -> None:
+        self._ctx = ctx
 
-    @staticmethod
-    def _load_host_contracts() -> tuple[type[Any], type[Any]]:
-        from src.config.model_configs import TaskConfig
-        from src.llm_models.utils_model import LLMOrchestrator
-
-        return TaskConfig, LLMOrchestrator
-
-    def _resolve_message_factory_builder(self) -> Callable[[Any], Callable[..., Any]]:
-        if self._message_factory_builder is not None:
-            return self._message_factory_builder
-        from src.services.llm_service import _build_prompt_message_factory
-
-        return _build_prompt_message_factory
+    def _llm_methods(self) -> tuple[Any, Any]:
+        llm = getattr(self._ctx, "llm", None)
+        return getattr(llm, "generate", None), getattr(llm, "generate_with_tools", None)
 
     def check_compatibility(self) -> PhysicalPinningStatus:
-        """在加载期检查当前 Host 是否同时支持文本与消息列表 pinning。"""
+        """在加载期检查 SDK 的 ``ctx.llm`` 是否同时支持文本与工具调用的 model_name 直选。"""
 
-        try:
-            TaskConfig, LLMOrchestrator = self._load_host_contracts()
-        except Exception:
-            return PhysicalPinningStatus(False, "physical_pinning_unsupported")
-        plain = getattr(LLMOrchestrator, "generate_response_async", None)
-        messages = getattr(LLMOrchestrator, "generate_response_with_message_async", None)
+        plain, with_tools = self._llm_methods()
         compatible = (
-            _supports_parameters(TaskConfig, _TASK_CONFIG_FIELDS)
-            and _supports_parameters(LLMOrchestrator.__init__, {"task_name", "request_type", "session_id"})
-            and inspect.iscoroutinefunction(plain)
-            and _supports_parameters(plain, _GENERATION_FIELDS | {"prompt"})
-            and inspect.iscoroutinefunction(messages)
-            and _supports_parameters(messages, _GENERATION_FIELDS | {"message_factory"})
+            inspect.iscoroutinefunction(plain)
+            and _supports_parameters(plain, _ROUTE_FIELDS)
+            and inspect.iscoroutinefunction(with_tools)
+            and _supports_parameters(with_tools, _ROUTE_FIELDS)
         )
         return PhysicalPinningStatus(compatible, None if compatible else "physical_pinning_unsupported")
 
@@ -111,82 +84,23 @@ class PhysicalPinningAdapter:
         tools: list[dict[str, Any]] | None,
         temperature: float | None,
         max_tokens: int | None,
-    ) -> dict[str, Any]:
-        try:
-            TaskConfig, LLMOrchestrator = self._load_host_contracts()
-        except Exception:
-            return _error("physical_pinning_unsupported", "当前 Host 不支持物理模型固定")
+        rpc_timeout_ms: int | None = None,
+    ) -> Any:
+        plain, with_tools = self._llm_methods()
+        method = plain if tools is None else with_tools
+        if method is None or not _supports_parameters(method, _ROUTE_FIELDS):
+            return _error("physical_pinning_unsupported", "当前 SDK 的 ctx.llm 不支持 model_name 直选模型")
 
-        init_required = {"task_name", "request_type", "session_id"}
-        method_name = "generate_response_async" if isinstance(prompt, str) else "generate_response_with_message_async"
-        method = getattr(LLMOrchestrator, method_name, None)
-        method_required = set(_GENERATION_FIELDS)
-        method_required.add("prompt" if isinstance(prompt, str) else "message_factory")
-        if not _supports_parameters(LLMOrchestrator.__init__, init_required) or not _supports_parameters(
-            method, method_required
-        ):
-            return _error("physical_pinning_unsupported", "当前 Host 的物理模型固定接口签名不兼容")
-
-        fallback_temperature = temperature if temperature is not None else 0.3
-        synthetic_max_tokens = max_tokens if max_tokens is not None and max_tokens > 0 else 65536
-        try:
-            task_config = TaskConfig(
-                model_list=[physical_name],
-                temperature=fallback_temperature,
-                max_tokens=synthetic_max_tokens,
-                selection_strategy="random",
-                slow_threshold=30.0,
-            )
-
-            class _PinnedOrchestrator(LLMOrchestrator):  # type: ignore[misc, valid-type]
-                def __init__(self, pinned_config: Any) -> None:
-                    self._pinned_config = pinned_config
-                    super().__init__(
-                        task_name="replyer",
-                        request_type="plugin.lunagentic_research_swarm",
-                        session_id="",
-                    )
-
-                def _get_task_config_or_raise(self) -> Any:
-                    return self._pinned_config
-
-                def _refresh_task_config(self) -> Any:
-                    return self._pinned_config
-
-            orchestrator = _PinnedOrchestrator(task_config)
-            common = {
-                "temperature": temperature,
-                # None 让 ModelInfo / extra_params 优先，synthetic TaskConfig 仅作最终 fallback。
-                "max_tokens": None,
-                "tools": tools,
-            }
-            if isinstance(prompt, str):
-                result = await orchestrator.generate_response_async(prompt=prompt, **common)
-            else:
-                raw_factory = self._resolve_message_factory_builder()(list(prompt))
-
-                async def message_factory(*args: Any) -> Any:
-                    built = raw_factory(*args)
-                    return await built if inspect.isawaitable(built) else built
-
-                result = await orchestrator.generate_response_with_message_async(
-                    message_factory=message_factory,
-                    **common,
-                )
-        except TypeError:
-            return _error("physical_pinning_unsupported", "当前 Host 的物理模型固定接口签名不兼容")
-        except Exception as exc:
-            return _error("physical_pinning_failed", f"物理模型 `{physical_name}` 调用失败：{exc}")
-
-        return {
-            "success": True,
-            "response": str(getattr(result, "response", "") or ""),
-            "model": str(getattr(result, "model_name", physical_name) or physical_name),
-            "model_name": str(getattr(result, "model_name", physical_name) or physical_name),
-            "tool_calls": _tool_calls_to_payload(getattr(result, "tool_calls", None)),
-            "prompt_tokens": getattr(result, "prompt_tokens", 0),
-            "completion_tokens": getattr(result, "completion_tokens", 0),
-            "total_tokens": getattr(result, "total_tokens", 0),
-            "prompt_cache_hit_tokens": getattr(result, "prompt_cache_hit_tokens", 0),
-            "prompt_cache_miss_tokens": getattr(result, "prompt_cache_miss_tokens", 0),
+        kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "task_name": PINNED_MODEL_HOST_TASK,
+            "model_name": physical_name,
+            "temperature": temperature,
+            # None 时 Host 依次取 ModelInfo.max_tokens / extra_params.max_tokens / 任务 max_tokens。
+            "max_tokens": max_tokens,
         }
+        if rpc_timeout_ms is not None:
+            kwargs["rpc_timeout_ms"] = rpc_timeout_ms
+        if tools is None:
+            return await method(**kwargs)
+        return await method(tools=tools, **kwargs)

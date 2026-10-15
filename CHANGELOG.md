@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2 — 2026-10-14
+
+### 修复
+
+- `model:` selector（物理模型 pinning）在 Host 1.2.0+ 上全部失败，任务在形式化阶段即报「当前 Host 的物理模型固定接口签名不兼容」：Host 1.2.0 把内部 `generate_response_with_message_async` / `_build_prompt_message_factory` 改名为 `…_with_context_async` / `_build_prompt_context_factory`，1.3.0 又删除了 `TaskConfig.slow_threshold`（`extra="forbid"` 直接拒绝）。pinning 改走公开 `ctx.llm.generate(_with_tools)` 的 `task_name="utils"` + `model_name=<物理名>`，不再 import Host 内部 LLM 实现；Host 对显式 `model_name` 失败直接报错，不会换用其他模型
+- 加载期 pinning 检查失败时写 warning 日志并列出受影响的 `model:` selector，不再只记在 `/swarm health` 里等任务失败才发现
+- 形式化时 Host `message.build_readable` 失败（返回 `{success: False}`，例如 WebUI 本地聊天的消息缺 `user_nickname`）不再被当成聊天消息送进 LLM 导致「消息缺少字符串类型的 `role` 字段」整任务失败；改为写 warning 并不带聊天上下文继续
+
+### 变更
+
+- Host 最低版本升至 **1.2.5**（公开 LLM 能力区分 `task_name` 与 `model_name` 的首个版本）；SDK 仍为 **≥2.8.1**
+- `model:` selector 的正数 `max_tokens` 现在与 `task:` 一致地显式生效；为 0/留空时仍依次继承 Host 模型、`extra_params` 与 `utils` 任务的 `max_tokens`。请求超时（`hard_timeout`）取 Host `utils` 任务配置
+
 ## 0.2.1 — 2026-09-20
 
 ### 修复

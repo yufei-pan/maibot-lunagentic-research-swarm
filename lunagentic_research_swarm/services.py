@@ -173,7 +173,7 @@ class LRSServiceContainer:
         self._outbox_poll_seconds = float(config.reporting.outbox_poll_seconds)
         self._discovery_factory = discovery_factory
         self._host_snapshot_loader = host_snapshot_loader
-        self._physical_pinning = physical_pinning or PhysicalPinningAdapter()
+        self._physical_pinning = physical_pinning or PhysicalPinningAdapter(ctx)
         self._builtin_provider_loader = builtin_provider_loader
         self._bundled_procedure_provider: BundledProcedureProvider | None = None
 
@@ -745,11 +745,24 @@ class LRSServiceContainer:
             status = self._physical_pinning.check_compatibility()
         except Exception:
             status = PhysicalPinningStatus(False, "physical_pinning_unsupported")
-        self._status["physical_pinning"] = (
-            {"status": "healthy"}
-            if status.available
-            else {"status": "degraded", "code": status.error_code or "physical_pinning_unsupported"}
+        if status.available:
+            self._status["physical_pinning"] = {"status": "healthy"}
+            return
+        code = status.error_code or "physical_pinning_unsupported"
+        self._status["physical_pinning"] = {"status": "degraded", "code": code}
+        # 只记 health 会让 Host 升级后的不兼容直到任务失败才暴露，因此加载期必须显式告警。
+        self._ctx.logger.warning(
+            "LRS 物理模型 pinning 不可用（%s）：所有 model: selector 的调用都会直接失败；"
+            "当前配置中的 model: selector：%s。请改用 task: selector，或确认 Host ≥ 1.2.5、SDK ≥ 2.8.1",
+            code,
+            ", ".join(self._configured_model_selectors()) or "无",
         )
+
+    def _configured_model_selectors(self) -> list[str]:
+        config = self._config
+        candidates = [config.llm.default_selector, config.summarizer.selector]
+        candidates.extend(override.selector for override in config.agents.values())
+        return sorted({str(item).strip() for item in candidates if str(item or "").strip().startswith("model:")})
 
     def _ensure_configured_root_available(self) -> None:
         """在暴露 running runtime 前确认配置的 root 能形成有效 catalog snapshot。"""

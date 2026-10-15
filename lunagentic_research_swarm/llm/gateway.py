@@ -158,7 +158,7 @@ class LLMGateway:
 
     def __init__(self, ctx: Any, *, physical_pinning: PhysicalPinningAdapter | Any | None = None) -> None:
         self._ctx = ctx
-        self._physical_pinning = physical_pinning or PhysicalPinningAdapter()
+        self._physical_pinning = physical_pinning or PhysicalPinningAdapter(ctx)
 
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         started = time.perf_counter()
@@ -185,6 +185,7 @@ class LLMGateway:
                     tools=request.tools,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
+                    rpc_timeout_ms=DEFAULT_LLM_RPC_TIMEOUT_MS,
                 )
             return self._normalize_result(raw, time.perf_counter() - started)
         except LRSError as exc:
