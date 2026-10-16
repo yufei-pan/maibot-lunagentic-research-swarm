@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.3 — 2026-10-16
+
+### 变更
+
+- manifest 兼容上限改为实际验证过的范围：宿主 `max_version` 1.99.99 → **1.3.99**，SDK `max_version` 2.99.99 → **2.14.99**（宿主 1.3.8 + SDK 2.12.0 上实际运行，SDK 2.14.0 上测试通过）。插件仓库审核不再接受「永远兼容」式的上限（Mai-with-u/plugin-repo#812）
+- manifest 移除未使用的 `message.get_by_time` 能力声明（代码只用 `message.get_by_time_in_chat`）
+
 ## 0.2.2 — 2026-10-14
 
 ### 修复

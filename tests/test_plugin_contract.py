@@ -13,7 +13,7 @@ def test_manifest_and_factory_contract(plugin_module) -> None:
     instance = plugin_module.create_plugin()
 
     assert manifest["id"] == "com.0-hz.lunagentic-research-swarm"
-    assert manifest["version"] == "0.2.2"
+    assert manifest["version"] == "0.2.3"
     assert manifest["host_application"]["min_version"] == "1.2.5"
     assert manifest["sdk"]["min_version"] == "2.8.1"
     assert isinstance(instance, MaiBotPlugin)
@@ -42,7 +42,6 @@ def test_manifest_declares_final_capabilities(plugin_module) -> None:
         "maisaka.proactive.trigger",
         "message.build_readable",
         "message.get_by_id",
-        "message.get_by_time",
         "message.get_by_time_in_chat",
         "message.get_recent",
         "person.get_id",
